@@ -2,14 +2,12 @@
 playwright==1.47.0
 
 # --- API LLM (structuration) ---
-# anthropic==0.34.2 était initialement prévu mais est INCOMPATIBLE avec httpx>=0.28
-# (TypeError: AsyncClient.__init__() got an unexpected keyword argument 'proxies').
-# Confirmé par exécution réelle de la suite de tests - 0.69.0 est validé fonctionnel.
-anthropic==0.69.0
-# socksio : requis par httpx dès qu'un proxy SOCKS est présent dans l'environnement
-# (variable ALL_PROXY/HTTPS_PROXY) - sans ça, la moindre config proxy fait planter
-# le client Anthropic à l'instanciation (testé en conditions réelles).
-socksio==1.0.0
+# Remplace l'API Claude (anthropic) sur demande du 2026-08-01 - gpt-4o-mini via
+# Structured Outputs, voir config.py pour la justification du choix de modèle.
+# Contrairement à anthropic==0.34.2, l'instanciation d'AsyncOpenAI ne plante PAS
+# en présence d'un proxy SOCKS dans l'environnement (testé en conditions réelles
+# avec ALL_PROXY défini) - pas besoin du paquet socksio ici.
+openai==2.52.0
 
 # --- Validation / parsing des données structurées ---
 pydantic==2.9.2
@@ -32,7 +30,10 @@ pytest==8.3.3
 pytest-asyncio==0.24.0
 
 # Versions validées par exécution réelle de `pip install -r requirements.txt` +
-# `pytest -q` (134/134 tests passés, y compris contre un vrai serveur PostgreSQL 16)
+# `pytest -q` (139/139 tests passés, y compris contre un vrai serveur PostgreSQL 16)
 # le 2026-08-01. playwright n'a PAS pu être testé en conditions réelles (pas d'accès
 # à facebook.com depuis ce sandbox) - seul son installation/import a pu être
-# vérifiée, pas le scraping live.
+# vérifiée, pas le scraping live. openai a été installé et son instanciation
+# vérifiée en conditions réelles, mais un vrai appel chat.completions.create()
+# n'a PAS pu être testé (pas d'accès réseau sortant vers api.openai.com depuis
+# ce sandbox) - à valider par un run réel avant tout usage à volume.

@@ -1,7 +1,7 @@
 # Pipeline ETL — Annonces foncières Ouagadougou (Facebook → base PostgreSQL + Excel)
 
 Projet académique. Collecte des posts de groupes Facebook ciblés, filtrage
-regex local (gratuit), puis structuration via l'API Claude, upsert dans une
+regex local (gratuit), puis structuration via l'API OpenAI (gpt-4o-mini), upsert dans une
 base maître PostgreSQL unique (+ vue Excel régénérée à chaque run). Deux modes :
 `daily` (dernières 24h, cron GitHub Actions 23h00 UTC) et `backfill`
 (rattrapage historique paramétrable par lots).
@@ -60,7 +60,7 @@ vous avant tout usage sérieux :
    dans le bloc "Architecture" et Python 3.12.7 dans le bloc "Workflow
    GitHub Actions". J'ai retenu **3.12.7** dans le workflow (la mention la
    plus précise) — à confirmer.
-6. **Suite de tests désormais exécutée réellement** (134/134 au 2026-08-01,
+6. **Suite de tests désormais exécutée réellement** (139/139 au 2026-08-01,
    voir section Tests) — mais uniquement la logique pure. Le scraping live
    contre facebook.com n'a toujours pas pu être testé (pas d'accès réseau
    vers Facebook depuis mon environnement).
@@ -72,6 +72,17 @@ vous avant tout usage sérieux :
    "Base de données" ci-dessous pour le dimensionnement (le tier gratuit
    0,5 Go / 100 CU-heures est largement suffisant pour ce volume de données)
    et les étapes de configuration.
+8. **Étape B = API OpenAI (gpt-4o-mini), jamais testée contre l'API réelle.**
+   Remplacement complet de l'API Claude par l'API OpenAI le 2026-08-01
+   (demande explicite). L'appel `chat.completions.create` avec Structured
+   Outputs (`response_format` json_schema strict) est construit à partir du
+   contrat documenté du SDK `openai` (vérifié par introspection du code du
+   SDK), mais **aucun appel réel n'a pu être exécuté** — pas d'accès réseau
+   sortant vers `api.openai.com` depuis mon environnement (échec de connexion
+   confirmé). La suite de tests mocke entièrement ce client, donc 139/139
+   tests verts ne garantit PAS que l'appel réel fonctionne tel quel. Testez
+   avec un seul post réel avant tout run à volume (`python main.py --mode
+   daily --group-limit 1` sans `--skip-llm`, pour forcer un vrai appel API).
 
 ## Groupes (`groups.csv`)
 
@@ -94,7 +105,7 @@ d'information). Voir la section "Risques et limites" ci-dessus pour les
 python -m venv .venv && source .venv/bin/activate  # ou .venv\Scripts\activate sous Windows
 pip install -r requirements.txt
 playwright install --with-deps chromium
-cp .env.example .env  # puis renseignez FB_COOKIES_JSON, ANTHROPIC_API_KEY et DATABASE_URL
+cp .env.example .env  # puis renseignez FB_COOKIES_JSON, OPENAI_API_KEY et DATABASE_URL
 ```
 
 `FB_COOKIES_JSON` : export des cookies de session Facebook au format JSON
@@ -153,7 +164,7 @@ python main.py --mode daily
 # Rattrapage sur 14 jours, 5 groupes max, lots de 3
 python main.py --mode backfill --days-back 14 --group-limit 5 --batch-size 3
 
-# Test du scraping + filtrage regex uniquement, sans consommer l'API Claude
+# Test du scraping + filtrage regex uniquement, sans consommer l'API OpenAI
 python main.py --mode daily --skip-llm
 ```
 
@@ -284,10 +295,10 @@ export TEST_DATABASE_URL="postgresql://postgres:motdepasse@localhost:5432/ouaga_
 pytest -q
 ```
 
-**État réel (mis à jour 2026-08-01) : 134/134 tests passent réellement**
+**État réel (mis à jour 2026-08-01) : 139/139 tests passent réellement**
 (`pytest -q`, exécuté pour de vrai, pas juste écrit — y compris les tests de
 base de données, contre un vrai serveur PostgreSQL 16 local via `pgserver`).
-Couverture : Étape A (regex, 100% hors-ligne), Étape B (API Claude entièrement
+Couverture : Étape A (regex, 100% hors-ligne), Étape B (API OpenAI entièrement
 mockée — aucun test ne consomme de crédits API), base maître PostgreSQL
 (upsert, export Excel, détection de dérive, isolation par TRUNCATE entre
 tests), throttle adaptatif AIMD (15 tests, purement arithmétique), parseur
@@ -303,12 +314,16 @@ un service Postgres éphémère dédié — voir "Stratégie anti-blocage" et
 `.github/workflows/daily_scraper.yml`).
 
 **Bugs réels trouvés en exécutant la suite** (pas juste en la lisant) :
-- `anthropic==0.34.2` (version initialement choisie sans pouvoir la tester)
-  est incompatible avec `httpx>=0.28` (`TypeError` à l'instanciation du
-  client) → remonté à `anthropic==0.69.0`.
-- Le client Anthropic plante à l'instanciation dès qu'un proxy SOCKS est
-  présent dans l'environnement (variable `ALL_PROXY`) sans le paquet
-  `socksio` → ajouté à `requirements.txt`.
+- Historique (API remplacée depuis, voir plus bas) : `anthropic==0.34.2`
+  (version initialement choisie sans pouvoir la tester) était incompatible
+  avec `httpx>=0.28` (`TypeError` à l'instanciation du client) → remonté à
+  `anthropic==0.69.0`. Le client Anthropic plantait aussi à l'instanciation
+  dès qu'un proxy SOCKS était présent dans l'environnement (`ALL_PROXY`) sans
+  le paquet `socksio`. Ces deux points n'ont plus d'incidence : l'API Claude
+  a été intégralement remplacée par l'API OpenAI le 2026-08-01 (demande
+  explicite) - voir "Changement de fournisseur LLM" ci-dessous. Le client
+  OpenAI, lui, ne plante pas à l'instanciation avec `ALL_PROXY` défini (testé
+  en conditions réelles).
 - `MOTIF_SPAM` rejetait la quasi-totalité des vraies annonces : le motif
   censé détecter le spam "juste un numéro de téléphone" matchait aussi
   n'importe quelle annonce légitime se terminant par un contact WhatsApp
@@ -336,7 +351,7 @@ ci-dessus, sélecteurs non vérifiés en live).
 ouaga-foncier-etl/
 ├── config.py              # mots-clés, quartiers, délais, chargement des groupes
 ├── scraper.py             # Playwright async (mbasic), pagination, throttle adaptatif
-├── processor.py           # filtrage regex + structuration API Claude + base maître PostgreSQL
+├── processor.py           # filtrage regex + structuration API OpenAI + base maître PostgreSQL
 ├── main.py                # orchestrateur CLI
 ├── groups.csv             # liste des groupes (15, voir "Risques et limites")
 ├── requirements.txt
@@ -356,7 +371,7 @@ ouaga-foncier-etl/
 
 Secrets requis dans le repo (`Settings > Secrets and variables > Actions`) :
 - `FB_COOKIES_JSON`
-- `ANTHROPIC_API_KEY`
+- `OPENAI_API_KEY`
 - `DATABASE_URL` — doit être joignable depuis un runner hébergé par GitHub,
   pas seulement depuis votre réseau local (voir section "Base de données").
 

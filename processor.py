@@ -22,8 +22,8 @@ from typing import Any
 import psycopg
 from openpyxl import Workbook
 
-from anthropic import AsyncAnthropic
-from anthropic import APIConnectionError, APIStatusError, RateLimitError
+from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, RateLimitError
 from pydantic import BaseModel, ValidationError, field_validator
 
 import config
@@ -99,12 +99,12 @@ def filtrer_candidats(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
 
 
 # --------------------------------------------------------------------------- #
-# Étape B : structuration via API Claude (async, tool-use, schéma forcé)
+# Étape B : structuration via API OpenAI (async, Structured Outputs, schéma forcé)
 # --------------------------------------------------------------------------- #
 
 
 class AnnonceStructuree(BaseModel):
-    """Schéma de sortie validé (voir aussi `config.SCHEMA_ANNONCE_TOOL` côté prompt).
+    """Schéma de sortie validé (voir aussi `config.SCHEMA_ANNONCE_JSON_SCHEMA` côté prompt).
 
     Utiliser Pydantic ici - plutôt qu'un simple `dict` non validé - permet de
     détecter immédiatement si le LLM dévie du contrat (type incohérent,
@@ -138,63 +138,81 @@ class AnnonceStructuree(BaseModel):
         return v
 
 
-def _construire_client(api_key: str | None = None) -> AsyncAnthropic:
-    cle = api_key or os.environ.get(config.ENV_ANTHROPIC_KEY)
+def _construire_client(api_key: str | None = None) -> AsyncOpenAI:
+    cle = api_key or os.environ.get(config.ENV_OPENAI_KEY)
     if not cle:
-        raise ValueError(f"Variable d'environnement {config.ENV_ANTHROPIC_KEY} absente.")
-    return AsyncAnthropic(api_key=cle)
+        raise ValueError(f"Variable d'environnement {config.ENV_OPENAI_KEY} absente.")
+    return AsyncOpenAI(api_key=cle)
 
 
 async def structurer_annonce(
-    client: AsyncAnthropic,
+    client: AsyncOpenAI,
     texte: str,
     semaphore: asyncio.Semaphore,
     max_retries: int = config.LLM_MAX_RETRIES,
 ) -> dict[str, Any] | None:
-    """Appelle l'API Claude pour structurer un post, avec retry/backoff exponentiel.
+    """Appelle l'API OpenAI pour structurer un post, avec retry/backoff exponentiel.
 
     Retourne None (plutôt que de lever) en cas d'échec définitif, pour que le
     traitement du lot entier ne soit pas interrompu par un seul post en erreur -
     l'appelant compte les échecs et les journalise (cf. `structurer_lot`).
+
+    INCERTITUDE ASSUMÉE : cet appel (Structured Outputs, `response_format`
+    json_schema strict) n'a pas pu être testé contre l'API OpenAI réelle -
+    aucun accès réseau sortant vers api.openai.com depuis mon environnement
+    (confirmé par un échec de connexion direct). La forme de l'appel est
+    basée sur le contrat documenté du SDK `openai` (introspection du
+    signature de `AsyncCompletions.create`, qui confirme `response_format`,
+    `max_tokens`, `temperature` comme paramètres valides) - à valider par un
+    run réel avec `--group-limit 1` avant tout usage à volume.
     """
     async with semaphore:
         for tentative in range(1, max_retries + 1):
             try:
-                reponse = await client.messages.create(
-                    model=config.ANTHROPIC_MODEL,
-                    max_tokens=config.ANTHROPIC_MAX_TOKENS,
-                    temperature=config.ANTHROPIC_TEMPERATURE,
-                    system=config.PROMPT_SYSTEME_LLM,
-                    tools=[config.SCHEMA_ANNONCE_TOOL],
-                    tool_choice={"type": "tool", "name": config.SCHEMA_ANNONCE_TOOL["name"]},
-                    messages=[{"role": "user", "content": texte}],
+                reponse = await client.chat.completions.create(
+                    model=config.OPENAI_MODEL,
+                    max_tokens=config.OPENAI_MAX_TOKENS,
+                    temperature=config.OPENAI_TEMPERATURE,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": config.SCHEMA_ANNONCE_JSON_SCHEMA,
+                    },
+                    messages=[
+                        {"role": "system", "content": config.PROMPT_SYSTEME_LLM},
+                        {"role": "user", "content": texte},
+                    ],
                 )
-                bloc_outil = next(
-                    (b for b in reponse.content if b.type == "tool_use"), None
-                )
-                if bloc_outil is None:
-                    logger.error("Réponse LLM sans bloc tool_use pour le texte : %.80s...", texte)
+                message = reponse.choices[0].message
+
+                if message.refusal:
+                    logger.error(
+                        "Le modèle a refusé de structurer ce post : %s", message.refusal
+                    )
+                    return None
+                if not message.content:
+                    logger.error("Réponse LLM vide pour le texte : %.80s...", texte)
                     return None
 
-                annonce = AnnonceStructuree.model_validate(bloc_outil.input)
+                donnees = json.loads(message.content)
+                annonce = AnnonceStructuree.model_validate(donnees)
                 return annonce.model_dump()
 
             except RateLimitError:
                 attente = config.LLM_BACKOFF_BASE_S * (2 ** (tentative - 1)) + random.uniform(0, 1)
                 logger.warning(
-                    "Rate limit API Claude (tentative %d/%d) - attente %.1fs",
+                    "Rate limit API OpenAI (tentative %d/%d) - attente %.1fs",
                     tentative, max_retries, attente,
                 )
                 await asyncio.sleep(attente)
             except (APIConnectionError, APIStatusError) as exc:
                 attente = config.LLM_BACKOFF_BASE_S * (2 ** (tentative - 1))
                 logger.warning(
-                    "Erreur API Claude (%s, tentative %d/%d) - attente %.1fs",
+                    "Erreur API OpenAI (%s, tentative %d/%d) - attente %.1fs",
                     exc, tentative, max_retries, attente,
                 )
                 await asyncio.sleep(attente)
-            except ValidationError as exc:
-                logger.error("Sortie LLM invalide (schéma non respecté) : %s", exc)
+            except (json.JSONDecodeError, ValidationError) as exc:
+                logger.error("Sortie LLM invalide (JSON ou schéma non respecté) : %s", exc)
                 return None  # inutile de retenter : le modèle a mal répondu, pas un pb réseau
 
         logger.error("Échec définitif après %d tentatives pour un post.", max_retries)
@@ -565,7 +583,7 @@ async def executer_traitement(
     comme trace d'audit ponctuelle - la base maître reste la référence.
 
     Raises:
-        ValueError: ANTHROPIC_API_KEY absente ou DATABASE_URL absente.
+        ValueError: OPENAI_API_KEY absente ou DATABASE_URL absente.
     """
     if not config.DATABASE_URL:
         # Échec rapide et explicite AVANT tout appel LLM payant : inutile de

@@ -91,7 +91,7 @@ SELECTEURS = {
     # présent sur les blocs de story dans les interfaces Facebook légères
     # (mbasic/lite) pour le tracking analytics interne - fallback sur <article>
     # si absent (structure alternative possible selon la version de mbasic).
-    "post": 'div[data-ft], article',
+    "post": "div[data-ft], article",
     # Lien permalien du post (contient souvent /posts/, /permalink/ ou
     # story_fbid=) - sur mbasic, le texte visible de CE lien est aussi
     # l'horodatage relatif/absolu du post (voir `_extraire_horodatage`).
@@ -177,7 +177,8 @@ def _normaliser_cookie(cookie: dict[str, Any]) -> dict[str, Any]:
         else:
             logger.warning(
                 "Cookie '%s' : valeur sameSite '%s' non reconnue, ignorée.",
-                cookie.get("name"), same_site_brut,
+                cookie.get("name"),
+                same_site_brut,
             )
         # Valeur non reconnue : on omet plutôt que d'envoyer à Playwright une
         # valeur hors de l'enum Strict/Lax/None qu'il rejetterait.
@@ -238,7 +239,10 @@ def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
         with config.STORAGE_STATE_PATH.open(encoding="utf-8") as f:
             return json.load(f).get("origins", [])
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("storage_state.json illisible (%s) - repart sans localStorage sauvegardé.", exc)
+        logger.warning(
+            "storage_state.json illisible (%s) - repart sans localStorage sauvegardé.",
+            exc,
+        )
         return []
 
 
@@ -257,7 +261,9 @@ async def sauvegarder_storage_state(contexte: BrowserContext) -> None:
         logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
 
 
-async def creer_navigateur(playwright, cookies: list[dict[str, Any]]) -> tuple[Browser, BrowserContext]:
+async def creer_navigateur(
+    playwright, cookies: list[dict[str, Any]]
+) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
 
@@ -330,7 +336,9 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
         raise BlocageDetecteError("Texte de vérification anti-bot détecté sur la page.")
 
     if await page.locator(SELECTEURS["mur_connexion"]).count() > 0:
-        raise SessionExpireeError("Mur de connexion détecté - cookies probablement expirés.")
+        raise SessionExpireeError(
+            "Mur de connexion détecté - cookies probablement expirés."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -347,14 +355,28 @@ def _extraire_id_depuis_url(url: str | None) -> str | None:
 
 
 _MOIS_FR = {
-    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
-    "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
-    "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+    "janvier": 1,
+    "février": 2,
+    "fevrier": 2,
+    "mars": 3,
+    "avril": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7,
+    "août": 8,
+    "aout": 8,
+    "septembre": 9,
+    "octobre": 10,
+    "novembre": 11,
+    "décembre": 12,
+    "decembre": 12,
 }
 _MOTIF_MOIS_FR = "|".join(_MOIS_FR)
 
 
-def _parser_horodatage_relatif(texte: str | None, maintenant: datetime) -> datetime | None:
+def _parser_horodatage_relatif(
+    texte: str | None, maintenant: datetime
+) -> datetime | None:
     """Convertit le texte d'horodatage affiché par mbasic (français, locale du
     contexte navigateur fixée à fr-FR) en `datetime` absolu.
 
@@ -399,7 +421,9 @@ def _parser_horodatage_relatif(texte: str | None, maintenant: datetime) -> datet
         return maintenant.replace(hour=heure, minute=minute, second=0, microsecond=0)
 
     m = re.fullmatch(
-        r"(\d{1,2})\s+(" + _MOTIF_MOIS_FR + r")(?:\s+(\d{4}))?(?:\s+[àa]\s+(\d{1,2})[:h](\d{2}))?",
+        r"(\d{1,2})\s+("
+        + _MOTIF_MOIS_FR
+        + r")(?:\s+(\d{4}))?(?:\s+[àa]\s+(\d{1,2})[:h](\d{2}))?",
         t,
     )
     if m:
@@ -412,8 +436,13 @@ def _parser_horodatage_relatif(texte: str | None, maintenant: datetime) -> datet
         minute = int(m.group(5)) if m.group(5) else 0
         try:
             candidat = maintenant.replace(
-                year=annee, month=mois_n, day=jour_n,
-                hour=heure, minute=minute, second=0, microsecond=0,
+                year=annee,
+                month=mois_n,
+                day=jour_n,
+                hour=heure,
+                minute=minute,
+                second=0,
+                microsecond=0,
             )
         except ValueError:
             return None  # date invalide (ex: 31 février) - on ne devine pas
@@ -426,7 +455,9 @@ def _parser_horodatage_relatif(texte: str | None, maintenant: datetime) -> datet
     return None
 
 
-async def _extraire_horodatage(lien_temps, maintenant: datetime | None = None) -> datetime | None:
+async def _extraire_horodatage(
+    lien_temps, maintenant: datetime | None = None
+) -> datetime | None:
     """Lit le texte visible du lien permalien (qui EST l'horodatage sur mbasic)
     et le fait parser par `_parser_horodatage_relatif`. Retourne None sur
     n'importe quel échec (élément absent, texte non reconnu) - jamais
@@ -439,7 +470,9 @@ async def _extraire_horodatage(lien_temps, maintenant: datetime | None = None) -
     return _parser_horodatage_relatif(texte, maintenant or datetime.now(timezone.utc))
 
 
-async def extraire_posts_visibles(page: Page, groupe_id: str, groupe_nom: str) -> list[dict[str, Any]]:
+async def extraire_posts_visibles(
+    page: Page, groupe_id: str, groupe_nom: str
+) -> list[dict[str, Any]]:
     """Extrait les posts actuellement chargés sur la page mbasic courante (une
     page = un lot de posts, la pagination est gérée par l'appelant via
     `_extraire_lien_page_suivante`). Ne fait AUCUN filtrage métier ici
@@ -472,7 +505,10 @@ async def extraire_posts_visibles(page: Page, groupe_id: str, groupe_nom: str) -
                 url_post = None
             horodatage = await _extraire_horodatage(lien, maintenant)
 
-        post_id = _extraire_id_depuis_url(url_post) or f"{groupe_id}_{hash(texte) & 0xFFFFFFFF}"
+        post_id = (
+            _extraire_id_depuis_url(url_post)
+            or f"{groupe_id}_{hash(texte) & 0xFFFFFFFF}"
+        )
 
         posts.append(
             {
@@ -519,7 +555,11 @@ def charger_seen_ids() -> dict[str, str]:
         with config.SEEN_IDS_PATH.open(encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Impossible de lire %s (%s) - repart d'un état vide.", config.SEEN_IDS_PATH, exc)
+        logger.warning(
+            "Impossible de lire %s (%s) - repart d'un état vide.",
+            config.SEEN_IDS_PATH,
+            exc,
+        )
         return {}
 
 
@@ -566,7 +606,12 @@ def activer_cooldown(heures: float, raison: str) -> None:
     fin = datetime.now(timezone.utc) + timedelta(hours=heures)
     config.STATE_DIR.mkdir(parents=True, exist_ok=True)
     with config.COOLDOWN_PATH.open("w", encoding="utf-8") as f:
-        json.dump({"jusqu_a": fin.isoformat(), "raison": raison}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"jusqu_a": fin.isoformat(), "raison": raison},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
     logger.critical("Cooldown activé jusqu'à %s (raison : %s)", fin.isoformat(), raison)
 
 
@@ -583,7 +628,9 @@ class AjustementsSession:
     """Réglages effectifs pour le run courant, dérivés du niveau de confiance."""
 
     delai_multiplicateur: float  # >1.0 = délais rallongés (confiance basse)
-    ratio_groupes: float  # 0.0-1.0 = fraction des groupes normalement prévus réellement traités
+    ratio_groupes: (
+        float  # 0.0-1.0 = fraction des groupes normalement prévus réellement traités
+    )
 
 
 def charger_sante() -> dict[str, Any]:
@@ -603,7 +650,9 @@ def charger_sante() -> dict[str, Any]:
         etat_initial.update(etat)
         return etat_initial
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("État de santé illisible (%s) - repart de la confiance maximale.", exc)
+        logger.warning(
+            "État de santé illisible (%s) - repart de la confiance maximale.", exc
+        )
         return etat_initial
 
 
@@ -621,7 +670,9 @@ def calculer_ajustements(etat: dict[str, Any]) -> AjustementsSession:
     suivants, une fois la confiance remontée).
     """
     confiance = etat.get("niveau_confiance", config.NIVEAU_CONFIANCE_INITIAL)
-    confiance = max(config.NIVEAU_CONFIANCE_MIN, min(config.NIVEAU_CONFIANCE_MAX, confiance))
+    confiance = max(
+        config.NIVEAU_CONFIANCE_MIN, min(config.NIVEAU_CONFIANCE_MAX, confiance)
+    )
     return AjustementsSession(
         delai_multiplicateur=round(1.0 / confiance, 3),
         ratio_groupes=confiance,
@@ -656,28 +707,35 @@ def mettre_a_jour_apres_run(
         nouvel_etat["niveau_confiance"] = config.NIVEAU_CONFIANCE_MIN
         nouvel_etat["runs_propres_consecutifs"] = 0
         nouvel_etat["cooldown_multiplicateur"] = min(
-            config.COOLDOWN_MULTIPLICATEUR_MAX, multiplicateur_cooldown * 2,
+            config.COOLDOWN_MULTIPLICATEUR_MAX,
+            multiplicateur_cooldown * 2,
         )
     elif session_expiree:
         # Signal plus faible qu'un blocage actif (probablement juste des
         # cookies à renouveler) - on reste prudent sans punir aussi fort.
-        nouvel_etat["niveau_confiance"] = max(config.NIVEAU_CONFIANCE_MIN, confiance * 0.7)
+        nouvel_etat["niveau_confiance"] = max(
+            config.NIVEAU_CONFIANCE_MIN, confiance * 0.7
+        )
         nouvel_etat["runs_propres_consecutifs"] = 0
     else:
         ratio_anomalies = (anomalies / total_groupes) if total_groupes else 0.0
         if ratio_anomalies > config.RATIO_ANOMALIES_SUSPICION:
             nouvel_etat["niveau_confiance"] = max(
-                config.NIVEAU_CONFIANCE_MIN, confiance * config.NIVEAU_CONFIANCE_PALIER_SUSPICION,
+                config.NIVEAU_CONFIANCE_MIN,
+                confiance * config.NIVEAU_CONFIANCE_PALIER_SUSPICION,
             )
             nouvel_etat["runs_propres_consecutifs"] = 0
         else:
             propres = etat.get("runs_propres_consecutifs", 0) + 1
             if propres >= config.RUNS_PROPRES_POUR_RAMPUP:
                 nouvel_etat["niveau_confiance"] = min(
-                    config.NIVEAU_CONFIANCE_MAX, confiance + config.RAMPUP_INCREMENT,
+                    config.NIVEAU_CONFIANCE_MAX,
+                    confiance + config.RAMPUP_INCREMENT,
                 )
                 nouvel_etat["runs_propres_consecutifs"] = 0
-                nouvel_etat["cooldown_multiplicateur"] = 1  # reset après un vrai streak propre
+                nouvel_etat["cooldown_multiplicateur"] = (
+                    1  # reset après un vrai streak propre
+                )
             else:
                 nouvel_etat["runs_propres_consecutifs"] = propres
 
@@ -741,7 +799,8 @@ async def scraper_groupe(
             await page.goto(url_courante, wait_until="domcontentloaded")
             await detecter_blocage_ou_session_expiree(page)
             await asyncio.sleep(
-                random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S) * delai_multiplicateur
+                random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                * delai_multiplicateur
             )
 
             posts_visibles = await extraire_posts_visibles(page, groupe.id, groupe.nom)
@@ -759,19 +818,22 @@ async def scraper_groupe(
             posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
             if posts_dates_connues:
                 plus_ancien = min(
-                    datetime.fromisoformat(p["date_publication"]) for p in posts_dates_connues
+                    datetime.fromisoformat(p["date_publication"])
+                    for p in posts_dates_connues
                 )
                 if plus_ancien < date_limite:
                     logger.info(
                         "Groupe %s : posts hors fenêtre de %d jour(s) atteints, arrêt de la pagination.",
-                        groupe.nom, max_days_back,
+                        groupe.nom,
+                        max_days_back,
                     )
                     break
 
             if pages_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
                 logger.info(
                     "Groupe %s : %d page(s) sans nouveau post, arrêt.",
-                    groupe.nom, pages_sans_nouveau,
+                    groupe.nom,
+                    pages_sans_nouveau,
                 )
                 break
 
@@ -779,13 +841,15 @@ async def scraper_groupe(
             pages_visitees += 1
             if url_courante:
                 await asyncio.sleep(
-                    random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S) * delai_multiplicateur
+                    random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                    * delai_multiplicateur
                 )
 
         if pages_visitees >= config.MAX_PAGES_ABSOLU:
             logger.warning(
                 "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint (arrêt forcé).",
-                groupe.nom, config.MAX_PAGES_ABSOLU,
+                groupe.nom,
+                config.MAX_PAGES_ABSOLU,
             )
 
     except PlaywrightTimeoutError as exc:
@@ -856,12 +920,19 @@ async def executer_scraping(
         logger.warning(
             "Throttle adaptatif actif (confiance=%.2f) : %d/%d groupe(s) traités ce run, "
             "délais x%.2f. Les groupes restants seront repris aux prochains runs.",
-            etat_sante.get("niveau_confiance", 1.0), len(groupes), nb_avant,
+            etat_sante.get("niveau_confiance", 1.0),
+            len(groupes),
+            nb_avant,
             ajustements.delai_multiplicateur,
         )
 
-    logger.info("Mode=%s | %d groupe(s) à traiter | days_back=%d | batch=%d",
-                mode, len(groupes), days_back, groups_batch_size)
+    logger.info(
+        "Mode=%s | %d groupe(s) à traiter | days_back=%d | batch=%d",
+        mode,
+        len(groupes),
+        days_back,
+        groups_batch_size,
+    )
 
     seen_ids = charger_seen_ids()
     fichiers_sauvegardes: list[Path] = []
@@ -880,30 +951,40 @@ async def executer_scraping(
                 if budget_depasse:
                     break
 
-                lot = groupes[debut_batch:debut_batch + groups_batch_size]
-                logger.info("--- Batch %d groupe(s) : %s ---",
-                            len(lot), ", ".join(g.nom for g in lot))
+                lot = groupes[debut_batch : debut_batch + groups_batch_size]
+                logger.info(
+                    "--- Batch %d groupe(s) : %s ---",
+                    len(lot),
+                    ", ".join(g.nom for g in lot),
+                )
 
                 for i, groupe in enumerate(lot):
-                    ecoulees_min = (datetime.now(timezone.utc) - debut_session).total_seconds() / 60
+                    ecoulees_min = (
+                        datetime.now(timezone.utc) - debut_session
+                    ).total_seconds() / 60
                     if ecoulees_min >= config.SESSION_DUREE_MAX_MINUTES:
                         logger.warning(
                             "Budget de session atteint (%.1f min) - arrêt propre, "
                             "%d groupe(s) restant(s) traités au prochain run.",
-                            ecoulees_min, len(groupes) - (debut_batch + i),
+                            ecoulees_min,
+                            len(groupes) - (debut_batch + i),
                         )
                         budget_depasse = True
                         break
 
                     try:
                         posts = await scraper_groupe(
-                            contexte, groupe, days_back, seen_ids,
+                            contexte,
+                            groupe,
+                            days_back,
+                            seen_ids,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
                             "Session Facebook expirée sur le groupe %s. Arrêt du run - "
-                            "il faut régénérer FB_COOKIES_JSON.", groupe.nom,
+                            "il faut régénérer FB_COOKIES_JSON.",
+                            groupe.nom,
                         )
                         session_expiree = True
                         activer_cooldown(
@@ -914,36 +995,56 @@ async def executer_scraping(
                     except BlocageDetecteError as exc:
                         logger.critical(
                             "Blocage anti-bot détecté sur %s (%s) - arrêt COMPLET du run "
-                            "(les autres groupes ne sont pas tentés).", groupe.nom, exc,
+                            "(les autres groupes ne sont pas tentés).",
+                            groupe.nom,
+                            exc,
                         )
                         bloque = True
-                        multiplicateur_cooldown = etat_sante.get("cooldown_multiplicateur", 1)
+                        multiplicateur_cooldown = etat_sante.get(
+                            "cooldown_multiplicateur", 1
+                        )
                         activer_cooldown(
-                            config.COOLDOWN_HEURES_APRES_BLOCAGE * multiplicateur_cooldown,
+                            config.COOLDOWN_HEURES_APRES_BLOCAGE
+                            * multiplicateur_cooldown,
                             f"blocage détecté sur {groupe.nom}: {exc}",
                         )
                         raise
                     except Exception:
-                        logger.exception("Erreur inattendue sur le groupe %s - groupe ignoré.", groupe.nom)
+                        logger.exception(
+                            "Erreur inattendue sur le groupe %s - groupe ignoré.",
+                            groupe.nom,
+                        )
                         anomalies += 1
                         continue
 
                     if posts:
-                        fichiers_sauvegardes.append(sauvegarder_posts_groupe(posts, groupe.id))
-                    sauvegarder_seen_ids(seen_ids)  # sauvegarde après CHAQUE groupe (résilience coupure)
+                        fichiers_sauvegardes.append(
+                            sauvegarder_posts_groupe(posts, groupe.id)
+                        )
+                    sauvegarder_seen_ids(
+                        seen_ids
+                    )  # sauvegarde après CHAQUE groupe (résilience coupure)
 
                     # Pause humaine entre deux groupes du même batch (pas seulement entre pages).
                     if i < len(lot) - 1:
                         await asyncio.sleep(
-                            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                            random.uniform(
+                                config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S
+                            )
                             * ajustements.delai_multiplicateur
                         )
 
                 # Pause plus longue entre deux batches de groupes.
-                if not budget_depasse and debut_batch + groups_batch_size < len(groupes):
-                    pause = random.uniform(
-                        config.PAUSE_ENTRE_BATCHES_MIN_S, config.PAUSE_ENTRE_BATCHES_MAX_S
-                    ) * ajustements.delai_multiplicateur
+                if not budget_depasse and debut_batch + groups_batch_size < len(
+                    groupes
+                ):
+                    pause = (
+                        random.uniform(
+                            config.PAUSE_ENTRE_BATCHES_MIN_S,
+                            config.PAUSE_ENTRE_BATCHES_MAX_S,
+                        )
+                        * ajustements.delai_multiplicateur
+                    )
                     logger.info("Pause inter-batch de %.1fs", pause)
                     await asyncio.sleep(pause)
         finally:
@@ -951,14 +1052,20 @@ async def executer_scraping(
             await contexte.close()
             await navigateur.close()
             nouvel_etat_sante = mettre_a_jour_apres_run(
-                etat_sante, anomalies=anomalies, total_groupes=len(groupes),
-                bloque=bloque, session_expiree=session_expiree,
+                etat_sante,
+                anomalies=anomalies,
+                total_groupes=len(groupes),
+                bloque=bloque,
+                session_expiree=session_expiree,
             )
             sauvegarder_sante(nouvel_etat_sante)
-            if nouvel_etat_sante.get("niveau_confiance") != etat_sante.get("niveau_confiance"):
+            if nouvel_etat_sante.get("niveau_confiance") != etat_sante.get(
+                "niveau_confiance"
+            ):
                 logger.info(
                     "Confiance du throttle adaptatif : %.2f -> %.2f",
-                    etat_sante.get("niveau_confiance", 1.0), nouvel_etat_sante.get("niveau_confiance", 1.0),
+                    etat_sante.get("niveau_confiance", 1.0),
+                    nouvel_etat_sante.get("niveau_confiance", 1.0),
                 )
 
     return fichiers_sauvegardes
@@ -967,4 +1074,6 @@ async def executer_scraping(
 if __name__ == "__main__":
     # Exécution ad hoc pour test manuel local (main.py reste le point d'entrée CLI officiel).
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(executer_scraping(mode="daily", days_back=1, group_limit=1, groups_batch_size=1))
+    asyncio.run(
+        executer_scraping(mode="daily", days_back=1, group_limit=1, groups_batch_size=1)
+    )

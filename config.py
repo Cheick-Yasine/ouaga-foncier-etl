@@ -45,7 +45,7 @@ MASTER_XLSX_PATH = PROCESSED_DIR / "annonces.xlsx"
 # --------------------------------------------------------------------------- #
 
 ENV_FB_COOKIES = "FB_COOKIES_JSON"
-ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
+ENV_OPENAI_KEY = "OPENAI_API_KEY"
 ENV_DATABASE_URL = "DATABASE_URL"
 
 # Base de données maître PostgreSQL (source de vérité, upsert par id de post).
@@ -360,81 +360,95 @@ COOLDOWN_MULTIPLICATEUR_MAX = 8  # plafonne le cooldown exponentiel (24h * 8 = 8
 # --------------------------------------------------------------------------- #
 # Configuration LLM (structuration niveau 2)
 # --------------------------------------------------------------------------- #
-
-ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
-ANTHROPIC_TEMPERATURE = 0.0
-ANTHROPIC_MAX_TOKENS = 1024
+#
+# OpenAI plutôt qu'Anthropic (changement demandé le 2026-08-01, remplacement
+# complet - plus de dépendance anthropic dans requirements.txt). gpt-4o-mini
+# retenu : c'est le moins cher des modèles OpenAI supportant les Structured
+# Outputs au moment du choix ($0.15/1M tokens entrée, $0.60/1M sortie -
+# comparé à gpt-4.1-mini à $0.40/$1.60, ~2.7x plus cher, sans intérêt ici vu
+# la taille d'un post Facebook), rôle équivalent à claude-3-5-haiku utilisé
+# avant. Prix vérifiés via recherche web le 2026-08-01, à revérifier
+# périodiquement (les tarifs LLM changent souvent).
+OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_TEMPERATURE = 0.0
+OPENAI_MAX_TOKENS = 1024
 LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate limits)
 LLM_MAX_RETRIES = 3
 LLM_BACKOFF_BASE_S = 2.0
 
 TYPES_BIEN_VALIDES = ["parcelle", "maison", "villa", "ferme", "autre"]
 
-# Schéma "tool use" envoyé à l'API Claude pour forcer une sortie JSON structurée
-# et valide (plus robuste que de parser un bloc de texte libre en JSON).
-SCHEMA_ANNONCE_TOOL = {
+# Schéma JSON envoyé à l'API OpenAI via Structured Outputs (response_format
+# json_schema, strict=True) pour forcer une sortie JSON garantie conforme au
+# schéma (plus robuste que de parser un bloc de texte libre en JSON) - même
+# principe que le "tool use" utilisé avec l'API Claude précédemment.
+#
+# Contraintes du mode strict OpenAI (différentes d'Anthropic) : TOUTES les
+# propriétés doivent figurer dans "required" (l'optionnalité se représente
+# par un type nullable `["string", "null"]`, pas par absence de la clé), et
+# "additionalProperties": false est obligatoire à chaque niveau d'objet.
+# Le schéma "métier" ci-dessous respectait déjà ces deux contraintes par
+# hasard (hérité du format Anthropic) - seul "additionalProperties" a été
+# ajouté, et l'enveloppe externe (name/strict/schema) a changé de forme.
+SCHEMA_ANNONCE_PROPRIETES = {
+    "est_une_annonce_valide": {
+        "type": "boolean",
+        "description": (
+            "true si c'est une vraie annonce de vente d'un bien immobilier/foncier "
+            "à Ouagadougou ou environs ; false si spam, recherche d'achat, "
+            "hors-sujet ou contenu incompréhensible."
+        ),
+    },
+    "type_bien": {
+        "type": "string",
+        "enum": TYPES_BIEN_VALIDES,
+    },
+    "quartier_zone": {
+        "type": ["string", "null"],
+        "description": "Quartier/secteur/commune mentionné, tel qu'écrit dans le texte.",
+    },
+    "superficie_m2": {
+        "type": ["integer", "null"],
+        "description": "Superficie convertie en m² (1 ha = 10000 m²). null si absente.",
+    },
+    "prix_fcfa": {
+        "type": ["integer", "null"],
+        "description": "Prix en FCFA, sans séparateurs. null si absent ou 'non précisé'.",
+    },
+    "statut_document": {
+        "type": ["string", "null"],
+        "description": "Ex: Attestation, Titre Foncier, PUH, Permis d'habiter, APFR.",
+    },
+    "contacts_whatsapp": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Numéros de téléphone/WhatsApp mentionnés, format brut.",
+    },
+    "mots_cles_pertinents": {
+        "type": "array",
+        "items": {"type": "string"},
+    },
+    "resume_court": {
+        "type": "string",
+        "description": "Résumé en une phrase (max ~25 mots), en français.",
+    },
+}
+
+SCHEMA_ANNONCE_JSON_SCHEMA = {
     "name": "structurer_annonce_fonciere",
-    "description": (
-        "Extrait les informations structurées d'une annonce immobilière/foncière "
-        "postée sur un groupe Facebook de Ouagadougou."
-    ),
-    "input_schema": {
+    "strict": True,
+    "schema": {
         "type": "object",
-        "properties": {
-            "est_une_annonce_valide": {
-                "type": "boolean",
-                "description": (
-                    "true si c'est une vraie annonce de vente d'un bien immobilier/foncier "
-                    "à Ouagadougou ou environs ; false si spam, recherche d'achat, "
-                    "hors-sujet ou contenu incompréhensible."
-                ),
-            },
-            "type_bien": {
-                "type": "string",
-                "enum": TYPES_BIEN_VALIDES,
-            },
-            "quartier_zone": {
-                "type": ["string", "null"],
-                "description": "Quartier/secteur/commune mentionné, tel qu'écrit dans le texte.",
-            },
-            "superficie_m2": {
-                "type": ["integer", "null"],
-                "description": "Superficie convertie en m² (1 ha = 10000 m²). null si absente.",
-            },
-            "prix_fcfa": {
-                "type": ["integer", "null"],
-                "description": "Prix en FCFA, sans séparateurs. null si absent ou 'non précisé'.",
-            },
-            "statut_document": {
-                "type": ["string", "null"],
-                "description": "Ex: Attestation, Titre Foncier, PUH, Permis d'habiter, APFR.",
-            },
-            "contacts_whatsapp": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Numéros de téléphone/WhatsApp mentionnés, format brut.",
-            },
-            "mots_cles_pertinents": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "resume_court": {
-                "type": "string",
-                "description": "Résumé en une phrase (max ~25 mots), en français.",
-            },
-        },
-        "required": [
-            "est_une_annonce_valide", "type_bien", "quartier_zone", "superficie_m2",
-            "prix_fcfa", "statut_document", "contacts_whatsapp",
-            "mots_cles_pertinents", "resume_court",
-        ],
+        "properties": SCHEMA_ANNONCE_PROPRIETES,
+        "required": list(SCHEMA_ANNONCE_PROPRIETES.keys()),
+        "additionalProperties": False,
     },
 }
 
 PROMPT_SYSTEME_LLM = (
     "Tu es un extracteur de données structurées spécialisé dans le marché foncier de "
     "Ouagadougou (Burkina Faso). Tu reçois le texte brut d'un post Facebook et tu dois "
-    "appeler l'outil `structurer_annonce_fonciere` avec les champs extraits. "
+    "répondre avec les champs extraits, au format JSON demandé. "
     "Règles strictes : ne devine JAMAIS une valeur absente du texte (mets null) ; "
     "ne convertis pas approximativement un prix ou une superficie ambigus, laisse null ; "
     "si le post est une recherche d'achat, du spam, ou non lié à l'immobilier/foncier "

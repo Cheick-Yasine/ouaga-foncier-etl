@@ -147,7 +147,7 @@ jobs:
       - name: Exécution du pipeline ETL
         env:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
           # README.md, section "Base de données", pour le dimensionnement et
           # les étapes de configuration du secret.
