@@ -64,14 +64,14 @@ vous avant tout usage sérieux :
    voir section Tests) — mais uniquement la logique pure. Le scraping live
    contre facebook.com n'a toujours pas pu être testé (pas d'accès réseau
    vers Facebook depuis mon environnement).
-7. **DATABASE_URL en CI doit être un Postgres accessible depuis Internet.**
-   Migration SQLite → PostgreSQL faite à votre demande, avec confirmation que
-   vous avez une instance **locale**. Point important à trancher vous-même
-   avant d'activer le cron : le job `scrape-and-process` tourne sur un
-   **runner GitHub Actions hébergé dans le cloud**, qui ne peut PAS atteindre
-   un serveur PostgreSQL qui n'écoute que sur votre réseau local (derrière
-   une box/routeur sans port ouvert). Voir la section "Base de données"
-   ci-dessous pour les options — je n'en ai choisi aucune à votre place.
+7. **DATABASE_URL en CI = Neon (Postgres serverless, tier gratuit).**
+   Migration SQLite → PostgreSQL faite à votre demande. Votre instance
+   PostgreSQL locale n'étant pas joignable depuis un runner GitHub Actions
+   (machine éphémère dans le cloud, pas sur votre réseau), vous avez choisi
+   Neon plutôt qu'un tunnel ou un runner self-hosted. Voir la section
+   "Base de données" ci-dessous pour le dimensionnement (le tier gratuit
+   0,5 Go / 100 CU-heures est largement suffisant pour ce volume de données)
+   et les étapes de configuration.
 
 ## Groupes (`groups.csv`)
 
@@ -107,35 +107,42 @@ Voir la section "Base de données" ci-dessous.
 
 ## Base de données
 
-La base maître est **PostgreSQL** (migration depuis SQLite effectuée sur
-demande explicite). `processor.py` s'y connecte via `psycopg` (v3) et crée
-son propre schéma au premier lancement (`CREATE TABLE IF NOT EXISTS`, voir
-`SCHEMA_SQL` dans `processor.py`) — rien à exécuter manuellement.
+La base maître est **PostgreSQL**, hébergée sur **Neon** (tier gratuit).
+`processor.py` s'y connecte via `psycopg` (v3) et crée son propre schéma au
+premier lancement (`CREATE TABLE IF NOT EXISTS`, voir `SCHEMA_SQL` dans
+`processor.py`) — rien à exécuter manuellement, ni sur Neon ni ailleurs.
 
-**En local** : n'importe quelle instance PostgreSQL (locale ou distante)
-fonctionne, il suffit de renseigner `DATABASE_URL` dans `.env`.
+**Pourquoi Neon plutôt que le Postgres local** : le job `scrape-and-process`
+tourne sur un runner GitHub Actions hébergé dans le cloud, qui ne peut pas
+atteindre une base qui n'écoute que sur le réseau local de l'utilisateur.
+Neon est joignable depuis Internet nativement, sans tunnel ni runner
+self-hosted à maintenir.
 
-**En CI (GitHub Actions)** : le secret `DATABASE_URL` du repo doit pointer
-vers un serveur **joignable depuis Internet** — le runner est une machine
-éphémère dans le cloud GitHub, pas votre machine. Une instance PostgreSQL qui
-n'écoute que sur `localhost`/votre réseau local ne convient pas telle quelle.
-Options à évaluer selon votre contexte (je n'en recommande aucune en
-particulier sans connaître vos contraintes de coût/hébergement) :
-- Un hébergeur Postgres géré avec un plan gratuit/faible coût (ex : Supabase,
-  Neon, Railway — tous exposent une chaîne `postgresql://...` utilisable
-  telle quelle comme secret).
-- Exposer votre instance locale via un tunnel (ex : ngrok, Cloudflare Tunnel)
-  — solution plus fragile (dépend que votre machine soit allumée et le tunnel
-  actif au moment du cron).
-- Un **runner self-hosted** GitHub Actions tournant sur votre propre réseau,
-  qui peut alors atteindre `localhost`/votre LAN directement — évite
-  d'exposer la base sur Internet, mais demande de garder une machine
-  disponible pour exécuter le workflow.
+**Dimensionnement du tier gratuit (vérifié sur neon.com/pricing, 2026-08-01)**
+— 0,5 Go de stockage et 100 CU-heures de calcul par mois, mise en veille
+après 5 min d'inactivité (sans coût). Calcul de marge pour ce projet : même
+avec une hypothèse haute de 50 annonces valides/jour et ~2 Ko/ligne (texte +
+métadonnées), la table `annonces` grossit d'environ 3 Mo/mois — le tier
+gratuit couvre donc plusieurs années à ce rythme, largement avant que le
+stockage devienne un problème. Le calcul (CU-heures) est utilisé quelques
+minutes par jour lors du run CI : très loin des 100 CU-heures/mois inclus.
+Seule contrepartie réelle : la mise en veille après 5 min ajoute un léger
+délai de "réveil" à la première connexion de chaque run (de l'ordre de la
+seconde) — sans impact pour un job batch quotidien comme celui-ci.
 
-Tant que `DATABASE_URL` n'est pas réglé pour être joignable depuis le runner,
-le job `scrape-and-process` échouera à la connexion (`psycopg.OperationalError`,
-capturé par `main.py` → code de sortie 1, run marqué en échec). Ce n'est pas
-un bug du pipeline, c'est cette décision d'infrastructure qui reste à prendre.
+**Configuration** :
+1. Créez un compte sur [neon.com](https://neon.com), puis un projet (ex :
+   `ouaga-foncier-etl`).
+2. Copiez la chaîne de connexion fournie dans le dashboard Neon (format
+   `postgresql://user:password@ep-xxxx.region.aws.neon.tech/dbname?sslmode=require`).
+3. En local : collez-la dans `DATABASE_URL=` de votre `.env`.
+4. En CI : ajoutez-la comme secret `DATABASE_URL` du repo GitHub
+   (`Settings > Secrets and variables > Actions`).
+
+Si `DATABASE_URL` n'est pas configurée ou devient injoignable, le job
+`scrape-and-process` échoue à la connexion (`psycopg.OperationalError`,
+capturé par `main.py` → code de sortie 1). C'est un échec explicite et
+volontaire plutôt qu'un run silencieux qui perdrait des données.
 
 ## Utilisation
 

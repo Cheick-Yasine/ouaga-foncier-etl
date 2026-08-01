@@ -148,11 +148,9 @@ jobs:
         env:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Base maître PostgreSQL - doit être un serveur ACCESSIBLE DEPUIS
-          # INTERNET (le runner GitHub Actions est une machine éphémère dans
-          # le cloud, elle ne peut pas atteindre un Postgres qui tourne
-          # uniquement sur le réseau local de l'utilisateur). Voir README.md,
-          # section "Base de données" pour les options d'hébergement.
+          # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
+          # README.md, section "Base de données", pour le dimensionnement et
+          # les étapes de configuration du secret.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python main.py \
