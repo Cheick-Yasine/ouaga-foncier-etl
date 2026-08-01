@@ -139,7 +139,10 @@ class AnnonceStructuree(BaseModel):
 
 
 def _construire_client(api_key: str | None = None) -> AsyncOpenAI:
-    cle = api_key or os.environ.get(config.ENV_OPENAI_KEY)
+    # .strip() : même piège que DATABASE_URL (voir config.py) - un secret CI
+    # collé avec un retour à la ligne final casserait l'en-tête HTTP
+    # Authorization envoyé par le client OpenAI.
+    cle = (api_key or os.environ.get(config.ENV_OPENAI_KEY, "")).strip()
     if not cle:
         raise ValueError(f"Variable d'environnement {config.ENV_OPENAI_KEY} absente.")
     return AsyncOpenAI(api_key=cle)

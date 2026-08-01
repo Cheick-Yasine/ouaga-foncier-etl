@@ -53,7 +53,12 @@ ENV_DATABASE_URL = "DATABASE_URL"
 # python-dotenv - voir main.py). Pas de valeur par défaut "pratique" du type
 # localhost:5432 : une absence de DATABASE_URL doit échouer bruyamment plutôt
 # que de pointer silencieusement vers une base qui n'existe pas chez l'utilisateur.
-DATABASE_URL = os.environ.get(ENV_DATABASE_URL, "")
+# `.strip()` : un secret GitHub Actions collé avec un retour à la ligne final
+# (piège courant - un simple copier-coller depuis un fichier/dashboard suffit)
+# produit une chaîne du type "...sslmode=require\n", que libpq/psycopg refuse
+# purement et simplement (`invalid sslmode value`) - confirmé en conditions
+# réelles le 2026-08-01 sur le premier run du workflow GitHub Actions.
+DATABASE_URL = os.environ.get(ENV_DATABASE_URL, "").strip()
 
 # --------------------------------------------------------------------------- #
 # Logging

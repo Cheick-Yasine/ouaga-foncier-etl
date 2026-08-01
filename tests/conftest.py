@@ -54,7 +54,7 @@ def repertoires_isoles(tmp_path, monkeypatch):
 # utilisable pour le reste de la suite (regex, parseur d'horodatage, etc.).
 # --------------------------------------------------------------------------- #
 
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
 
 
 def _postgres_disponible() -> bool:
