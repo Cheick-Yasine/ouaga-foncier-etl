@@ -350,14 +350,26 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
 # sans navigateur - contrairement à la navigation/au scroll qui les entoure.
 # --------------------------------------------------------------------------- #
 
-# Clés observées sur un vrai échantillon (2026-08-01) sur l'objet "story"
-# de plus haut niveau d'un post (`edges[i].node.story` dans le JSON Comet) :
-# {'encrypted_tracking', 'viewability_config', 'client_view_config', 'url',
-# 'comet_sections', 'feedback', 'id'}. On ne teste que le sous-ensemble le
-# plus stable/probable (id + url + comet_sections) plutôt que la liste
-# complète - une clé en moins dans une future version de Comet ne doit pas
-# faire échouer la détection.
-_CLES_STORY_REQUISES = ("id", "url", "comet_sections")
+# Clés observées sur DEUX échantillons réels distincts (2026-08-01) - la
+# structure diffère selon la provenance du post, pas seulement selon la
+# version de Comet :
+#   1. Post "mis en avant" (`highlight_units.edges[i].node`) : id + url +
+#      comet_sections co-existent directement sur le même objet.
+#   2. Post du fil normal (`group_feed.edges[i].node`, capturé via une
+#      réponse GraphQL de scroll) : l'objet "node" porte id + creation_time,
+#      mais le texte/comet_sections réel vit un niveau plus bas, dans un
+#      sous-objet `attached_story` (post partagé/attaché) qui a SA PROPRE
+#      clé `id` et `comet_sections` - mais PAS de `url` à ce niveau, celle-ci
+#      étant encore plus profondément imbriquée (`comet_sections.
+#      context_layout.story.comet_sections.metadata[i].story.url`).
+# Conclusion : exiger `url` sur le MÊME objet que `id`+`comet_sections` (comme
+# avant) rate systématiquement le cas 2, qui est pourtant le cas le plus
+# fréquent en usage réel (fil normal vs. les quelques posts épinglés). On ne
+# garde donc que `id` + `comet_sections` comme signature d'identification, et
+# `url` est recherché séparément par motif (`_extraire_url_story`), comme le
+# texte et la date - le risque de faux positif reste faible car un post n'est
+# retenu que si un texte réel est aussi trouvé (voir `extraire_stories_depuis_json`).
+_CLES_STORY_REQUISES = ("id", "comet_sections")
 
 
 def _est_noeud_story(obj: Any) -> bool:
@@ -369,7 +381,6 @@ def _est_noeud_story(obj: Any) -> bool:
     return (
         isinstance(obj, dict)
         and isinstance(obj.get("id"), str)
-        and isinstance(obj.get("url"), str)
         and all(cle in obj for cle in _CLES_STORY_REQUISES)
     )
 
@@ -415,6 +426,32 @@ def _extraire_texte_story(story: dict[str, Any]) -> str | None:
 
     trouve = _chercher_valeur_imbriquee(story, _est_message_texte)
     return trouve["message"]["text"] if trouve else None
+
+
+def _extraire_url_story(story: dict[str, Any]) -> str | None:
+    """Cherche le permalien du post à l'intérieur d'un nœud story. Sur
+    l'échantillon "fil normal" observé, ce champ vit sous
+    `attached_story.comet_sections.context_layout.story.comet_sections.
+    metadata[i].story.url` - trop profond et instable pour un chemin figé,
+    d'où la recherche par motif comme pour le texte et la date.
+
+    On ne se contente pas de vérifier `isinstance(v, str)` : un objet story
+    contient aussi des URLs de profil d'auteur (`"url":
+    "https://www.facebook.com/<pseudo>"`), rencontrées AVANT le vrai
+    permalien lors d'un parcours en largeur - les retenir par erreur
+    casserait le dédoublonnage par id. Un vrai permalien de post Facebook
+    contient toujours `/posts/` ou `/permalink/` (confirmé sur les deux
+    échantillons réels analysés), ce qui les distingue de façon fiable.
+    """
+    def _est_url_post(v: Any) -> bool:
+        return (
+            isinstance(v, dict)
+            and isinstance(v.get("url"), str)
+            and ("/posts/" in v["url"] or "/permalink/" in v["url"])
+        )
+
+    trouve = _chercher_valeur_imbriquee(story, _est_url_post)
+    return trouve["url"] if trouve else None
 
 
 def _extraire_creation_time_story(story: dict[str, Any]) -> datetime | None:
@@ -476,7 +513,7 @@ def extraire_stories_depuis_json(
                             "id": obj["id"],
                             "groupe_id": groupe_id,
                             "groupe_nom": groupe_nom,
-                            "url": obj.get("url"),
+                            "url": _extraire_url_story(obj),
                             "texte": texte,
                             "date_publication": horodatage.isoformat() if horodatage else None,
                             "date_incertaine": horodatage is None,

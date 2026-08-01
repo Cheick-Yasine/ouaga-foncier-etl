@@ -148,9 +148,69 @@ def _story_synthetique(
     return story
 
 
+def _story_synthetique_fil_normal(
+    id_: str = "story_normal_456",
+    post_id_groupe: str = "999999",
+    post_id: str = "111222333",
+    texte: str = "Deux parcelles a vendre pres du marche.",
+    creation_time: int = 1_753_100_000,
+    url_profil_auteur: str = "https://www.facebook.com/un.profil.synthetique",
+) -> dict:
+    """Construit un noeud "story" de FIL NORMAL (pas "mis en avant"), avec le
+    nesting `attached_story` observé sur un vrai post capturé par scroll le
+    2026-08-01 (voir `_extraire_url_story`) - structure DIFFÉRENTE de
+    `_story_synthetique` (posts "mis en avant") : le noeud externe porte
+    id + creation_time, mais comet_sections/url/texte réels vivent un niveau
+    plus bas, dans un sous-objet `attached_story` qui a SA PROPRE clé `id` et
+    `comet_sections`. Contient aussi un piège volontaire (URL de profil
+    d'auteur) pour vérifier que `_extraire_url_story` ne s'y trompe pas.
+    Entièrement fabriqué, aucune donnée personnelle réelle.
+    """
+    url_post = f"https://www.facebook.com/groups/{post_id_groupe}/posts/{post_id}/"
+    return {
+        "id": id_,
+        "post_id": post_id,
+        "creation_time": creation_time,
+        "feedback": {
+            "owning_profile": {"url": url_profil_auteur, "name": "Auteur Synthetique"}
+        },
+        "attached_story": {
+            "id": f"{id_}_attached",
+            "comet_sections": {
+                "content": {
+                    "story": {
+                        "comet_sections": {
+                            "message_container": {
+                                "story": {"message": {"text": texte}}
+                            }
+                        }
+                    }
+                },
+                "context_layout": {
+                    "story": {
+                        "comet_sections": {
+                            "metadata": [
+                                {"story": {"creation_time": creation_time, "url": url_post}}
+                            ]
+                        }
+                    }
+                },
+            },
+        },
+    }
+
+
 class TestEstNoeudStory:
     def test_noeud_avec_id_url_comet_sections_est_reconnu(self):
         assert scraper._est_noeud_story(_story_synthetique()) is True
+
+    def test_noeud_avec_id_et_comet_sections_sans_url_est_reconnu(self):
+        # Structure "fil normal" (voir _story_synthetique_fil_normal) : url
+        # absente au même niveau que id+comet_sections - doit quand même être
+        # identifié comme un noeud story (url extraite séparément, voir
+        # TestExtraireUrlStory). Régression du bug réel du 2026-08-01.
+        obj = {"id": "x", "comet_sections": {}}
+        assert scraper._est_noeud_story(obj) is True
 
     def test_dict_sans_comet_sections_est_rejete(self):
         assert scraper._est_noeud_story({"id": "x", "url": "https://x"}) is False
@@ -197,6 +257,31 @@ class TestExtraireTexteStory:
     def test_ignore_un_message_texte_vide(self):
         story = _story_synthetique(texte="   ")
         assert scraper._extraire_texte_story(story) is None
+
+
+class TestExtraireUrlStory:
+    def test_extrait_lurl_co_localisee_avec_id_et_comet_sections(self):
+        story = _story_synthetique(url="https://web.facebook.com/groups/1/permalink/2/")
+        assert scraper._extraire_url_story(story) == "https://web.facebook.com/groups/1/permalink/2/"
+
+    def test_extrait_lurl_imbriquee_dans_attached_story(self):
+        # Régression du bug réel du 2026-08-01 : url absente du noeud
+        # externe, imbriquée dans attached_story.comet_sections....story.url.
+        story = _story_synthetique_fil_normal(post_id_groupe="42", post_id="777")
+        assert scraper._extraire_url_story(story) == "https://www.facebook.com/groups/42/posts/777/"
+
+    def test_ne_confond_pas_une_url_de_profil_avec_le_permalien(self):
+        # L'URL de profil d'auteur (sans /posts/ ni /permalink/) apparaît
+        # AVANT le vrai permalien lors du parcours en largeur - ne doit pas
+        # être retournée à sa place.
+        story = _story_synthetique_fil_normal(url_profil_auteur="https://www.facebook.com/quelquun")
+        resultat = scraper._extraire_url_story(story)
+        assert resultat is not None
+        assert "/posts/" in resultat or "/permalink/" in resultat
+
+    def test_retourne_none_si_aucune_url_de_post_trouvee(self):
+        story = {"id": "x", "comet_sections": {"auteur": {"url": "https://www.facebook.com/quelquun"}}}
+        assert scraper._extraire_url_story(story) is None
 
 
 class TestExtraireCreationTimeStory:
@@ -264,6 +349,26 @@ class TestExtraireStoriesDepuisJson:
     def test_payload_non_dict_ni_liste_ne_leve_pas(self):
         assert scraper.extraire_stories_depuis_json("juste une chaine", "grp1", "Groupe Test") == []
         assert scraper.extraire_stories_depuis_json(None, "grp1", "Groupe Test") == []
+
+    def test_extrait_une_story_de_fil_normal_type_attached_story(self):
+        # RÉGRESSION du bug réel du 2026-08-01 (2 groupes sur 5 revenaient à
+        # 0 post en CI) : les stories du fil normal (capturées par scroll,
+        # structure attached_story) n'étaient pas détectées avant l'ajout de
+        # _extraire_url_story - _est_noeud_story exigeait url co-localisée
+        # avec id+comet_sections, ce qui n'est vrai que pour les posts "mis
+        # en avant", pas pour le fil normal. Voir _story_synthetique_fil_normal.
+        story = _story_synthetique_fil_normal(
+            id_="wrapper_789", post_id_groupe="42", post_id="777", texte="Villa a louer."
+        )
+        payload = {"path": ["group", "group_feed", "edges", 1], "data": {"node": story}}
+        posts = scraper.extraire_stories_depuis_json(payload, "42", "Groupe Test")
+        assert len(posts) == 1
+        # id retenu = celui d'attached_story (le post réel), pas celui du
+        # noeud "wrapper" externe.
+        assert posts[0]["id"] == "wrapper_789_attached"
+        assert posts[0]["texte"] == "Villa a louer."
+        assert posts[0]["url"] == "https://www.facebook.com/groups/42/posts/777/"
+        assert posts[0]["date_incertaine"] is False
 
 
 class TestExtraireStoriesDepuisScriptsJson:
