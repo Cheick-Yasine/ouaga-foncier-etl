@@ -308,20 +308,31 @@ MBASIC_BASE_URL = "https://mbasic.facebook.com"
 # BUG TROUVÉ EN CONDITIONS RÉELLES (2026-08-01, premier run live) : avec un
 # User-Agent Chrome desktop moderne, mbasic.facebook.com a renvoyé
 # l'application React "Comet" (marqueurs `GroupsCometFeed`, `mount_0_0`,
-# `ssr-finished-successfully` trouvés dans le HTML de debug) au lieu du HTML
-# léger attendu (`data-ft`/`article` absents à 100%) - donc `SELECTEURS`
-# ne peut rien matcher, quel que soit son contenu. Hypothèse retenue : le
-# choix desktop/lite dépend du User-Agent envoyé, et un UA de navigateur
-# ancien/peu capable devrait déclencher le rendu allégé historique de mbasic.
-# INCERTITUDE ASSUMÉE (non vérifiable sans accès réseau depuis mon
-# environnement) : cette valeur précise n'est PAS confirmée en conditions
-# réelles - c'est la meilleure hypothèse testable, pas une certitude. Si le
-# prochain run produit encore un dump HTML sans `data-ft`, essayez une autre
-# valeur ici (ex. un vieux User-Agent Android ou Opera Mini) avant de
-# conclure que mbasic ne sert plus jamais de HTML léger en 2026.
+# `ssr-finished-successfully`) au lieu du HTML léger attendu (`data-ft`/
+# `article` absents à 100%).
+#
+# Round 1 (échec partiel) : UA Android 2.3.5 (2011, HTC Desire S). Résultat :
+# plus de Comet (page passée de 3,3 Mo à 300 Ko, redirigée en interne vers
+# m.facebook.com avec `shouldForceMTouch=1`), mais la page retournée était un
+# carrousel de "groupes suggérés" ("Rejoindre" x40, cartes d'AUTRES groupes
+# avec nombre de membres), PAS le fil du groupe ciblé - l'id du groupe
+# n'apparaissait que 3 fois dans toute la page, jamais lié à un post.
+# Hypothèse : cet UA était trop extrême (pré-smartphone), déclenchant un
+# mauvais aiguillage côté Facebook plutôt que la vraie vue "WebLite" du
+# groupe.
+#
+# Round 2 (valeur actuelle, NON CONFIRMÉE) : UA Android récent et courant
+# (téléphone milieu de gamme, 2024-2025) - hypothèse que Facebook route vers
+# l'expérience mobile légère (WebLite/Bloks, pas Comet) pour un appareil
+# mobile réel et courant, sans tomber dans un cas limite comme un UA trop
+# ancien. INCERTITUDE ASSUMÉE (non vérifiable sans accès réseau depuis mon
+# environnement) : à confirmer par un run réel. Si le prochain dump HTML
+# montre encore 0 lien vers ce groupe précis, le problème n'est probablement
+# plus le User-Agent - voir README.md pour la suite (ground truth à obtenir
+# depuis un vrai navigateur connecté).
 MBASIC_USER_AGENT = (
-    "Mozilla/5.0 (Linux; U; Android 2.3.5; fr-fr; HTC_DesireS_S510e Build/GRJ90) "
-    "AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1"
+    "Mozilla/5.0 (Linux; Android 13; SM-A146U) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36"
 )
 
 PAGE_DELAY_MIN_S = 2.0  # délai entre deux chargements de page (remplace l'ancien délai de scroll)
