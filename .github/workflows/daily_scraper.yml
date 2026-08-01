@@ -159,6 +159,23 @@ jobs:
             --group-limit "${{ steps.params.outputs.group_limit }}" \
             --batch-size "${{ steps.params.outputs.batch_size }}"
 
+      # Installe un pg_dump compatible avec la version serveur de Neon. BUG
+      # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
+      # préinstallé sur ubuntu-latest refusait de dumper le serveur Neon en
+      # PostgreSQL 18.4 ("server version mismatch"), silencieusement avalé
+      # par le `|| true` de l'étape suivante - la sauvegarde SQL ne s'est
+      # donc JAMAIS produite jusqu'ici, sans faire échouer le job. Méthode
+      # d'installation officielle PGDG (dépôt apt.postgresql.org) plutôt
+      # qu'une gestion manuelle de clé/sources.list. INCERTITUDE ASSUMÉE :
+      # non vérifié en conditions réelles (pas d'accès réseau à Neon depuis
+      # mon environnement de développement) - à confirmer sur le prochain run.
+      - name: Installer pg_dump compatible avec la version PostgreSQL de Neon
+        if: always()
+        run: |
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-18
+
       # Sauvegarde ponctuelle de la base maître dans l'artefact du run, en plus
       # de la base PostgreSQL elle-même (qui reste la source de vérité). Utile
       # pour retrouver un état antérieur sans dépendre de la politique de
