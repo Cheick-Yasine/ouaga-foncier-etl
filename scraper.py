@@ -526,6 +526,37 @@ async def extraire_posts_visibles(
     return posts
 
 
+async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
+    """Sauvegarde le HTML brut de la page courante quand 0 post est extrait sur
+    la première page d'un groupe.
+
+    Sert à distinguer deux cas indiscernables depuis les seuls logs : "ce
+    groupe n'a réellement aucun post visible en l'état" vs "SELECTEURS['post']
+    ne matche plus rien parce que la structure DOM de mbasic a changé" (risque
+    documenté en tête de module, jamais vérifiable sans session live). Fichier
+    écrit dans data/logs/ (jamais commité - voir .gitignore, jamais uploadé en
+    artefact CI - voir daily_scraper.yml qui ne prend que *.log).
+
+    Best-effort : une erreur d'écriture ne doit jamais faire échouer le run.
+    """
+    try:
+        horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        chemin = config.LOG_DIR / f"debug_page_vide_{groupe_id}_{horodatage}.html"
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        contenu = await page.content()
+        chemin.write_text(contenu, encoding="utf-8")
+        logger.warning(
+            "0 post extrait sur la première page du groupe %s - HTML sauvegardé "
+            "pour diagnostic -> %s (sélecteur cassé, ou groupe réellement sans "
+            "post récent : ouvrez ce fichier pour trancher).",
+            groupe_id, chemin,
+        )
+        return chemin
+    except Exception as exc:  # ne doit jamais interrompre le scraping
+        logger.debug("Échec sauvegarde HTML de debug : %s", exc)
+        return None
+
+
 async def _extraire_lien_page_suivante(page: Page) -> str | None:
     """Retourne l'URL absolue du lien de pagination "plus ancien" s'il existe,
     sinon None (fin de la liste de posts pour ce groupe).
@@ -804,6 +835,8 @@ async def scraper_groupe(
             )
 
             posts_visibles = await extraire_posts_visibles(page, groupe.id, groupe.nom)
+            if not posts_visibles and pages_visitees == 0:
+                await _sauvegarder_html_debug(page, groupe.id)
             posts_inedits = [p for p in posts_visibles if p["id"] not in seen_ids]
 
             if posts_inedits:
