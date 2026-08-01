@@ -197,6 +197,7 @@ jobs:
             data/processed/annonces_*.csv
             data/processed/rejetes_*.json
             data/logs/*.log
+            data/logs/debug_page_vide_*.html
           retention-days: 30
           if-no-files-found: warn
 
