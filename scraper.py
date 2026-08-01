@@ -275,13 +275,14 @@ async def creer_navigateur(
         args=["--disable-blink-features=AutomationControlled"],
     )
     contexte = await navigateur.new_context(
-        viewport={"width": 1366, "height": 900},
+        # Viewport réduit : cohérent avec le User-Agent d'ancien navigateur
+        # mobile ci-dessous (voir config.MBASIC_USER_AGENT) - un viewport
+        # desktop 1366x900 combiné à un UA mobile serait un signal incohérent
+        # facilement détectable.
+        viewport={"width": 360, "height": 640},
         locale="fr-FR",
         timezone_id="Africa/Ouagadougou",
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        ),
+        user_agent=config.MBASIC_USER_AGENT,
         storage_state={"cookies": [], "origins": _charger_origins_sauvegardees()},
     )
     # Masque le flag standard qui trahit un navigateur piloté par automation.
