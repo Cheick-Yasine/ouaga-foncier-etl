@@ -911,12 +911,17 @@ async def scraper_groupe(
        principal) - interceptées via `page.on("response", ...)` et parsées
        avec le même parseur générique `extraire_stories_depuis_json`.
 
-    Stratégie d'arrêt : on arrête le scroll quand `MAX_PAGES_SANS_NOUVEAU_POST`
+    Stratégie d'arrêt du scroll : on arrête quand `MAX_PAGES_SANS_NOUVEAU_POST`
     étapes consécutives n'apportent aucun post inédit, après `MAX_PAGES_ABSOLU`
-    étapes (garde-fou dur), ou si tous les posts inédits d'une étape sont plus
-    vieux que `max_days_back` ET que leur date est connue (les posts à date
-    incertaine ne sont jamais utilisés comme critère d'arrêt, pour éviter de
-    couper la collecte à tort).
+    étapes (garde-fou dur), ou si tous les posts inédits d'une étape de scroll
+    sont plus vieux que `max_days_back` ET que leur date est connue (les posts
+    à date incertaine ne sont jamais utilisés comme critère d'arrêt, pour
+    éviter de couper la collecte à tort). Les posts "mis en avant" (source 1
+    ci-dessus) ne participent PAS à ce calcul et sont toujours conservés quel
+    que soit leur âge - voir le commentaire détaillé au-dessus de leur bloc
+    d'extraction pour la justification (posts épinglés = pas d'ordre
+    chronologique fiable, donc inutilisables comme signal de fraîcheur ; une
+    fois vus ils entrent dans `seen_ids` et ne sont plus jamais réévalués).
 
     Args:
         delai_multiplicateur: facteur appliqué aux délais entre étapes de
@@ -972,6 +977,26 @@ async def scraper_groupe(
         await detecter_blocage_ou_session_expiree(page)
 
         # Posts "mis en avant" présents dès le chargement initial.
+        #
+        # DÉCISION ASSUMÉE (confirmée en conditions réelles le 2026-08-01,
+        # voir README section "Risques et limites") : ces posts sont ajoutés
+        # SANS filtre sur `max_days_back`, et leur date n'intervient JAMAIS
+        # dans la décision de lancer ou non le scroll ci-dessous. Deux
+        # raisons, pas un oubli :
+        #   1. "Mis en avant" par Facebook/l'admin du groupe ne veut pas dire
+        #      "récent" - ce sont des posts épinglés, potentiellement anciens
+        #      par nature (annonce phare gardée en tête). Les utiliser comme
+        #      signal de fraîcheur pour décider d'arrêter le scroll AVANT
+        #      MÊME de l'avoir commencé couperait l'accès au vrai fil (le
+        #      seul chronologique) sur la base d'une donnée non pertinente.
+        #   2. Cohérent avec le reste de cette fonction : aucune étape (page
+        #      mbasic historiquement, étape de scroll ici) ne filtre les
+        #      posts un par un par date - la date ne sert qu'à décider de
+        #      continuer ou non la collecte, jamais à exclure un post déjà
+        #      trouvé. Une fois vu, un post "mis en avant" entre dans
+        #      `seen_ids` et ne sera plus jamais réévalué (impact réel
+        #      observé : une seule fois par groupe, pas une pollution
+        #      quotidienne récurrente du jeu de données).
         html_initial = await page.content()
         posts_initiaux = _extraire_stories_depuis_scripts_json(
             html_initial, groupe.id, groupe.nom

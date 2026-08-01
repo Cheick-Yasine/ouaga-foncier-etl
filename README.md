@@ -45,25 +45,35 @@ vous avant tout usage sérieux :
    blobs par signature structurelle (`id` + `url` + `comet_sections`) plutôt
    que par chemin de clés fixe, l'API interne de Facebook n'étant pas
    documentée et pouvant changer sans préavis.
-3. **Limite non résolue : le HTML initial ne contient que les posts "mis en
-   avant" (3 dans l'échantillon analysé), pas le fil complet.** Le vrai fil
-   chronologique du groupe (`group_feed`) est chargé dynamiquement par des
-   appels GraphQL déclenchés au scroll - absent de la réponse HTML initiale.
-   `scraper_groupe` a donc été réécrit pour (a) cibler `web.facebook.com`,
-   (b) intercepter les réponses réseau GraphQL via `page.on("response", ...)`
-   et les parser avec le même `extraire_stories_depuis_json`, (c) simuler un
-   scroll (`window.scrollBy`) entre chaque étape pour déclencher ce
-   chargement. **Cette partie n'a jamais pu être testée en conditions
-   réelles** (aucun accès réseau vers facebook.com depuis mon environnement
-   de développement) - deux hypothèses non vérifiées : le motif d'URL utilisé
-   pour repérer les requêtes GraphQL (`config.GRAPHQL_URL_FRAGMENTS =
-   ["/api/graphql/"]`, déduit de connaissances publiques sur l'architecture
-   Facebook, pas observé directement) et le fait qu'un scroll simulé par
-   Playwright déclenche bien les mêmes appels réseau qu'un scroll humain.
-   **Testez impérativement avec `--group-limit 1` et regardez les logs** :
-   si le nombre de posts trouvés reste à 0 ou anormalement bas (proche de 3),
-   inspectez `data/logs/debug_page_vide_*.html` et signalez-le-moi plutôt que
-   de lancer un run à volume.
+3. **Le HTML initial ne contient que les posts "mis en avant" (3 dans
+   l'échantillon analysé), pas le fil complet** - le vrai fil chronologique du
+   groupe (`group_feed`) est chargé dynamiquement par des appels GraphQL
+   déclenchés au scroll, absent de la réponse HTML initiale. `scraper_groupe`
+   a donc été réécrit pour (a) cibler `web.facebook.com`, (b) intercepter les
+   réponses réseau GraphQL via `page.on("response", ...)` et les parser avec
+   le même `extraire_stories_depuis_json`, (c) simuler un scroll
+   (`window.scrollBy`) entre chaque étape pour déclencher ce chargement.
+   **Confirmé en conditions réelles le 2026-08-01** (`--group-limit 1`,
+   `--mode daily`) : sur 4 posts collectés, 1 provenait bien de la capture
+   GraphQL déclenchée par le scroll (horodatage `scrape_le` distinct des 3
+   posts "mis en avant", texte différent) - la mécanique fonctionne, mais
+   n'a été validée que sur ce seul run/groupe. Restent non vérifiés sur la
+   durée : la stabilité du motif d'URL GraphQL (`config.GRAPHQL_URL_FRAGMENTS
+   = ["/api/graphql/"]`) et le comportement sur des groupes à fort volume ou
+   sur beaucoup de pas de scroll d'affilée. Surveillez les logs sur les
+   prochains runs (`--group-limit 1` d'abord) et signalez tout retour à 0/peu
+   de posts.
+   **Décision assumée sur les posts "mis en avant"** : ils sont toujours
+   inclus, sans filtre sur `max_days_back` (contrairement aux posts trouvés
+   par scroll, où seule la décision de continuer ou non dépend de la date -
+   aucun post individuel n'est jamais exclu par date, nulle part dans cette
+   fonction). Raison : un post épinglé par Facebook/l'admin n'a pas d'ordre
+   chronologique garanti, l'utiliser comme signal de fraîcheur risquerait
+   d'arrêter le scroll avant même d'avoir atteint le vrai fil. Impact réel
+   mesuré : une seule fois par groupe (dès qu'un post "mis en avant" est vu,
+   il entre dans `seen_ids` et n'est plus jamais réévalué) - pas une
+   pollution quotidienne récurrente de la base. Si vous préférez un filtrage
+   strict par date même pour ces posts, dites-le-moi.
 4. **Extraction de l'horodatage : fiable, basée sur un timestamp Unix réel.**
    `_extraire_creation_time_story` lit `creation_time` (entier Unix) trouvé
    dans le JSON Comet et le convertit en date absolue via
