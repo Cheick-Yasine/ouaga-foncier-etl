@@ -166,9 +166,7 @@ jobs:
       # par le `|| true` de l'étape suivante - la sauvegarde SQL ne s'est
       # donc JAMAIS produite jusqu'ici, sans faire échouer le job. Méthode
       # d'installation officielle PGDG (dépôt apt.postgresql.org) plutôt
-      # qu'une gestion manuelle de clé/sources.list. INCERTITUDE ASSUMÉE :
-      # non vérifié en conditions réelles (pas d'accès réseau à Neon depuis
-      # mon environnement de développement) - à confirmer sur le prochain run.
+      # qu'une gestion manuelle de clé/sources.list.
       - name: Installer pg_dump compatible avec la version PostgreSQL de Neon
         if: always()
         run: |
@@ -180,11 +178,32 @@ jobs:
       # de la base PostgreSQL elle-même (qui reste la source de vérité). Utile
       # pour retrouver un état antérieur sans dépendre de la politique de
       # sauvegarde de l'hébergeur Postgres choisi.
+      #
+      # ÉCHEC CONFIRMÉ du premier essai (run 30714569155, 2026-08-01) : après
+      # installation de postgresql-client-18 ci-dessus, l'appel nu à `pg_dump`
+      # utilisait TOUJOURS le binaire 16.14 ("server version mismatch"
+      # identique). Cause : sur ce runner, `/usr/bin/pg_dump` n'est pas géré
+      # par le système d'alternatives de postgresql-common (seul `psql` l'est,
+      # confirmé dans les logs de l'étape précédente - "using .../18/.../
+      # psql.1.gz ... in auto mode", rien d'équivalent pour pg_dump). On
+      # appelle donc directement le binaire versionné installé par le paquet
+      # `postgresql-client-18` (chemin standard Debian/Ubuntu), avec repli
+      # explicite (+ avertissement visible) sur `pg_dump` générique si ce
+      # chemin venait à changer. Non re-vérifié en conditions réelles depuis
+      # ce correctif (pas d'accès réseau à Neon depuis mon environnement) - à
+      # confirmer sur le prochain run.
       - name: Sauvegarde SQL de la base maître (pg_dump)
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: pg_dump "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
+        run: |
+          PG_DUMP_BIN="/usr/lib/postgresql/18/bin/pg_dump"
+          if [ ! -x "$PG_DUMP_BIN" ]; then
+            echo "::warning::$PG_DUMP_BIN introuvable, repli sur 'pg_dump' générique (risque de mismatch de version serveur)"
+            PG_DUMP_BIN="pg_dump"
+          fi
+          "$PG_DUMP_BIN" --version
+          "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
 
       - name: Upload de l'artefact (dump base maître, Excel, CSV du run, logs)
         if: always()  # même en cas d'échec partiel, on récupère les données déjà collectées
