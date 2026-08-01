@@ -20,6 +20,11 @@ node_modules/
 playwright-report/
 test-results/
 
+# Dumps HTML "Afficher le code source" (contiennent de vraies données
+# personnelles de tiers - numéros de téléphone dans les posts - jamais versionnés)
+view-source_*.html
+*.html
+
 # Python
 __pycache__/
 *.pyc

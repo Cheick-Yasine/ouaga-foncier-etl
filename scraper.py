@@ -16,28 +16,40 @@ l'utilisateur de : (1) utiliser un compte dédié, pas un compte personnel
 principal, (2) ne pas redistribuer les données personnelles collectées,
 (3) vérifier la réglementation applicable avant tout usage en production.
 
-CHOIX D'ARCHITECTURE : mbasic.facebook.com plutôt que le Facebook standard
+CHOIX D'ARCHITECTURE : extraction JSON depuis web.facebook.com (Comet)
 ----------------------------------------------------------------------------
-Ce module cible `mbasic.facebook.com`, l'interface HTML légère de Facebook
-(server-rendered, quasi sans JS, pagination par lien plutôt que scroll
-infini). Deux raisons : un DOM historiquement plus stable que le Facebook
-moderne (classes CSS générées qui changent en continu), et un horodatage
-textuel exploitable par `_parser_horodatage_relatif` (le Facebook standard ne
-l'exposait pas de façon fiable dans la version précédente de ce module).
+Historique complet dans config.py (juste au-dessus de `WEB_FACEBOOK_BASE_URL`)
+- résumé : le plan initial ciblait mbasic.facebook.com pour son HTML léger
+server-rendered, mais un test en conditions réelles le 2026-08-01 (avec un
+vrai navigateur, aucune automation) a confirmé que mbasic redirige
+désormais systématiquement vers web.facebook.com, qui sert l'application
+React "Comet". Contrairement à ce qu'on pourrait croire, ce n'est PAS une
+impasse : Comet embarque les données de chaque post en clair dans des blobs
+JSON (`<script type="application/json" data-sjs>`, format Relay/GraphQL
+interne à Facebook) pour l'hydratation côté client - texte, horodatage Unix
+exact, id et permalien y sont tous présents. `extraire_stories_depuis_json`
+parcourt ces blobs sans dépendre d'un chemin de clés fixe (structure interne
+non documentée, susceptible de changer).
 
-LIMITE TECHNIQUE IMPORTANTE - toujours non vérifiée en conditions réelles
+Deux sources de blobs JSON exploitées :
+1. Le HTML initial de la page (posts "mis en avant" du groupe - peu nombreux,
+   souvent anciens/épinglés).
+2. Les réponses réseau GraphQL déclenchées par le scroll (le vrai fil
+   principal, chargé dynamiquement - Facebook ne l'inclut plus dans la
+   réponse HTML initiale).
+
+LIMITE TECHNIQUE IMPORTANTE - le scroll + capture réseau reste non vérifié
 ----------------------------------------------------------------------------
-Je n'ai aucun accès réseau à facebook.com/mbasic.facebook.com depuis cet
-environnement. Les sélecteurs ci-dessous (`SELECTEURS`) et le format des
-chaînes d'horodatage (`_parser_horodatage_relatif`) sont construits à partir
-de patterns publiquement documentés pour mbasic (attribut `data-ft` sur les
-conteneurs de story, liens de pagination "Voir plus"/"See More"), mais RIEN
-de tout ça n'a été validé contre une session live. Deux risques distincts à
-garder en tête : (1) mbasic pourrait avoir changé de structure depuis que ces
-patterns ont été documentés publiquement, (2) je ne sais même pas avec
-certitude si mbasic.facebook.com est encore pleinement accessible à la date
-où ce code sera exécuté. Testez avec `--group-limit 1 --skip-llm` avant tout
-run sérieux, et attendez-vous à devoir ajuster `SELECTEURS`.
+Le parseur JSON pur (`extraire_stories_depuis_json`) est testé et vérifié
+contre un échantillon RÉEL (structure confirmée, pas une supposition). En
+revanche, la partie qui simule le scroll et intercepte les réponses réseau
+GraphQL (`scraper_groupe`) n'a pas pu être testée en conditions réelles -
+aucun accès réseau à facebook.com depuis mon environnement. Deux
+incertitudes assumées : (1) le pattern d'URL utilisé pour repérer les
+requêtes GraphQL (`config.GRAPHQL_URL_FRAGMENTS`) est une hypothèse
+documentée publiquement, pas une vérification directe ; (2) rien ne garantit
+que le scroll simulé par Playwright déclenche les mêmes appels réseau qu'un
+scroll humain. Testez avec `--group-limit 1` avant tout run sérieux.
 """
 
 from __future__ import annotations
@@ -47,10 +59,11 @@ import json
 import logging
 import random
 import re
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from playwright.async_api import (
     Browser,
@@ -87,21 +100,11 @@ class CooldownActifError(Exception):
 # --------------------------------------------------------------------------- #
 
 SELECTEURS = {
-    # Conteneur d'un post individuel. `data-ft` est un attribut historiquement
-    # présent sur les blocs de story dans les interfaces Facebook légères
-    # (mbasic/lite) pour le tracking analytics interne - fallback sur <article>
-    # si absent (structure alternative possible selon la version de mbasic).
-    "post": "div[data-ft], article",
-    # Lien permalien du post (contient souvent /posts/, /permalink/ ou
-    # story_fbid=) - sur mbasic, le texte visible de CE lien est aussi
-    # l'horodatage relatif/absolu du post (voir `_extraire_horodatage`).
-    "lien_permalien": 'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]',
-    # Lien de pagination "plus ancien" en bas de la liste de posts d'un groupe.
-    "lien_page_suivante": (
-        'a:has-text("Voir plus"), a:has-text("See More"), '
-        'a:has-text("Plus de publications"), a:has-text("Older Posts")'
-    ),
-    # Indicateurs de mur de connexion / checkpoint (formulaire de login mbasic).
+    # Indicateurs de mur de connexion / checkpoint. INCERTITUDE ASSUMÉE : ce
+    # sélecteur (`input[name="pass"], #login_form`) visait à l'origine la
+    # page de login mbasic - non revérifié pour la page de login de
+    # web.facebook.com/Comet, qui pourrait utiliser une structure différente.
+    # `checkpoint_url_fragments` reste fiable (basé sur l'URL, pas le DOM).
     "mur_connexion": 'input[name="pass"], #login_form',
     "checkpoint_url_fragments": ["checkpoint", "login.php", "recover"],
 }
@@ -301,12 +304,11 @@ async def echauffement(contexte: BrowserContext) -> None:
     d'actualité général plutôt que de foncer droit sur une URL de groupe dès la
     première requête de la session. Best-effort : un échec ici ne doit jamais
     arrêter le run (c'est une amélioration comportementale, pas une étape
-    critique). Pas de simulation de scroll ici : mbasic est server-rendered,
-    un scroll JS n'y a aucun effet réel (contrairement au Facebook standard).
+    critique).
     """
     page = await contexte.new_page()
     try:
-        await page.goto(f"{config.MBASIC_BASE_URL}/", wait_until="domcontentloaded")
+        await page.goto(f"{config.WEB_FACEBOOK_BASE_URL}/", wait_until="domcontentloaded")
         await asyncio.sleep(random.uniform(3.0, 7.0))
     except Exception as exc:
         logger.debug("Échauffement ignoré (non bloquant) : %s", exc)
@@ -343,17 +345,198 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Extraction des posts visibles
+# Extraction des posts depuis les blobs JSON Comet (voir avertissement en
+# tête de module + historique dans config.py). Fonctions PURES et testables
+# sans navigateur - contrairement à la navigation/au scroll qui les entoure.
 # --------------------------------------------------------------------------- #
 
+# Clés observées sur un vrai échantillon (2026-08-01) sur l'objet "story"
+# de plus haut niveau d'un post (`edges[i].node.story` dans le JSON Comet) :
+# {'encrypted_tracking', 'viewability_config', 'client_view_config', 'url',
+# 'comet_sections', 'feedback', 'id'}. On ne teste que le sous-ensemble le
+# plus stable/probable (id + url + comet_sections) plutôt que la liste
+# complète - une clé en moins dans une future version de Comet ne doit pas
+# faire échouer la détection.
+_CLES_STORY_REQUISES = ("id", "url", "comet_sections")
 
-def _extraire_id_depuis_url(url: str | None) -> str | None:
-    """Extrait un identifiant stable de post depuis une URL de permalien."""
-    if not url:
+
+def _est_noeud_story(obj: Any) -> bool:
+    """Heuristique de détection d'un objet "story" (post) dans un payload
+    JSON Comet - structure interne non documentée publiquement et non
+    garantie stable, donc détectée par la PRÉSENCE d'un jeu de clés typique
+    plutôt que par un chemin de clés fixe (voir `_CLES_STORY_REQUISES`).
+    """
+    return (
+        isinstance(obj, dict)
+        and isinstance(obj.get("id"), str)
+        and isinstance(obj.get("url"), str)
+        and all(cle in obj for cle in _CLES_STORY_REQUISES)
+    )
+
+
+def _chercher_valeur_imbriquee(
+    obj: Any, predicat: Callable[[Any], bool], profondeur_max: int = config.JSON_PROFONDEUR_MAX
+) -> Any | None:
+    """Parcours en largeur (BFS) d'un JSON imbriqué à la recherche de la
+    première valeur satisfaisant `predicat`, borné par `profondeur_max`
+    (protection contre un coût CPU excessif sur un payload volumineux).
+    """
+    file_attente: deque[tuple[Any, int]] = deque([(obj, 0)])
+    while file_attente:
+        courant, profondeur = file_attente.popleft()
+        if profondeur > profondeur_max:
+            continue
+        if predicat(courant):
+            return courant
+        if isinstance(courant, dict):
+            for v in courant.values():
+                file_attente.append((v, profondeur + 1))
+        elif isinstance(courant, list):
+            for v in courant:
+                file_attente.append((v, profondeur + 1))
+    return None
+
+
+def _extraire_texte_story(story: dict[str, Any]) -> str | None:
+    """Cherche le texte du post à l'intérieur d'un nœud story (voir
+    `_est_noeud_story`). Sur l'échantillon réel observé, ce texte vit sous
+    `comet_sections.content.story.comet_sections.message_container.story.
+    message.text` - chemin non codé en dur ici car probablement instable,
+    d'où la recherche par motif (`{"message": {"text": "..."}}`) plutôt que
+    par chemin exact.
+    """
+    def _est_message_texte(v: Any) -> bool:
+        return (
+            isinstance(v, dict)
+            and isinstance(v.get("message"), dict)
+            and isinstance(v["message"].get("text"), str)
+            and bool(v["message"]["text"].strip())
+        )
+
+    trouve = _chercher_valeur_imbriquee(story, _est_message_texte)
+    return trouve["message"]["text"] if trouve else None
+
+
+def _extraire_creation_time_story(story: dict[str, Any]) -> datetime | None:
+    """Cherche l'horodatage Unix du post à l'intérieur d'un nœud story. Sur
+    l'échantillon réel observé, ce champ vit sous `comet_sections.
+    context_layout.story.comet_sections.metadata[0].story.creation_time` -
+    recherche par motif pour la même raison que `_extraire_texte_story`.
+    Contrairement à l'horodatage textuel relatif de mbasic
+    (`_parser_horodatage_relatif`), c'est un timestamp Unix exact - aucune
+    ambiguïté à résoudre, mais toujours pas de valeur inventée si absent.
+    """
+    def _est_creation_time(v: Any) -> bool:
+        return (
+            isinstance(v, dict)
+            and isinstance(v.get("creation_time"), (int, float))
+            and not isinstance(v.get("creation_time"), bool)
+            and v["creation_time"] > 1_000_000_000  # grandeur d'un timestamp Unix plausible
+        )
+
+    trouve = _chercher_valeur_imbriquee(story, _est_creation_time)
+    if not trouve:
         return None
-    match = re.search(r"(?:/posts/|/permalink/|story_fbid=)(\d+)", url)
-    return match.group(1) if match else url  # fallback : l'URL elle-même comme id
+    try:
+        return datetime.fromtimestamp(trouve["creation_time"], tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None
 
+
+def extraire_stories_depuis_json(
+    payload: Any, groupe_id: str, groupe_nom: str
+) -> list[dict[str, Any]]:
+    """Parcourt un payload JSON Comet (blob SSR initial ou réponse GraphQL
+    capturée pendant le scroll) et en extrait tous les posts identifiables.
+
+    Une fois qu'un nœud story est identifié et qu'un texte a pu en être
+    extrait, on ne descend PAS plus profondément dans son sous-arbre - évite
+    de compter deux fois le même post si un nœud story imbriqué à
+    l'intérieur (ex: dans `comet_sections.content.story`) matche lui aussi
+    l'heuristique `_est_noeud_story`.
+
+    Best-effort par construction : un post au format inattendu (texte
+    introuvable, JSON malformé localement) est silencieusement ignoré plutôt
+    que de faire échouer tout le parcours - cohérent avec le reste du
+    pipeline (aucun post individuel ne doit pouvoir bloquer un run entier).
+    """
+    posts: list[dict[str, Any]] = []
+    vus: set[str] = set()
+    maintenant = datetime.now(timezone.utc)
+
+    def _parcourir(obj: Any) -> None:
+        if isinstance(obj, dict):
+            if _est_noeud_story(obj) and obj["id"] not in vus:
+                texte = _extraire_texte_story(obj)
+                if texte:
+                    vus.add(obj["id"])
+                    horodatage = _extraire_creation_time_story(obj)
+                    posts.append(
+                        {
+                            "id": obj["id"],
+                            "groupe_id": groupe_id,
+                            "groupe_nom": groupe_nom,
+                            "url": obj.get("url"),
+                            "texte": texte,
+                            "date_publication": horodatage.isoformat() if horodatage else None,
+                            "date_incertaine": horodatage is None,
+                            "scrape_le": maintenant.isoformat(),
+                        }
+                    )
+                    return  # pas de descente dans le sous-arbre déjà capturé
+            for v in obj.values():
+                _parcourir(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _parcourir(v)
+
+    try:
+        _parcourir(payload)
+    except RecursionError:
+        logger.warning(
+            "Profondeur de récursion dépassée en parcourant un blob JSON du groupe %s "
+            "- extraction partielle conservée (%d post(s) trouvé(s) avant l'échec).",
+            groupe_id, len(posts),
+        )
+
+    return posts
+
+
+def _extraire_stories_depuis_scripts_json(
+    html: str, groupe_id: str, groupe_nom: str
+) -> list[dict[str, Any]]:
+    """Parcourt tous les blocs `<script type="application/json">` d'une page
+    HTML Comet et en extrait les posts (voir `extraire_stories_depuis_json`).
+
+    Chaque blob est indépendant et peut échouer sans affecter les autres -
+    la page contient couramment 300+ balises script, la plupart sans rapport
+    avec des posts (config, tracking, autres widgets).
+    """
+    posts: list[dict[str, Any]] = []
+    vus: set[str] = set()
+    for blob in re.findall(
+        r'<script type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL
+    ):
+        try:
+            payload = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        for post in extraire_stories_depuis_json(payload, groupe_id, groupe_nom):
+            if post["id"] not in vus:
+                vus.add(post["id"])
+                posts.append(post)
+    return posts
+
+
+# --------------------------------------------------------------------------- #
+# CODE HÉRITÉ, PLUS UTILISÉ PAR LE CHEMIN ACTIF (voir historique en tête de
+# fichier) : parsing des horodatages textuels relatifs de mbasic ("il y a 3
+# h", "Hier à 14:30"). Devenu inutile depuis le passage à l'extraction JSON
+# Comet, qui fournit un timestamp Unix exact (`_extraire_creation_time_story`)
+# - plus besoin de deviner une date approximative depuis du texte affiché.
+# Conservé (fonction pure, 15 tests existants, aucun coût de maintenance)
+# uniquement au cas où un retour à du HTML léger redeviendrait pertinent.
+# --------------------------------------------------------------------------- #
 
 _MOIS_FR = {
     "janvier": 1,
@@ -456,85 +639,11 @@ def _parser_horodatage_relatif(
     return None
 
 
-async def _extraire_horodatage(
-    lien_temps, maintenant: datetime | None = None
-) -> datetime | None:
-    """Lit le texte visible du lien permalien (qui EST l'horodatage sur mbasic)
-    et le fait parser par `_parser_horodatage_relatif`. Retourne None sur
-    n'importe quel échec (élément absent, texte non reconnu) - jamais
-    d'exception propagée jusqu'à l'appelant.
-    """
-    try:
-        texte = (await lien_temps.inner_text()).strip()
-    except Exception:
-        return None
-    return _parser_horodatage_relatif(texte, maintenant or datetime.now(timezone.utc))
-
-
-async def extraire_posts_visibles(
-    page: Page, groupe_id: str, groupe_nom: str
-) -> list[dict[str, Any]]:
-    """Extrait les posts actuellement chargés sur la page mbasic courante (une
-    page = un lot de posts, la pagination est gérée par l'appelant via
-    `_extraire_lien_page_suivante`). Ne fait AUCUN filtrage métier ici
-    (regex/LLM) : ce module ne fait que collecter le texte brut, conformément
-    à la séparation des responsabilités avec processor.py.
-    """
-    posts: list[dict[str, Any]] = []
-    elements = page.locator(SELECTEURS["post"])
-    total = await elements.count()
-    maintenant = datetime.now(timezone.utc)
-
-    for i in range(total):
-        element = elements.nth(i)
-        try:
-            texte = (await element.inner_text()).strip()
-        except Exception as exc:
-            logger.debug("Échec extraction texte post #%d : %s", i, exc)
-            continue
-
-        if not texte:
-            continue
-
-        lien = element.locator(SELECTEURS["lien_permalien"]).first
-        url_post = None
-        horodatage = None
-        if await lien.count() > 0:
-            try:
-                url_post = await lien.get_attribute("href")
-            except Exception:
-                url_post = None
-            horodatage = await _extraire_horodatage(lien, maintenant)
-
-        post_id = (
-            _extraire_id_depuis_url(url_post)
-            or f"{groupe_id}_{hash(texte) & 0xFFFFFFFF}"
-        )
-
-        posts.append(
-            {
-                "id": post_id,
-                "groupe_id": groupe_id,
-                "groupe_nom": groupe_nom,
-                "url": url_post,
-                "texte": texte,
-                "date_publication": horodatage.isoformat() if horodatage else None,
-                "date_incertaine": horodatage is None,
-                "scrape_le": maintenant.isoformat(),
-            }
-        )
-
-    return posts
-
-
 async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
-    """Sauvegarde le HTML brut de la page courante quand 0 post est extrait sur
-    la première page d'un groupe.
+    """Sauvegarde le HTML brut de la page courante quand 0 post est extrait.
 
-    Sert à distinguer deux cas indiscernables depuis les seuls logs : "ce
-    groupe n'a réellement aucun post visible en l'état" vs "SELECTEURS['post']
-    ne matche plus rien parce que la structure DOM de mbasic a changé" (risque
-    documenté en tête de module, jamais vérifiable sans session live). Fichier
+    Sert à diagnostiquer un échec d'extraction JSON sans session live pour
+    inspecter manuellement (voir `extraire_stories_depuis_json`). Fichier
     écrit dans data/logs/ (jamais commité - voir .gitignore, jamais uploadé en
     artefact CI - voir daily_scraper.yml qui ne prend que *.log).
 
@@ -547,31 +656,16 @@ async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
         contenu = await page.content()
         chemin.write_text(contenu, encoding="utf-8")
         logger.warning(
-            "0 post extrait sur la première page du groupe %s - HTML sauvegardé "
-            "pour diagnostic -> %s (sélecteur cassé, ou groupe réellement sans "
-            "post récent : ouvrez ce fichier pour trancher).",
+            "0 post extrait pour le groupe %s - HTML sauvegardé pour diagnostic "
+            "-> %s (structure JSON Comet probablement changée : ouvrez ce "
+            "fichier et cherchez un bloc <script type=\"application/json\"> "
+            "contenant un texte de post connu pour retrouver le nouveau chemin).",
             groupe_id, chemin,
         )
         return chemin
     except Exception as exc:  # ne doit jamais interrompre le scraping
         logger.debug("Échec sauvegarde HTML de debug : %s", exc)
         return None
-
-
-async def _extraire_lien_page_suivante(page: Page) -> str | None:
-    """Retourne l'URL absolue du lien de pagination "plus ancien" s'il existe,
-    sinon None (fin de la liste de posts pour ce groupe).
-    """
-    lien = page.locator(SELECTEURS["lien_page_suivante"]).first
-    try:
-        if await lien.count() == 0:
-            return None
-        href = await lien.get_attribute("href")
-    except Exception:
-        return None
-    if not href:
-        return None
-    return href if href.startswith("http") else f"{config.MBASIC_BASE_URL}{href}"
 
 
 # --------------------------------------------------------------------------- #
@@ -790,7 +884,7 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
 
 
 # --------------------------------------------------------------------------- #
-# Scraping d'un groupe (pagination mbasic + pauses aléatoires)
+# Scraping d'un groupe (web.facebook.com/Comet : scroll + capture GraphQL)
 # --------------------------------------------------------------------------- #
 
 
@@ -801,52 +895,133 @@ async def scraper_groupe(
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
 ) -> list[dict[str, Any]]:
-    """Parcourt un groupe Facebook (mbasic, page par page) et retourne les
-    nouveaux posts non vus.
+    """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
+    réseau GraphQL) et retourne les nouveaux posts non vus.
 
-    Stratégie d'arrêt : on arrête la pagination quand `MAX_PAGES_SANS_NOUVEAU_POST`
-    pages consécutives n'apportent aucun post inédit, après `MAX_PAGES_ABSOLU`
-    pages (garde-fou dur), s'il n'y a plus de lien "page suivante", ou si tous
-    les posts visibles les plus récents sont plus vieux que `max_days_back` ET
-    que leur date est connue (les posts à date incertaine ne sont jamais
-    utilisés comme critère d'arrêt, pour éviter de couper la collecte à tort).
+    INCERTITUDE ASSUMÉE (voir avertissement en tête de fichier) : cette
+    fonction n'a pas pu être testée en conditions réelles (aucun accès réseau
+    à facebook.com depuis l'environnement de développement). Testez
+    impérativement avec `--group-limit 1` avant tout run de production, et
+    surveillez les logs pour vérifier qu'au moins quelques posts sont trouvés.
+
+    Deux sources de posts, fusionnées et dédoublonnées par id :
+    1. Le HTML initial (posts "mis en avant", peu nombreux) - extraction
+       immédiate via `_extraire_stories_depuis_scripts_json`.
+    2. Les réponses réseau GraphQL déclenchées par le scroll (le fil
+       principal) - interceptées via `page.on("response", ...)` et parsées
+       avec le même parseur générique `extraire_stories_depuis_json`.
+
+    Stratégie d'arrêt : on arrête le scroll quand `MAX_PAGES_SANS_NOUVEAU_POST`
+    étapes consécutives n'apportent aucun post inédit, après `MAX_PAGES_ABSOLU`
+    étapes (garde-fou dur), ou si tous les posts inédits d'une étape sont plus
+    vieux que `max_days_back` ET que leur date est connue (les posts à date
+    incertaine ne sont jamais utilisés comme critère d'arrêt, pour éviter de
+    couper la collecte à tort).
 
     Args:
-        delai_multiplicateur: facteur appliqué aux délais entre pages (voir
-            `calculer_ajustements` - >1.0 quand le throttle adaptatif a perdu
-            confiance suite à des runs récents suspects).
+        delai_multiplicateur: facteur appliqué aux délais entre étapes de
+            scroll (voir `calculer_ajustements` - >1.0 quand le throttle
+            adaptatif a perdu confiance suite à des runs récents suspects).
     """
     date_limite = datetime.now(timezone.utc) - timedelta(days=max_days_back)
     page = await context.new_page()
     nouveaux_posts: list[dict[str, Any]] = []
-    url_courante = f"{config.MBASIC_BASE_URL}/groups/{groupe.id}/"
+    posts_captures: list[dict[str, Any]] = []
+    taches_en_cours: set[asyncio.Task] = set()
+
+    async def _traiter_reponse_graphql(reponse: Any) -> None:
+        """Parse une réponse réseau GraphQL et accumule les posts trouvés dans
+        `posts_captures`. Best-effort : toute erreur est avalée pour ne
+        jamais interrompre le scraping sur une réponse mal formée.
+        """
+        try:
+            corps = await reponse.text()
+        except Exception:
+            return
+        # Ancien préfixe anti-JSON-hijacking parfois toujours présent.
+        corps = corps.removeprefix("for (;;);")
+        # Une réponse GraphQL Facebook peut contenir plusieurs objets JSON
+        # concaténés ligne par ligne ("multipart") - on tente le corps entier
+        # puis chaque ligne individuellement.
+        for candidat in (corps, *corps.splitlines()):
+            candidat = candidat.strip()
+            if not candidat:
+                continue
+            try:
+                payload = json.loads(candidat)
+            except json.JSONDecodeError:
+                continue
+            posts_captures.extend(
+                extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
+            )
+
+    def _sur_reponse(reponse: Any) -> None:
+        # Callback SYNCHRONE (API d'événements Playwright) : on ne fait que
+        # planifier le traitement async (reponse.text() est une coroutine).
+        if any(fragment in reponse.url for fragment in config.GRAPHQL_URL_FRAGMENTS):
+            tache = asyncio.ensure_future(_traiter_reponse_graphql(reponse))
+            taches_en_cours.add(tache)
+            tache.add_done_callback(taches_en_cours.discard)
+
+    page.on("response", _sur_reponse)
+    url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
 
     try:
-        logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_courante)
+        logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
+        await page.goto(url_groupe, wait_until="domcontentloaded")
+        await detecter_blocage_ou_session_expiree(page)
 
-        pages_sans_nouveau = 0
-        pages_visitees = 0
+        # Posts "mis en avant" présents dès le chargement initial.
+        html_initial = await page.content()
+        posts_initiaux = _extraire_stories_depuis_scripts_json(
+            html_initial, groupe.id, groupe.nom
+        )
+        if not posts_initiaux:
+            await _sauvegarder_html_debug(page, groupe.id)
+        posts_inedits_initiaux = [
+            p for p in posts_initiaux if p["id"] not in seen_ids
+        ]
+        for p in posts_inedits_initiaux:
+            seen_ids[p["id"]] = p["scrape_le"]
+        nouveaux_posts.extend(posts_inedits_initiaux)
 
-        while url_courante and pages_visitees < config.MAX_PAGES_ABSOLU:
-            await page.goto(url_courante, wait_until="domcontentloaded")
-            await detecter_blocage_ou_session_expiree(page)
+        await asyncio.sleep(
+            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+            * delai_multiplicateur
+        )
+
+        etapes_sans_nouveau = 0
+        etapes_scroll = 0
+
+        while etapes_scroll < config.MAX_PAGES_ABSOLU:
+            debut_capture = len(posts_captures)
+            # Scroll page-niveau (window), plus fiable en headless que
+            # page.mouse.wheel dont l'effet dépend de la position du curseur.
+            await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
             await asyncio.sleep(
                 random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
                 * delai_multiplicateur
             )
+            # Laisse le temps aux tâches de capture réseau déclenchées par ce
+            # scroll de se terminer avant d'évaluer ce qui a été trouvé.
+            if taches_en_cours:
+                await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
-            posts_visibles = await extraire_posts_visibles(page, groupe.id, groupe.nom)
-            if not posts_visibles and pages_visitees == 0:
-                await _sauvegarder_html_debug(page, groupe.id)
-            posts_inedits = [p for p in posts_visibles if p["id"] not in seen_ids]
+            nouveaux_bruts = posts_captures[debut_capture:]
+            vus_cette_etape: set[str] = set()
+            posts_inedits: list[dict[str, Any]] = []
+            for p in nouveaux_bruts:
+                if p["id"] not in seen_ids and p["id"] not in vus_cette_etape:
+                    vus_cette_etape.add(p["id"])
+                    posts_inedits.append(p)
 
             if posts_inedits:
-                pages_sans_nouveau = 0
+                etapes_sans_nouveau = 0
                 for p in posts_inedits:
                     seen_ids[p["id"]] = p["scrape_le"]
                 nouveaux_posts.extend(posts_inedits)
             else:
-                pages_sans_nouveau += 1
+                etapes_sans_nouveau += 1
 
             # Critère d'arrêt "hors fenêtre temporelle" : uniquement sur posts datés.
             posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
@@ -857,29 +1032,23 @@ async def scraper_groupe(
                 )
                 if plus_ancien < date_limite:
                     logger.info(
-                        "Groupe %s : posts hors fenêtre de %d jour(s) atteints, arrêt de la pagination.",
+                        "Groupe %s : posts hors fenêtre de %d jour(s) atteints, arrêt du scroll.",
                         groupe.nom,
                         max_days_back,
                     )
                     break
 
-            if pages_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
+            if etapes_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
                 logger.info(
-                    "Groupe %s : %d page(s) sans nouveau post, arrêt.",
+                    "Groupe %s : %d étape(s) de scroll sans nouveau post, arrêt.",
                     groupe.nom,
-                    pages_sans_nouveau,
+                    etapes_sans_nouveau,
                 )
                 break
 
-            url_courante = await _extraire_lien_page_suivante(page)
-            pages_visitees += 1
-            if url_courante:
-                await asyncio.sleep(
-                    random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
-                    * delai_multiplicateur
-                )
+            etapes_scroll += 1
 
-        if pages_visitees >= config.MAX_PAGES_ABSOLU:
+        if etapes_scroll >= config.MAX_PAGES_ABSOLU:
             logger.warning(
                 "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint (arrêt forcé).",
                 groupe.nom,
@@ -889,6 +1058,9 @@ async def scraper_groupe(
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
     finally:
+        page.remove_listener("response", _sur_reponse)
+        if taches_en_cours:
+            await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
         await page.close()
 
     return nouveaux_posts

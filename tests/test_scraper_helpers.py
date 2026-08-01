@@ -1,9 +1,14 @@
 """Tests des fonctions pures/synchrones de scraper.py.
 
-Les fonctions qui pilotent un vrai navigateur (creer_navigateur, scraper_groupe,
-extraire_posts_visibles) nécessitent une session Playwright/Chromium et ne sont
-PAS couvertes ici - voir la limite documentée dans README.md. On teste tout ce
-qui peut l'être sans navigateur : parsing, validation, persistance.
+Les fonctions qui pilotent un vrai navigateur (creer_navigateur, scraper_groupe)
+nécessitent une session Playwright/Chromium et ne sont PAS couvertes ici - voir
+la limite documentée dans README.md et le module docstring de scraper.py (le
+scroll + la capture réseau GraphQL de `scraper_groupe` n'ont jamais été
+vérifiés en conditions réelles). On teste tout ce qui peut l'être sans
+navigateur : parsing, validation, persistance - y compris le parseur JSON des
+stories Comet (`extraire_stories_depuis_json` et fonctions associées), sur des
+fixtures SYNTHÉTIQUES construites pour reproduire la structure réelle
+découverte (jamais de données personnelles réelles dans ce fichier).
 """
 
 from __future__ import annotations
@@ -102,22 +107,196 @@ class TestChargerCookies:
         assert cookies[0]["sameSite"] == "Strict"
 
 
-class TestExtraireIdDepuisUrl:
-    @pytest.mark.parametrize(
-        "url,id_attendu",
-        [
-            ("https://www.facebook.com/groups/123/posts/456789/", "456789"),
-            ("https://www.facebook.com/groups/123/permalink/456789/", "456789"),
-            ("https://www.facebook.com/story.php?story_fbid=456789&id=123", "456789"),
-            (None, None),
-        ],
-    )
-    def test_extraction(self, url, id_attendu):
-        assert scraper._extraire_id_depuis_url(url) == id_attendu
+def _story_synthetique(
+    id_: str = "story_abc123",
+    url: str = "https://web.facebook.com/groups/589699498704633/permalink/111/",
+    texte: str = "Terrain de 300m2 a vendre a Ouagadougou.",
+    creation_time: int | None = 1_753_000_000,
+) -> dict:
+    """Construit un noeud "story" Comet synthétique, avec la même forme de
+    nesting que l'échantillon réel analysé (message.text et creation_time à
+    des profondeurs différentes, voir docstring de extraire_stories_depuis_json)
+    - mais entièrement fabriqué, aucune donnée personnelle réelle.
+    """
+    story: dict = {
+        "id": id_,
+        "url": url,
+        "encrypted_tracking": "tracking_synthetique",
+        "viewability_config": {},
+        "client_view_config": {},
+        "feedback": {"id": "feedback_synthetique"},
+        "comet_sections": {
+            "content": {
+                "story": {
+                    "comet_sections": {
+                        "message_container": {
+                            "story": {"message": {"text": texte}}
+                        }
+                    }
+                }
+            },
+        },
+    }
+    if creation_time is not None:
+        story["comet_sections"]["context_layout"] = {
+            "story": {
+                "comet_sections": {
+                    "metadata": [{"story": {"creation_time": creation_time}}]
+                }
+            }
+        }
+    return story
 
-    def test_url_sans_motif_connu_retourne_url_telle_quelle(self):
-        url = "https://www.facebook.com/groups/123/"
-        assert scraper._extraire_id_depuis_url(url) == url
+
+class TestEstNoeudStory:
+    def test_noeud_avec_id_url_comet_sections_est_reconnu(self):
+        assert scraper._est_noeud_story(_story_synthetique()) is True
+
+    def test_dict_sans_comet_sections_est_rejete(self):
+        assert scraper._est_noeud_story({"id": "x", "url": "https://x"}) is False
+
+    def test_dict_avec_id_non_str_est_rejete(self):
+        obj = {"id": 123, "url": "https://x", "comet_sections": {}}
+        assert scraper._est_noeud_story(obj) is False
+
+    def test_non_dict_est_rejete(self):
+        assert scraper._est_noeud_story(["id", "url", "comet_sections"]) is False
+        assert scraper._est_noeud_story(None) is False
+
+
+class TestChercherValeurImbriquee:
+    def test_trouve_une_valeur_profondement_imbriquee(self):
+        obj = {"a": {"b": {"c": [1, 2, {"cible": True}]}}}
+        resultat = scraper._chercher_valeur_imbriquee(
+            obj, lambda v: isinstance(v, dict) and v.get("cible") is True
+        )
+        assert resultat == {"cible": True}
+
+    def test_retourne_none_si_absent(self):
+        obj = {"a": {"b": 1}}
+        assert scraper._chercher_valeur_imbriquee(obj, lambda v: v == "introuvable") is None
+
+    def test_respecte_la_profondeur_max(self):
+        # imbrication de 5 niveaux, mais profondeur_max=1 -> ne doit pas être trouvé
+        obj = {"n1": {"n2": {"n3": {"n4": {"cible": True}}}}}
+        resultat = scraper._chercher_valeur_imbriquee(
+            obj, lambda v: isinstance(v, dict) and v.get("cible") is True, profondeur_max=1
+        )
+        assert resultat is None
+
+
+class TestExtraireTexteStory:
+    def test_extrait_le_texte_du_message(self):
+        story = _story_synthetique(texte="Deux parcelles a Bassinko.")
+        assert scraper._extraire_texte_story(story) == "Deux parcelles a Bassinko."
+
+    def test_retourne_none_si_texte_absent(self):
+        story = {"id": "x", "url": "https://x", "comet_sections": {}}
+        assert scraper._extraire_texte_story(story) is None
+
+    def test_ignore_un_message_texte_vide(self):
+        story = _story_synthetique(texte="   ")
+        assert scraper._extraire_texte_story(story) is None
+
+
+class TestExtraireCreationTimeStory:
+    def test_extrait_et_convertit_le_timestamp_unix(self):
+        story = _story_synthetique(creation_time=1_753_000_000)
+        resultat = scraper._extraire_creation_time_story(story)
+        assert resultat == datetime.fromtimestamp(1_753_000_000, tz=timezone.utc)
+
+    def test_retourne_none_si_absent(self):
+        story = _story_synthetique(creation_time=None)
+        assert scraper._extraire_creation_time_story(story) is None
+
+    def test_ignore_un_booleen_meme_si_techniquement_un_int(self):
+        # En Python, bool est une sous-classe d'int - piège classique, doit
+        # être explicitement exclu (voir garde `not isinstance(..., bool)`).
+        story = {
+            "id": "x", "url": "https://x",
+            "comet_sections": {"creation_time": True},
+        }
+        assert scraper._extraire_creation_time_story(story) is None
+
+
+class TestExtraireStoriesDepuisJson:
+    def test_extrait_une_story_valide(self):
+        payload = {"data": {"group": {"story": _story_synthetique(id_="s1")}}}
+        posts = scraper.extraire_stories_depuis_json(payload, "grp1", "Groupe Test")
+        assert len(posts) == 1
+        assert posts[0]["id"] == "s1"
+        assert posts[0]["groupe_id"] == "grp1"
+        assert posts[0]["groupe_nom"] == "Groupe Test"
+        assert posts[0]["texte"] == "Terrain de 300m2 a vendre a Ouagadougou."
+        assert posts[0]["date_incertaine"] is False
+        assert posts[0]["date_publication"] is not None
+
+    def test_ignore_une_story_sans_texte(self):
+        story = _story_synthetique(id_="s2")
+        story["comet_sections"]["content"]["story"]["comet_sections"]["message_container"]["story"]["message"]["text"] = ""
+        payload = {"root": story}
+        posts = scraper.extraire_stories_depuis_json(payload, "grp1", "Groupe Test")
+        assert posts == []
+
+    def test_deduplique_par_id_dans_un_meme_payload(self):
+        story = _story_synthetique(id_="s3")
+        payload = {"edges": [{"node": story}, {"autre": story}]}
+        posts = scraper.extraire_stories_depuis_json(payload, "grp1", "Groupe Test")
+        assert len(posts) == 1
+
+    def test_plusieurs_stories_distinctes(self):
+        payload = {
+            "edges": [
+                {"node": _story_synthetique(id_="s4", texte="Annonce A")},
+                {"node": _story_synthetique(id_="s5", texte="Annonce B")},
+            ]
+        }
+        posts = scraper.extraire_stories_depuis_json(payload, "grp1", "Groupe Test")
+        assert {p["id"] for p in posts} == {"s4", "s5"}
+
+    def test_date_incertaine_si_creation_time_absent(self):
+        story = _story_synthetique(id_="s6", creation_time=None)
+        payload = {"root": story}
+        posts = scraper.extraire_stories_depuis_json(payload, "grp1", "Groupe Test")
+        assert posts[0]["date_incertaine"] is True
+        assert posts[0]["date_publication"] is None
+
+    def test_payload_non_dict_ni_liste_ne_leve_pas(self):
+        assert scraper.extraire_stories_depuis_json("juste une chaine", "grp1", "Groupe Test") == []
+        assert scraper.extraire_stories_depuis_json(None, "grp1", "Groupe Test") == []
+
+
+class TestExtraireStoriesDepuisScriptsJson:
+    def test_extrait_depuis_un_bloc_script_json_valide(self):
+        story = _story_synthetique(id_="s7")
+        payload = json.dumps({"data": {"group": story}})
+        html = (
+            "<html><body>"
+            f'<script type="application/json" data-sjs>{payload}</script>'
+            "</body></html>"
+        )
+        posts = scraper._extraire_stories_depuis_scripts_json(html, "grp1", "Groupe Test")
+        assert len(posts) == 1
+        assert posts[0]["id"] == "s7"
+
+    def test_ignore_un_bloc_script_json_invalide(self):
+        html = '<script type="application/json">{ceci n est pas du json}</script>'
+        posts = scraper._extraire_stories_depuis_scripts_json(html, "grp1", "Groupe Test")
+        assert posts == []
+
+    def test_deduplique_entre_plusieurs_blocs_script(self):
+        story = _story_synthetique(id_="s8")
+        payload = json.dumps({"root": story})
+        html = (
+            f'<script type="application/json">{payload}</script>'
+            f'<script type="application/json">{payload}</script>'
+        )
+        posts = scraper._extraire_stories_depuis_scripts_json(html, "grp1", "Groupe Test")
+        assert len(posts) == 1
+
+    def test_html_sans_script_json_retourne_liste_vide(self):
+        html = "<html><body><p>Rien ici.</p></body></html>"
+        assert scraper._extraire_stories_depuis_scripts_json(html, "grp1", "Groupe Test") == []
 
 
 class TestSeenIds:

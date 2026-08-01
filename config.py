@@ -294,55 +294,82 @@ MAX_DAYS_BACK_DAILY = 1
 MAX_DAYS_BACK_BACKFILL_DEFAULT = 7
 GROUPS_BATCH_SIZE_DEFAULT = 5
 
-# Interface Facebook ciblée : mbasic (HTML léger, server-rendered, pagination
-# par lien plutôt que scroll JS) au lieu du Facebook standard. Choix motivé
-# par deux gains concrets : un DOM nettement plus stable (donc moins de
-# maintenance des sélecteurs) et l'accès à un horodatage textuel exploitable
-# (le Facebook standard ne l'exposait pas de façon fiable - voir
-# `_parser_horodatage_relatif`). INCERTITUDE ASSUMÉE : je n'ai pas d'accès
-# réseau à facebook.com pour vérifier que mbasic.facebook.com répond encore
-# tel que documenté publiquement au moment de la rédaction - à valider avec
-# une session réelle avant tout run sérieux (voir README.md).
+# --------------------------------------------------------------------------- #
+# HISTORIQUE D'ARCHITECTURE (important pour comprendre le code ci-dessous) :
+#
+# 1. Choix initial : mbasic.facebook.com (HTML léger server-rendered),
+#    jamais vérifié en conditions réelles faute d'accès réseau.
+# 2. Premier run live (2026-08-01) : mbasic a renvoyé l'app React "Comet"
+#    (mêmes marqueurs que le Facebook standard), pas de HTML léger.
+# 3. Deux tentatives de contournement par changement de User-Agent (un UA
+#    2011 puis un UA Android récent) : la seconde a évité Comet mais a
+#    atterri sur une page de "groupes suggérés" générique, jamais le fil du
+#    groupe ciblé.
+# 4. Test décisif : l'utilisateur a ouvert lui-même l'URL dans SON navigateur
+#    réel (aucune automation, aucun UA modifié) et a récupéré le vrai
+#    "View Source" de la page. Verdict sans ambiguïté : mbasic.facebook.com
+#    redirige tout navigateur réel vers web.facebook.com, qui sert l'app
+#    Comet - CE N'EST PAS UN PROBLÈME DE USER-AGENT, c'est que Facebook ne
+#    sert plus de HTML léger du tout aux sessions authentifiées en 2026.
+# 5. MAIS : l'inspection de ce "View Source" réel a révélé que Comet
+#    embarque les données des posts en clair, sous forme de JSON, dans des
+#    balises `<script type="application/json" data-sjs>` (payload Relay/
+#    GraphQL utilisé pour l'hydratation React) - texte du post, horodatage
+#    Unix exact (`creation_time`), id et URL du post, tout y est. Confirmé
+#    sur un échantillon réel (une annonce de parcelle avec son vrai texte,
+#    son vrai lien permanent, son vrai horodatage).
+#
+# Nouvelle stratégie retenue (voir `extraire_stories_depuis_json` dans
+# scraper.py) : au lieu de scroller/paginer un DOM HTML avec des sélecteurs
+# CSS, on parse directement ces blobs JSON - au chargement initial de la
+# page (posts "mis en avant") ET dans les réponses GraphQL déclenchées par
+# le scroll (fil principal, chargé dynamiquement). C'est plus puissant mais
+# aussi plus fragile : la structure interne n'est pas documentée
+# publiquement, n'est stabilisée par aucun contrat, et peut changer sans
+# préavis à la prochaine mise à jour de Facebook. Conçu pour échouer
+# silencieusement poste par poste plutôt que de planter tout le run.
+# --------------------------------------------------------------------------- #
+
+WEB_FACEBOOK_BASE_URL = "https://web.facebook.com"
+
+# Conservé pour référence/historique uniquement - mbasic redirige les
+# navigateurs réels vers web.facebook.com, voir ci-dessus. Plus utilisé par
+# le code de scraping actif.
 MBASIC_BASE_URL = "https://mbasic.facebook.com"
 
-# BUG TROUVÉ EN CONDITIONS RÉELLES (2026-08-01, premier run live) : avec un
-# User-Agent Chrome desktop moderne, mbasic.facebook.com a renvoyé
-# l'application React "Comet" (marqueurs `GroupsCometFeed`, `mount_0_0`,
-# `ssr-finished-successfully`) au lieu du HTML léger attendu (`data-ft`/
-# `article` absents à 100%).
-#
-# Round 1 (échec partiel) : UA Android 2.3.5 (2011, HTC Desire S). Résultat :
-# plus de Comet (page passée de 3,3 Mo à 300 Ko, redirigée en interne vers
-# m.facebook.com avec `shouldForceMTouch=1`), mais la page retournée était un
-# carrousel de "groupes suggérés" ("Rejoindre" x40, cartes d'AUTRES groupes
-# avec nombre de membres), PAS le fil du groupe ciblé - l'id du groupe
-# n'apparaissait que 3 fois dans toute la page, jamais lié à un post.
-# Hypothèse : cet UA était trop extrême (pré-smartphone), déclenchant un
-# mauvais aiguillage côté Facebook plutôt que la vraie vue "WebLite" du
-# groupe.
-#
-# Round 2 (valeur actuelle, NON CONFIRMÉE) : UA Android récent et courant
-# (téléphone milieu de gamme, 2024-2025) - hypothèse que Facebook route vers
-# l'expérience mobile légère (WebLite/Bloks, pas Comet) pour un appareil
-# mobile réel et courant, sans tomber dans un cas limite comme un UA trop
-# ancien. INCERTITUDE ASSUMÉE (non vérifiable sans accès réseau depuis mon
-# environnement) : à confirmer par un run réel. Si le prochain dump HTML
-# montre encore 0 lien vers ce groupe précis, le problème n'est probablement
-# plus le User-Agent - voir README.md pour la suite (ground truth à obtenir
-# depuis un vrai navigateur connecté).
+# User-Agent desktop standard (pas un UA mobile spoofé - les deux tentatives
+# de spoofing UA ont échoué à obtenir autre chose que Comet ou une page
+# générique, voir historique ci-dessus). Puisque Comet est de toute façon
+# inévitable, autant utiliser un UA cohérent avec le reste du fingerprint
+# (viewport desktop) plutôt qu'un mensonge inutile.
 MBASIC_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 13; SM-A146U) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-PAGE_DELAY_MIN_S = 2.0  # délai entre deux chargements de page (remplace l'ancien délai de scroll)
+PAGE_DELAY_MIN_S = 2.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
 PAGE_DELAY_MAX_S = 5.0
 PAUSE_ENTRE_BATCHES_MIN_S = 15.0
 PAUSE_ENTRE_BATCHES_MAX_S = 45.0
 
-MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt de la pagination si N pages consécutives sans nouveauté
-MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter une pagination infinie
+MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
+MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini
 NAVIGATION_TIMEOUT_MS = 30_000
+
+# Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
+# les réponses réseau déclenchées par le scroll et y chercher des posts).
+# INCERTITUDE ASSUMÉE : ce pattern (`/api/graphql/`) est celui documenté
+# publiquement par la communauté pour Facebook web, non vérifié en conditions
+# réelles depuis mon environnement (pas d'accès réseau). Si le scroll ne
+# ramène jamais de nouveau post en conditions réelles alors que le compte a
+# clairement plus de contenu, ce pattern est le premier suspect à vérifier
+# (ouvrir les DevTools > Network > filtrer "graphql" pendant un scroll réel).
+GRAPHQL_URL_FRAGMENTS = ["/api/graphql/"]
+
+# Profondeur maximale de parcours récursif d'un blob JSON à la recherche de
+# posts - protection contre un coût CPU excessif sur un payload très large
+# et profondément imbriqué (observé : blobs de 170 Ko+, des centaines par page).
+JSON_PROFONDEUR_MAX = 12
 
 # --------------------------------------------------------------------------- #
 # Stratégie anti-blocage : circuit breaker + budget de session

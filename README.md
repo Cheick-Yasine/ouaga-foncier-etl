@@ -23,35 +23,59 @@ vous avant tout usage sérieux :
    cadre académique du projet — évaluez si une alternative (API officielle,
    service tiers comme Apify) est acceptable pour votre cas d'usage avant
    de lancer le pipeline en production.
-2. **Sélecteurs DOM de `scraper.py` - risque confirmé en conditions réelles
-   le 2026-08-01.** Premier run live : 0 post extrait. Le HTML de debug
-   sauvegardé (`data/logs/debug_page_vide_*.html`, voir mécanisme ajouté ce
-   jour-là) a révélé que `mbasic.facebook.com` avait renvoyé l'application
-   React moderne "Comet" (marqueurs `GroupsCometFeed`, `mount_0_0`,
-   `ssr-finished-successfully`) au lieu du HTML léger attendu - `data-ft` et
-   `<article>` totalement absents, donc `SELECTEURS` ne pouvait rien matcher.
-   Hypothèse retenue et codée : le rendu dépendrait du User-Agent envoyé -
-   `config.MBASIC_USER_AGENT` a été changé pour un vieux navigateur mobile.
-   **Non confirmé** (pas d'accès réseau depuis mon environnement pour
-   valider) : si un nouveau run produit encore un dump HTML sans `data-ft`,
-   c'est que cette hypothèse est fausse et que mbasic ne sert peut-être plus
-   de HTML léger du tout en 2026 pour les sessions authentifiées - dans ce
-   cas, l'architecture "scraping HTML léger server-rendered" choisie pour ce
-   projet ne tient plus et demanderait une refonte plus profonde (parsing des
-   blobs JSON embarqués dans le HTML SSR de Comet, beaucoup plus fragile).
-   Testez avec `--group-limit 1` avant tout run à volume.
-3. **Extraction de l'horodatage : logique implémentée et testée, format
-   textuel non vérifié.** `_parser_horodatage_relatif` (fonction pure, 15
-   tests unitaires) convertit correctement "3 h", "Hier à 14:30", "1 août
-   2025", etc. en date absolue - ce qui manquait totalement dans la version
-   précédente de ce module (qui ciblait le Facebook standard, sans horodatage
-   exploitable). Ce qui reste incertain : je ne sais pas avec certitude que
-   ce sont exactement les chaînes que mbasic affiche en 2026 avec une locale
-   fr-FR - à confirmer sur un run réel. Tant que ce n'est pas confirmé, un
-   format non reconnu retourne `None` (`date_incertaine=True`) plutôt que de
-   deviner, donc aucun risque de date silencieusement fausse - au pire, le
-   critère d'arrêt basé sur `days_back` ne se déclenche pas sur ce post-là.
-4. **`groups.csv` contient les 15 groupes réels** issus de `Groupe.csv`
+2. **Architecture révisée le 2026-08-01 : `mbasic.facebook.com` ne sert plus
+   de HTML léger, confirmé (pas juste supposé).** Premier run live : 0 post
+   extrait, mais aucune erreur (cookies et connexion DB valides). Le HTML de
+   debug (`data/logs/debug_page_vide_*.html`) a révélé l'application React
+   moderne "Comet" (marqueurs `GroupsCometFeed`, `mount_0_0`,
+   `ssr-finished-successfully`) au lieu du HTML léger attendu. Deux tentatives
+   de contournement par User-Agent (vieux navigateur Android puis Chrome
+   Android récent) ont échoué - la seconde retombait sur une page générique
+   "groupes suggérés", pas le fil du groupe ciblé. Diagnostic définitif obtenu
+   en demandant un "Afficher le code source" de `web.facebook.com/groups/<id>/`
+   depuis un vrai navigateur connecté (donnée de référence, pas une
+   supposition) : `mbasic` redirige systématiquement vers `web.facebook.com`
+   pour une session authentifiée en 2026, quel que soit le User-Agent.
+   **Bonne nouvelle inattendue** : Comet embarque quand même les posts en
+   clair, sous forme de JSON (`<script type="application/json">`, format
+   Relay/GraphQL interne), donc pas besoin d'exécuter le JavaScript pour
+   récupérer du contenu réel. `scraper.py` a été réécrit en conséquence
+   (`extraire_stories_depuis_json` et fonctions associées, testées avec 24
+   tests sur données synthétiques - voir section Tests) pour parcourir ces
+   blobs par signature structurelle (`id` + `url` + `comet_sections`) plutôt
+   que par chemin de clés fixe, l'API interne de Facebook n'étant pas
+   documentée et pouvant changer sans préavis.
+3. **Limite non résolue : le HTML initial ne contient que les posts "mis en
+   avant" (3 dans l'échantillon analysé), pas le fil complet.** Le vrai fil
+   chronologique du groupe (`group_feed`) est chargé dynamiquement par des
+   appels GraphQL déclenchés au scroll - absent de la réponse HTML initiale.
+   `scraper_groupe` a donc été réécrit pour (a) cibler `web.facebook.com`,
+   (b) intercepter les réponses réseau GraphQL via `page.on("response", ...)`
+   et les parser avec le même `extraire_stories_depuis_json`, (c) simuler un
+   scroll (`window.scrollBy`) entre chaque étape pour déclencher ce
+   chargement. **Cette partie n'a jamais pu être testée en conditions
+   réelles** (aucun accès réseau vers facebook.com depuis mon environnement
+   de développement) - deux hypothèses non vérifiées : le motif d'URL utilisé
+   pour repérer les requêtes GraphQL (`config.GRAPHQL_URL_FRAGMENTS =
+   ["/api/graphql/"]`, déduit de connaissances publiques sur l'architecture
+   Facebook, pas observé directement) et le fait qu'un scroll simulé par
+   Playwright déclenche bien les mêmes appels réseau qu'un scroll humain.
+   **Testez impérativement avec `--group-limit 1` et regardez les logs** :
+   si le nombre de posts trouvés reste à 0 ou anormalement bas (proche de 3),
+   inspectez `data/logs/debug_page_vide_*.html` et signalez-le-moi plutôt que
+   de lancer un run à volume.
+4. **Extraction de l'horodatage : fiable, basée sur un timestamp Unix réel.**
+   `_extraire_creation_time_story` lit `creation_time` (entier Unix) trouvé
+   dans le JSON Comet et le convertit en date absolue via
+   `datetime.fromtimestamp(..., tz=timezone.utc)` - plus fiable que l'ancien
+   parsing de texte relatif ("3 h", "Hier à 14:30", conçu pour le HTML mbasic
+   qui n'est plus utilisé). L'ancien parseur (`_parser_horodatage_relatif`,
+   15 tests) est conservé dans le code mais n'est plus appelé - pur, testé,
+   inoffensif, gardé au cas où un retour à du HTML léger redeviendrait
+   pertinent. Si `creation_time` est absent d'une story (structure JSON
+   inattendue), la date reste `None` (`date_incertaine=True`) plutôt que
+   d'être devinée.
+5. **`groups.csv` contient les 15 groupes réels** issus de `Groupe.csv`
    (converti par vous depuis `Groupe.xlsx`). Deux points à valider :
    - Ligne `1412949025757240` ("VENTE ET ACHAT A OUAGADOUGOU") est marquée
      `Private` — pour qu'un groupe privé soit scrapable, le compte associé
@@ -65,15 +89,16 @@ vous avant tout usage sérieux :
      `true` si vous voulez quand même la scraper. La ligne `331961108512130`
      ("... partout au Burkina") reste active mais couvre plus large que la
      seule Ouagadougou, à vous de juger.
-5. **Divergence dans le cahier des charges** : Python 3.11 est mentionné
+6. **Divergence dans le cahier des charges** : Python 3.11 est mentionné
    dans le bloc "Architecture" et Python 3.12.7 dans le bloc "Workflow
    GitHub Actions". J'ai retenu **3.12.7** dans le workflow (la mention la
    plus précise) — à confirmer.
-6. **Suite de tests désormais exécutée réellement** (139/139 au 2026-08-01,
+7. **Suite de tests désormais exécutée réellement** (145/145 au 2026-08-01,
    voir section Tests) — mais uniquement la logique pure. Le scraping live
-   contre facebook.com n'a toujours pas pu être testé (pas d'accès réseau
-   vers Facebook depuis mon environnement).
-7. **DATABASE_URL en CI = Neon (Postgres serverless, tier gratuit).**
+   contre facebook.com n'a toujours pas pu être testé de bout en bout (pas
+   d'accès réseau vers Facebook depuis mon environnement) - voir point 3
+   ci-dessus pour la partie scroll/GraphQL, la plus incertaine.
+8. **DATABASE_URL en CI = Neon (Postgres serverless, tier gratuit).**
    Migration SQLite → PostgreSQL faite à votre demande. Votre instance
    PostgreSQL locale n'étant pas joignable depuis un runner GitHub Actions
    (machine éphémère dans le cloud, pas sur votre réseau), vous avez choisi
@@ -81,7 +106,7 @@ vous avant tout usage sérieux :
    "Base de données" ci-dessous pour le dimensionnement (le tier gratuit
    0,5 Go / 100 CU-heures est largement suffisant pour ce volume de données)
    et les étapes de configuration.
-8. **Étape B = API OpenAI (gpt-4o-mini), jamais testée contre l'API réelle.**
+9. **Étape B = API OpenAI (gpt-4o-mini), jamais testée contre l'API réelle.**
    Remplacement complet de l'API Claude par l'API OpenAI le 2026-08-01
    (demande explicite). L'appel `chat.completions.create` avec Structured
    Outputs (`response_format` json_schema strict) est construit à partir du
@@ -243,7 +268,7 @@ risque de blocage. Par ordre d'impact réel estimé :
   repartir d'un navigateur vierge chaque jour. Les cookies, eux, viennent
   toujours de `FB_COOKIES_JSON` (source de vérité).
 - **Échauffement de session** : la première action de chaque run est une
-  visite de `mbasic.facebook.com/`, pas un saut direct dans un groupe.
+  visite de `web.facebook.com/`, pas un saut direct dans un groupe.
 - Masquage du flag `navigator.webdriver` (une ligne, technique documentée
   publiquement, pas une suite de contournement).
 - **Jitter temporel** : délai aléatoire de 0 à 20 min avant démarrage sur le
@@ -304,23 +329,26 @@ export TEST_DATABASE_URL="postgresql://postgres:motdepasse@localhost:5432/ouaga_
 pytest -q
 ```
 
-**État réel (mis à jour 2026-08-01) : 139/139 tests passent réellement**
+**État réel (mis à jour 2026-08-01) : 145/145 tests passent réellement**
 (`pytest -q`, exécuté pour de vrai, pas juste écrit — y compris les tests de
 base de données, contre un vrai serveur PostgreSQL 16 local via `pgserver`).
 Couverture : Étape A (regex, 100% hors-ligne), Étape B (API OpenAI entièrement
 mockée — aucun test ne consomme de crédits API), base maître PostgreSQL
 (upsert, export Excel, détection de dérive, isolation par TRUNCATE entre
 tests), throttle adaptatif AIMD (15 tests, purement arithmétique), parseur
-d'horodatage mbasic (15 tests, désormais entièrement testable contrairement à
-l'ancienne extraction jamais implémentée), CLI (`main.py`), cooldown/circuit-
-breaker. Les parties de `scraper.py` qui pilotent un vrai navigateur
-(`creer_navigateur`, `scraper_groupe`, `extraire_posts_visibles`,
-`echauffement`, `_extraire_lien_page_suivante`) ne sont PAS testées
-automatiquement — elles nécessitent une vraie session Playwright/mbasic.facebook.com,
-toujours inaccessible depuis mon environnement. Le workflow GitHub Actions
-bloque désormais le scraping si cette suite échoue (job `tests` séparé, avec
-un service Postgres éphémère dédié — voir "Stratégie anti-blocage" et
-`.github/workflows/daily_scraper.yml`).
+JSON des stories Comet (24 tests sur données synthétiques -
+`extraire_stories_depuis_json` et fonctions associées, voir point 2/3 des
+risques ci-dessus), ancien parseur d'horodatage texte (15 tests, conservé
+mais plus appelé, voir point 4 des risques), CLI (`main.py`),
+cooldown/circuit-breaker. Les parties de `scraper.py` qui pilotent un vrai
+navigateur (`creer_navigateur`, `scraper_groupe`, `echauffement`) ne sont PAS
+testées automatiquement — elles nécessitent une vraie session Playwright
+contre `web.facebook.com`, toujours inaccessible depuis mon environnement (le
+scroll + la capture réseau GraphQL de `scraper_groupe` en particulier n'ont
+jamais tourné en conditions réelles, voir point 3 des risques). Le workflow
+GitHub Actions bloque désormais le scraping si cette suite échoue (job
+`tests` séparé, avec un service Postgres éphémère dédié — voir "Stratégie
+anti-blocage" et `.github/workflows/daily_scraper.yml`).
 
 **Bugs réels trouvés en exécutant la suite** (pas juste en la lisant) :
 - Historique (API remplacée depuis, voir plus bas) : `anthropic==0.34.2`
@@ -359,7 +387,7 @@ ci-dessus, sélecteurs non vérifiés en live).
 ```
 ouaga-foncier-etl/
 ├── config.py              # mots-clés, quartiers, délais, chargement des groupes
-├── scraper.py             # Playwright async (mbasic), pagination, throttle adaptatif
+├── scraper.py             # Playwright async (web.facebook.com/Comet), scroll+JSON, throttle adaptatif
 ├── processor.py           # filtrage regex + structuration API OpenAI + base maître PostgreSQL
 ├── main.py                # orchestrateur CLI
 ├── groups.csv             # liste des groupes (15, voir "Risques et limites")
