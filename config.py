@@ -1,0 +1,442 @@
+"""Configuration centrale du pipeline ETL (mots-clés, quartiers, délais, chemins).
+
+Toute constante "métier" (regex, quartiers, délais anti-bot) vit ici pour que
+scraper.py / processor.py / main.py restent des modules de logique pure, sans
+valeur hardcodée dispersée.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# Arborescence
+# --------------------------------------------------------------------------- #
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"  # posts bruts scrapés, sauvegarde incrémentale
+PROCESSED_DIR = DATA_DIR / "processed"  # sorties CSV/JSON structurées
+STATE_DIR = DATA_DIR / "state"  # ids déjà vus (déduplication inter-runs)
+LOG_DIR = DATA_DIR / "logs"
+
+for _dir in (RAW_DIR, PROCESSED_DIR, STATE_DIR, LOG_DIR):
+    _dir.mkdir(parents=True, exist_ok=True)
+
+GROUPS_CSV_PATH = BASE_DIR / "groups.csv"
+SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
+COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
+STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
+SANTE_PATH = STATE_DIR / "sante_scraper.json"
+
+# Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
+# SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir
+# processor.py). La base maître elle-même n'est plus un fichier local depuis
+# la migration SQLite -> PostgreSQL : voir DATABASE_URL ci-dessous.
+MASTER_XLSX_PATH = PROCESSED_DIR / "annonces.xlsx"
+
+# --------------------------------------------------------------------------- #
+# Variables d'environnement (secrets)
+# --------------------------------------------------------------------------- #
+
+ENV_FB_COOKIES = "FB_COOKIES_JSON"
+ENV_ANTHROPIC_KEY = "ANTHROPIC_API_KEY"
+ENV_DATABASE_URL = "DATABASE_URL"
+
+# Base de données maître PostgreSQL (source de vérité, upsert par id de post).
+# Lue depuis l'environnement (secret GitHub Actions en CI, .env en local via
+# python-dotenv - voir main.py). Pas de valeur par défaut "pratique" du type
+# localhost:5432 : une absence de DATABASE_URL doit échouer bruyamment plutôt
+# que de pointer silencieusement vers une base qui n'existe pas chez l'utilisateur.
+DATABASE_URL = os.environ.get(ENV_DATABASE_URL, "")
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+
+
+def configurer_logging(niveau: int = logging.INFO) -> logging.Logger:
+    """Configure un logger unique pour tout le pipeline (console + fichier)."""
+    logger = logging.getLogger("ouaga_foncier_etl")
+    if logger.handlers:  # évite les handlers dupliqués si appelé plusieurs fois
+        return logger
+    logger.setLevel(niveau)
+
+    formatteur = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler_console = logging.StreamHandler()
+    handler_console.setFormatter(formatteur)
+    logger.addHandler(handler_console)
+
+    handler_fichier = logging.FileHandler(LOG_DIR / "pipeline.log", encoding="utf-8")
+    handler_fichier.setFormatter(formatteur)
+    logger.addHandler(handler_fichier)
+
+    return logger
+
+
+# --------------------------------------------------------------------------- #
+# Groupes Facebook à scraper
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Groupe:
+    """Représente un groupe Facebook cible."""
+
+    id: str
+    nom: str
+    url: str
+    actif: bool = True
+
+
+def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -> list[Groupe]:
+    """Charge la liste des groupes depuis groups.csv (source unique de vérité).
+
+    IMPORTANT : cette liste n'est PAS hardcodée dans le code. Le fichier
+    Groupe.xlsx fourni à la racine de "F:\\Scraping Facebook" n'a pas pu être
+    lu automatiquement lors de la génération de ce projet (accès shell
+    indisponible dans mon environnement à ce moment-là). `groups.csv` contient
+    donc des lignes TODO à compléter/valider manuellement - voir README.md.
+
+    Args:
+        chemin: chemin vers le fichier CSV des groupes.
+        limite: si fourni, ne retourne que les N premiers groupes actifs
+            (utilisé par `--group-limit` en CLI pour les tests/rattrapages).
+
+    Raises:
+        FileNotFoundError: si groups.csv est absent.
+        ValueError: si le CSV est vide ou mal formé.
+    """
+    if not chemin.exists():
+        raise FileNotFoundError(
+            f"Fichier de groupes introuvable : {chemin}. "
+            "Créez-le à partir de Groupe.xlsx (voir README.md)."
+        )
+
+    groupes: list[Groupe] = []
+    with chemin.open(encoding="utf-8") as f:
+        lecteur = csv.DictReader(f)
+        colonnes_attendues = {"id", "nom", "url", "actif"}
+        if lecteur.fieldnames is None or not colonnes_attendues.issubset(set(lecteur.fieldnames)):
+            raise ValueError(
+                f"En-têtes CSV invalides dans {chemin} : attendu {colonnes_attendues}, "
+                f"trouvé {lecteur.fieldnames}"
+            )
+        for ligne in lecteur:
+            if ligne["id"].strip().upper().startswith("TODO"):
+                continue  # ligne placeholder non complétée : on l'ignore silencieusement
+            groupes.append(
+                Groupe(
+                    id=ligne["id"].strip(),
+                    nom=ligne["nom"].strip(),
+                    url=ligne["url"].strip(),
+                    actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
+                )
+            )
+
+    groupes_actifs = [g for g in groupes if g.actif]
+    if not groupes_actifs:
+        raise ValueError(
+            f"Aucun groupe actif trouvé dans {chemin}. "
+            "Vérifiez que les lignes TODO ont bien été remplacées."
+        )
+
+    if limite is not None and limite > 0:
+        groupes_actifs = groupes_actifs[:limite]
+
+    return groupes_actifs
+
+
+# --------------------------------------------------------------------------- #
+# Filtrage regex niveau 1 (marché foncier de Ouagadougou)
+# --------------------------------------------------------------------------- #
+
+# Mots-clés d'inclusion : présence d'AU MOINS UN de ces motifs = candidat potentiel.
+# Regroupés par thème pour faciliter la maintenance.
+_MOTS_FONCIER = [
+    r"parcelle", r"terrain", r"lotissement", r"non\s+loti", r"zone\s+lotie",
+    r"cession", r"hectares?", r"superficie",
+]
+_MOTS_DOCUMENT = [
+    r"attestation", r"titre\s+foncier", r"\btf\b", r"puh", r"permis\s+d[' ]habiter",
+    r"apfr", r"acte\s+de\s+cession", r"papier\s+en\s+r[eè]gle",
+]
+_MOTS_TRANSACTION = [
+    r"\b[àa]\s+vendre\b", r"\bvente\b", r"\bvendre\b", r"\bc[ée]der\b", r"\bprix\b",
+    r"n[ée]gociable",
+]
+
+MOTIF_FONCIER = re.compile(
+    r"\b(" + "|".join(_MOTS_FONCIER + _MOTS_DOCUMENT + _MOTS_TRANSACTION) + r")\b",
+    re.IGNORECASE,
+)
+
+# Unités de superficie ("ha", "m2", "m²") gérées à part avec une ancre sur le
+# chiffre qui précède plutôt qu'un \b classique. Raison : dans l'écriture
+# courante ("600m2", "5ha", sans espace), le chiffre et la lettre sont tous les
+# deux des caractères "mot" pour le moteur regex -> \b ne trouve AUCUNE
+# frontière entre eux et ne matche jamais. Idem pour \b après "²", qui n'est
+# pas considéré comme un caractère "mot" par Python (donc jamais suivi d'une
+# frontière valide devant un espace, lui aussi non-mot). Bug identifié et
+# corrigé en relecture - non testé en conditions réelles (sandbox indisponible
+# au moment de la génération), à confirmer sur un échantillon réel d'annonces.
+MOTIF_SUPERFICIE_NUMERIQUE = re.compile(r"\d\s*(m2|m²|ha)(?=\D|$)", re.IGNORECASE)
+
+# Recherches d'achat ("je cherche/recherche un terrain...") : à exclure de l'envoi au
+# LLM car ce ne sont PAS des annonces de vente. Heuristique volontairement prudente :
+# si le texte contient un verbe de recherche ET ne contient PAS de signal de vente
+# explicite (souvent une recherche republie une annonce trouvée ailleurs), on exclut.
+MOTIF_RECHERCHE_ACHAT = re.compile(
+    r"\b(je\s+recherche|recherche\s+un[e]?|cherche\s+un[e]?|besoin\s+d[' ]un[e]?|"
+    r"suis\s+preneur|qui\s+a\s+un[e]?\s+(terrain|parcelle)\s+[àa]\s+(vendre|proposer))\b",
+    re.IGNORECASE,
+)
+MOTIF_SIGNAL_VENTE = re.compile(
+    r"\b([àa]\s+vendre|vends|disponible\s+[àa]\s+la\s+vente)\b|prix\s*:?\s*\d+",
+    re.IGNORECASE,
+)
+
+# Locations (à ne pas rejeter, mais à taguer - le foncier "vente" reste la cible
+# métier principale ; laissé au LLM de trancher via `type_bien`/`resume_court`).
+MOTIF_LOCATION = re.compile(r"\b(location|louer|loyer|bail)\b", re.IGNORECASE)
+
+# Spam grossier détectable sans LLM (économie de coûts) : arnaques, contenus hors-sujet
+# manifestes. Volontairement restreint pour limiter les faux positifs - un pattern trop
+# large rejetterait de vraies annonces. À enrichir avec des cas réels observés.
+#
+# BUG CORRIGÉ (trouvé en exécutant réellement la suite de tests) : la version
+# précédente incluait `whatsapp\s*:?\s*\+?\d{8,}.{0,5}$` pour détecter les posts
+# qui ne sont QU'un numéro de téléphone (spam de contact). En pratique, la quasi-
+# totalité des vraies annonces immobilières se terminent aussi par un numéro
+# WhatsApp ("...Contact WhatsApp 70123456.") - ce motif rejetait donc la majorité
+# des annonces légitimes (faux négatif massif, découvert par le test
+# `test_separe_correctement_candidats_et_rejetes`). Supprimé plutôt que rafistolé :
+# la présence d'un numéro en fin de texte n'est PAS un signal fiable de spam dans
+# ce domaine métier précis.
+MOTIF_SPAM = re.compile(
+    r"(cliquez\s+ici|gagnez\s+\d|投资|forex\s+trading|crypto\s*(monnaie)?\s+gratuit)",
+    re.IGNORECASE,
+)
+
+
+def est_candidat_foncier(texte: str) -> bool:
+    """Étape A du filtrage : décide si un post mérite d'être envoyé au LLM.
+
+    Règle : (mot-clé foncier présent) ET (pas de spam évident) ET
+    (pas une recherche d'achat pure, sauf si un signal de vente cohabite -
+    cas fréquent d'un post republié ambigu, laissé au LLM pour trancher).
+
+    Limite connue : détection d'intention (achat vs vente) par regex est
+    approximative. Des faux négatifs (annonces rejetées à tort) sont possibles
+    sur des tournures inhabituelles. Pas de faux positifs coûteux en revanche,
+    car l'étape B (LLM) revalide `est_une_annonce_valide`.
+    """
+    if not texte or not texte.strip():
+        return False
+    if MOTIF_SPAM.search(texte):
+        return False
+    if not (MOTIF_FONCIER.search(texte) or MOTIF_SUPERFICIE_NUMERIQUE.search(texte)):
+        return False
+    if MOTIF_RECHERCHE_ACHAT.search(texte) and not MOTIF_SIGNAL_VENTE.search(texte):
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Quartiers / zones de Ouagadougou (normalisation)
+# --------------------------------------------------------------------------- #
+
+# Liste non exhaustive des quartiers/secteurs/communes couramment cités dans les
+# annonces foncières à Ouagadougou. À COMPLÉTER au fil de l'eau : quand le LLM
+# renvoie un `quartier_zone` absent de cette liste, il est conservé tel quel
+# (voir processor.py) plutôt que forcé/déformé - on ne veut pas perdre
+# d'information par excès de normalisation.
+QUARTIERS_OUAGA = [
+    "Ouaga 2000", "Karpala", "Pissy", "Saaba", "Komsilga", "Cissin", "Tanghin",
+    "Gounghin", "Kossodo", "Nioko", "Bassinko", "Yagma", "Tampouy", "Zagtouli",
+    "Kamboinsé", "Nongr-Massom", "Sig-Noghin", "Baskuy", "Bogodogo", "Boulmiougou",
+    "Tanghin-Dassouri", "Koubri", "Loumbila", "Pabré", "Dapoya", "Zone du Bois",
+    "Patte d'Oie", "Ouidi", "Kilwin", "Rimkiéta", "Yamtenga",
+]
+
+_QUARTIERS_NORMALISES = {q.lower(): q for q in QUARTIERS_OUAGA}
+
+
+def normaliser_quartier(valeur: str | None) -> str | None:
+    """Tente de faire correspondre un quartier libre à la liste normalisée.
+
+    Correspondance stricte (insensible à la casse) uniquement - volontairement
+    pas de fuzzy-matching (Levenshtein, etc.) pour éviter de fusionner à tort
+    deux quartiers distincts. Si aucune correspondance, retourne la valeur
+    d'origine nettoyée (pas de perte de donnée), à trier manuellement plus tard.
+    """
+    if not valeur:
+        return None
+    nettoye = valeur.strip()
+    return _QUARTIERS_NORMALISES.get(nettoye.lower(), nettoye)
+
+
+# --------------------------------------------------------------------------- #
+# Paramètres de scraping / anti-détection
+# --------------------------------------------------------------------------- #
+
+# Ces valeurs peuvent être surchargées via les arguments CLI de main.py.
+MAX_DAYS_BACK_DAILY = 1
+MAX_DAYS_BACK_BACKFILL_DEFAULT = 7
+GROUPS_BATCH_SIZE_DEFAULT = 5
+
+# Interface Facebook ciblée : mbasic (HTML léger, server-rendered, pagination
+# par lien plutôt que scroll JS) au lieu du Facebook standard. Choix motivé
+# par deux gains concrets : un DOM nettement plus stable (donc moins de
+# maintenance des sélecteurs) et l'accès à un horodatage textuel exploitable
+# (le Facebook standard ne l'exposait pas de façon fiable - voir
+# `_parser_horodatage_relatif`). INCERTITUDE ASSUMÉE : je n'ai pas d'accès
+# réseau à facebook.com pour vérifier que mbasic.facebook.com répond encore
+# tel que documenté publiquement au moment de la rédaction - à valider avec
+# une session réelle avant tout run sérieux (voir README.md).
+MBASIC_BASE_URL = "https://mbasic.facebook.com"
+
+PAGE_DELAY_MIN_S = 2.0  # délai entre deux chargements de page (remplace l'ancien délai de scroll)
+PAGE_DELAY_MAX_S = 5.0
+PAUSE_ENTRE_BATCHES_MIN_S = 15.0
+PAUSE_ENTRE_BATCHES_MAX_S = 45.0
+
+MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt de la pagination si N pages consécutives sans nouveauté
+MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter une pagination infinie
+NAVIGATION_TIMEOUT_MS = 30_000
+
+# --------------------------------------------------------------------------- #
+# Stratégie anti-blocage : circuit breaker + budget de session
+# --------------------------------------------------------------------------- #
+#
+# Le facteur qui a le plus d'impact réel sur le risque de blocage n'est PAS le
+# code (délais, user-agent, etc.) mais l'infrastructure (réputation de l'IP/ASN
+# du runner) et la confiance du compte utilisé - voir README.md, section
+# "Stratégie anti-blocage". Ce qui suit ne compense pas ces facteurs, ça réduit
+# seulement le risque évitable côté comportement.
+
+# En cas de blocage détecté (checkpoint, mur anti-bot), on arrête TOUT le run
+# immédiatement (pas seulement le groupe en cours) et on impose un délai de
+# repos avant tout nouveau run - retenter aussitôt après un blocage est le
+# signal le plus voyant possible pour un système anti-bot.
+COOLDOWN_HEURES_APRES_BLOCAGE = 24
+COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 6  # probablement juste les cookies à renouveler, pas un blocage actif
+
+# Durée maximale d'un run, tous groupes confondus. Une session de scraping qui
+# tourne des heures d'affilée est un signal comportemental fort ; mieux vaut
+# couper proprement (les groupes restants seront traités au run suivant) que
+# de pousser un run interminable.
+SESSION_DUREE_MAX_MINUTES = 45
+
+# --------------------------------------------------------------------------- #
+# Throttle adaptatif (AIMD) : ajuste automatiquement délais et volume selon
+# l'historique récent, plutôt que d'appliquer toujours les mêmes réglages.
+# Logique "additive increase / multiplicative decrease" - le même principe que
+# le contrôle de congestion TCP : on ralentit fort et vite au moindre signal
+# de suspicion, on ré-accélère lentement seulement après plusieurs runs propres
+# consécutifs. C'est un throttle défensif auto-régulé, pas une technique
+# d'évasion : il ne cherche jamais à déjouer Facebook, seulement à réduire le
+# volume/rythme de lui-même quand quelque chose semble anormal.
+# --------------------------------------------------------------------------- #
+
+NIVEAU_CONFIANCE_MIN = 0.2
+NIVEAU_CONFIANCE_MAX = 1.0
+NIVEAU_CONFIANCE_INITIAL = 1.0
+NIVEAU_CONFIANCE_PALIER_SUSPICION = 0.5  # multiplicateur appliqué en cas de suspicion (decrease)
+RUNS_PROPRES_POUR_RAMPUP = 3  # nb de runs propres consécutifs avant d'augmenter la confiance
+RAMPUP_INCREMENT = 0.15  # augmentation additive, volontairement lente
+RATIO_ANOMALIES_SUSPICION = 0.3  # >30% de groupes en erreur sur un run = signal de suspicion
+COOLDOWN_MULTIPLICATEUR_MAX = 8  # plafonne le cooldown exponentiel (24h * 8 = 8 jours max)
+
+# --------------------------------------------------------------------------- #
+# Configuration LLM (structuration niveau 2)
+# --------------------------------------------------------------------------- #
+
+ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
+ANTHROPIC_TEMPERATURE = 0.0
+ANTHROPIC_MAX_TOKENS = 1024
+LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate limits)
+LLM_MAX_RETRIES = 3
+LLM_BACKOFF_BASE_S = 2.0
+
+TYPES_BIEN_VALIDES = ["parcelle", "maison", "villa", "ferme", "autre"]
+
+# Schéma "tool use" envoyé à l'API Claude pour forcer une sortie JSON structurée
+# et valide (plus robuste que de parser un bloc de texte libre en JSON).
+SCHEMA_ANNONCE_TOOL = {
+    "name": "structurer_annonce_fonciere",
+    "description": (
+        "Extrait les informations structurées d'une annonce immobilière/foncière "
+        "postée sur un groupe Facebook de Ouagadougou."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "est_une_annonce_valide": {
+                "type": "boolean",
+                "description": (
+                    "true si c'est une vraie annonce de vente d'un bien immobilier/foncier "
+                    "à Ouagadougou ou environs ; false si spam, recherche d'achat, "
+                    "hors-sujet ou contenu incompréhensible."
+                ),
+            },
+            "type_bien": {
+                "type": "string",
+                "enum": TYPES_BIEN_VALIDES,
+            },
+            "quartier_zone": {
+                "type": ["string", "null"],
+                "description": "Quartier/secteur/commune mentionné, tel qu'écrit dans le texte.",
+            },
+            "superficie_m2": {
+                "type": ["integer", "null"],
+                "description": "Superficie convertie en m² (1 ha = 10000 m²). null si absente.",
+            },
+            "prix_fcfa": {
+                "type": ["integer", "null"],
+                "description": "Prix en FCFA, sans séparateurs. null si absent ou 'non précisé'.",
+            },
+            "statut_document": {
+                "type": ["string", "null"],
+                "description": "Ex: Attestation, Titre Foncier, PUH, Permis d'habiter, APFR.",
+            },
+            "contacts_whatsapp": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Numéros de téléphone/WhatsApp mentionnés, format brut.",
+            },
+            "mots_cles_pertinents": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "resume_court": {
+                "type": "string",
+                "description": "Résumé en une phrase (max ~25 mots), en français.",
+            },
+        },
+        "required": [
+            "est_une_annonce_valide", "type_bien", "quartier_zone", "superficie_m2",
+            "prix_fcfa", "statut_document", "contacts_whatsapp",
+            "mots_cles_pertinents", "resume_court",
+        ],
+    },
+}
+
+PROMPT_SYSTEME_LLM = (
+    "Tu es un extracteur de données structurées spécialisé dans le marché foncier de "
+    "Ouagadougou (Burkina Faso). Tu reçois le texte brut d'un post Facebook et tu dois "
+    "appeler l'outil `structurer_annonce_fonciere` avec les champs extraits. "
+    "Règles strictes : ne devine JAMAIS une valeur absente du texte (mets null) ; "
+    "ne convertis pas approximativement un prix ou une superficie ambigus, laisse null ; "
+    "si le post est une recherche d'achat, du spam, ou non lié à l'immobilier/foncier "
+    "de la région de Ouagadougou, mets `est_une_annonce_valide` à false."
+)

@@ -1,0 +1,33 @@
+# Secrets / environnement
+.env
+*.env.local
+
+# Données scrapées (peuvent contenir des données personnelles - ne jamais versionner)
+data/raw/
+data/processed/
+data/state/
+data/logs/
+*.csv
+*.json
+!tests/fixtures/*.json
+!groups.csv
+
+# Artefacts pytest occasionnels (basetemp créé dans le cwd selon l'environnement)
+pytest-cache-files-*
+
+# Playwright
+node_modules/
+playwright-report/
+test-results/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS / éditeurs
+.DS_Store
+.vscode/

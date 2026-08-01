@@ -1,0 +1,192 @@
+"""Tests de l'Étape B (structuration via API Claude) - le client HTTP est TOUJOURS
+mocké : cette suite ne fait jamais d'appel réseau réel ni ne consomme de crédits API.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+from anthropic import RateLimitError
+
+import config
+import processor
+
+
+ANNONCE_VALIDE_BRUTE = {
+    "est_une_annonce_valide": True,
+    "type_bien": "parcelle",
+    "quartier_zone": "ouaga 2000",  # volontairement en minuscule pour tester la normalisation
+    "superficie_m2": 600,
+    "prix_fcfa": 15_000_000,
+    "statut_document": "Titre Foncier",
+    "contacts_whatsapp": ["70123456"],
+    "mots_cles_pertinents": ["parcelle", "titre foncier"],
+    "resume_court": "Parcelle 600m2 à Ouaga 2000, titre foncier, 15M FCFA.",
+}
+
+
+class _FauxBlocOutil:
+    def __init__(self, input_dict: dict):
+        self.type = "tool_use"
+        self.input = input_dict
+
+
+class _FausseReponse:
+    def __init__(self, content: list):
+        self.content = content
+
+
+def _erreur_rate_limit() -> RateLimitError:
+    requete = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    reponse = httpx.Response(status_code=429, request=requete)
+    return RateLimitError("rate limited (test)", response=reponse, body=None)
+
+
+@pytest.fixture(autouse=True)
+def pas_de_vraie_attente(monkeypatch):
+    """Neutralise les pauses de backoff pour garder la suite rapide."""
+    monkeypatch.setattr(config, "LLM_BACKOFF_BASE_S", 0.001)
+
+    async def _sleep_instantane(_delai):
+        return None
+
+    monkeypatch.setattr(processor.asyncio, "sleep", _sleep_instantane)
+
+
+class TestStructurerAnnonce:
+    async def test_reponse_valide_est_parsee_et_normalisee(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(
+            return_value=_FausseReponse([_FauxBlocOutil(ANNONCE_VALIDE_BRUTE)])
+        )
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore)
+
+        assert resultat is not None
+        assert resultat["est_une_annonce_valide"] is True
+        assert resultat["superficie_m2"] == 600
+        client.messages.create.assert_awaited_once()
+
+    async def test_reponse_sans_bloc_tool_use_retourne_none(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(return_value=_FausseReponse([]))
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore)
+
+        assert resultat is None
+
+    async def test_schema_invalide_retourne_none_sans_retry(self):
+        client = AsyncMock()
+        entree_invalide = {**ANNONCE_VALIDE_BRUTE, "est_une_annonce_valide": "pas_un_booleen"}
+        client.messages.create = AsyncMock(
+            return_value=_FausseReponse([_FauxBlocOutil(entree_invalide)])
+        )
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore)
+
+        assert resultat is None
+        client.messages.create.assert_awaited_once()  # pas de retry sur erreur de schéma
+
+    async def test_rate_limit_puis_succes_retente(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(
+            side_effect=[
+                _erreur_rate_limit(),
+                _FausseReponse([_FauxBlocOutil(ANNONCE_VALIDE_BRUTE)]),
+            ]
+        )
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore, max_retries=3)
+
+        assert resultat is not None
+        assert client.messages.create.await_count == 2
+
+    async def test_echec_persistant_retourne_none_apres_max_retries(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(side_effect=_erreur_rate_limit())
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore, max_retries=2)
+
+        assert resultat is None
+        assert client.messages.create.await_count == 2
+
+    async def test_valeurs_negatives_sont_mises_a_null(self):
+        client = AsyncMock()
+        entree = {**ANNONCE_VALIDE_BRUTE, "prix_fcfa": -100}
+        client.messages.create = AsyncMock(
+            return_value=_FausseReponse([_FauxBlocOutil(entree)])
+        )
+        semaphore = asyncio.Semaphore(1)
+
+        resultat = await processor.structurer_annonce(client, "texte de test", semaphore)
+
+        assert resultat["prix_fcfa"] is None
+
+
+class TestStructurerLot:
+    async def test_liste_vide_ne_construit_pas_de_client(self, monkeypatch):
+        appelle = {"valeur": False}
+
+        def _client_espion(*_a, **_k):
+            appelle["valeur"] = True
+            raise AssertionError("ne devrait pas être appelé pour une liste vide")
+
+        monkeypatch.setattr(processor, "_construire_client", _client_espion)
+        valides, non_valides = await processor.structurer_lot([], api_key="cle-test")
+        assert valides == [] and non_valides == []
+        assert appelle["valeur"] is False
+
+    async def test_separe_valides_et_non_valides(self, monkeypatch):
+        candidats = [
+            {"id": "p1", "texte_nettoye": "annonce 1"},
+            {"id": "p2", "texte_nettoye": "annonce 2"},
+        ]
+
+        async def _fausse_structuration(_client, texte, _sem, max_retries=3):
+            if texte == "annonce 1":
+                return dict(ANNONCE_VALIDE_BRUTE)
+            return None  # échec simulé pour le 2e post
+
+        monkeypatch.setattr(processor, "_construire_client", lambda *_a, **_k: AsyncMock())
+        monkeypatch.setattr(processor, "structurer_annonce", _fausse_structuration)
+
+        valides, non_valides = await processor.structurer_lot(candidats, api_key="cle-test")
+
+        assert len(valides) == 1 and valides[0]["id"] == "p1"
+        assert len(non_valides) == 1 and non_valides[0]["id"] == "p2"
+        # La normalisation du quartier doit avoir été appliquée sur le résultat valide.
+        assert valides[0]["quartier_zone"] == "Ouaga 2000"
+
+    async def test_llm_juge_invalide_va_dans_non_valides(self, monkeypatch):
+        candidats = [{"id": "p1", "texte_nettoye": "annonce suspecte"}]
+
+        async def _fausse_structuration(_client, _texte, _sem, max_retries=3):
+            return {**ANNONCE_VALIDE_BRUTE, "est_une_annonce_valide": False}
+
+        monkeypatch.setattr(processor, "_construire_client", lambda *_a, **_k: AsyncMock())
+        monkeypatch.setattr(processor, "structurer_annonce", _fausse_structuration)
+
+        valides, non_valides = await processor.structurer_lot(candidats, api_key="cle-test")
+
+        assert valides == []
+        assert non_valides[0]["motif_rejet"] == "llm_juge_invalide"
+
+
+class TestConstruireClient:
+    def test_leve_erreur_si_cle_absente(self, monkeypatch):
+        monkeypatch.delenv(config.ENV_ANTHROPIC_KEY, raising=False)
+        with pytest.raises(ValueError):
+            processor._construire_client(api_key=None)
+
+    def test_utilise_la_cle_fournie_en_priorite(self, monkeypatch):
+        monkeypatch.setenv(config.ENV_ANTHROPIC_KEY, "cle-env")
+        client = processor._construire_client(api_key="cle-explicite")
+        assert client.api_key == "cle-explicite"

@@ -1,0 +1,899 @@
+"""Scraping Facebook (Playwright async) - mode quotidien et rattrapage (backfill).
+
+AVERTISSEMENT - À LIRE AVANT TOUTE EXÉCUTION
+---------------------------------------------
+Ce module automatise la navigation sur des groupes Facebook avec une session
+authentifiée (cookies exportés depuis un compte réel). Cela contrevient aux
+Conditions d'Utilisation de Meta, qui interdisent explicitement la collecte
+automatisée de données ("scraping"). Risques concrets et non hypothétiques :
+  - bannissement/désactivation du compte Facebook utilisé pour les cookies ;
+  - blocage de l'IP/du fingerprint utilisé par le runner GitHub Actions ;
+  - exposition légale selon la juridiction (CGU contractuelles + réglementation
+    locale sur les données personnelles, puisque les posts contiennent des
+    numéros de téléphone de tiers).
+Ce projet étant présenté comme académique, il est de la responsabilité de
+l'utilisateur de : (1) utiliser un compte dédié, pas un compte personnel
+principal, (2) ne pas redistribuer les données personnelles collectées,
+(3) vérifier la réglementation applicable avant tout usage en production.
+
+CHOIX D'ARCHITECTURE : mbasic.facebook.com plutôt que le Facebook standard
+----------------------------------------------------------------------------
+Ce module cible `mbasic.facebook.com`, l'interface HTML légère de Facebook
+(server-rendered, quasi sans JS, pagination par lien plutôt que scroll
+infini). Deux raisons : un DOM historiquement plus stable que le Facebook
+moderne (classes CSS générées qui changent en continu), et un horodatage
+textuel exploitable par `_parser_horodatage_relatif` (le Facebook standard ne
+l'exposait pas de façon fiable dans la version précédente de ce module).
+
+LIMITE TECHNIQUE IMPORTANTE - toujours non vérifiée en conditions réelles
+----------------------------------------------------------------------------
+Je n'ai aucun accès réseau à facebook.com/mbasic.facebook.com depuis cet
+environnement. Les sélecteurs ci-dessous (`SELECTEURS`) et le format des
+chaînes d'horodatage (`_parser_horodatage_relatif`) sont construits à partir
+de patterns publiquement documentés pour mbasic (attribut `data-ft` sur les
+conteneurs de story, liens de pagination "Voir plus"/"See More"), mais RIEN
+de tout ça n'a été validé contre une session live. Deux risques distincts à
+garder en tête : (1) mbasic pourrait avoir changé de structure depuis que ces
+patterns ont été documentés publiquement, (2) je ne sais même pas avec
+certitude si mbasic.facebook.com est encore pleinement accessible à la date
+où ce code sera exécuté. Testez avec `--group-limit 1 --skip-llm` avant tout
+run sérieux, et attendez-vous à devoir ajuster `SELECTEURS`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import random
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
+
+import config
+
+logger = logging.getLogger("ouaga_foncier_etl.scraper")
+
+
+class SessionExpireeError(Exception):
+    """Levée quand les cookies Facebook ne sont plus valides (mur de connexion)."""
+
+
+class BlocageDetecteError(Exception):
+    """Levée quand Facebook affiche un mur anti-bot (checkpoint/captcha)."""
+
+
+class CooldownActifError(Exception):
+    """Levée en tout début de run si un cooldown anti-blocage est encore actif.
+
+    Ce n'est PAS une erreur au sens habituel : c'est le mécanisme qui empêche
+    de relancer un scraping immédiatement après un blocage détecté, ce qui
+    serait le signal comportemental le plus voyant pour Facebook.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Sélecteurs DOM (fragiles - voir avertissement en tête de fichier)
+# --------------------------------------------------------------------------- #
+
+SELECTEURS = {
+    # Conteneur d'un post individuel. `data-ft` est un attribut historiquement
+    # présent sur les blocs de story dans les interfaces Facebook légères
+    # (mbasic/lite) pour le tracking analytics interne - fallback sur <article>
+    # si absent (structure alternative possible selon la version de mbasic).
+    "post": 'div[data-ft], article',
+    # Lien permalien du post (contient souvent /posts/, /permalink/ ou
+    # story_fbid=) - sur mbasic, le texte visible de CE lien est aussi
+    # l'horodatage relatif/absolu du post (voir `_extraire_horodatage`).
+    "lien_permalien": 'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]',
+    # Lien de pagination "plus ancien" en bas de la liste de posts d'un groupe.
+    "lien_page_suivante": (
+        'a:has-text("Voir plus"), a:has-text("See More"), '
+        'a:has-text("Plus de publications"), a:has-text("Older Posts")'
+    ),
+    # Indicateurs de mur de connexion / checkpoint (formulaire de login mbasic).
+    "mur_connexion": 'input[name="pass"], #login_form',
+    "checkpoint_url_fragments": ["checkpoint", "login.php", "recover"],
+}
+
+MOTS_CHECKPOINT_TEXTE = [
+    "nous voulons juste vérifier",
+    "confirmez votre identité",
+    "action inhabituelle",
+    "we just want to make sure",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Authentification / contexte navigateur
+# --------------------------------------------------------------------------- #
+
+
+def charger_cookies(cookies_json: str) -> list[dict[str, Any]]:
+    """Parse et valide le contenu de la variable d'environnement FB_COOKIES_JSON.
+
+    Format attendu : liste d'objets cookie compatibles Playwright, ex.
+    `[{"name": "c_user", "value": "...", "domain": ".facebook.com", "path": "/"}, ...]`.
+
+    Raises:
+        ValueError: JSON invalide ou structure inattendue.
+    """
+    try:
+        cookies = json.loads(cookies_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"FB_COOKIES_JSON n'est pas un JSON valide : {exc}") from exc
+
+    if not isinstance(cookies, list) or not cookies:
+        raise ValueError("FB_COOKIES_JSON doit être une liste non vide de cookies.")
+
+    champs_requis = {"name", "value", "domain"}
+    for i, cookie in enumerate(cookies):
+        if not isinstance(cookie, dict) or not champs_requis.issubset(cookie):
+            raise ValueError(
+                f"Cookie #{i} invalide : champs requis {champs_requis} manquants."
+            )
+        cookie.setdefault("path", "/")
+
+    noms_presents = {c["name"] for c in cookies}
+    if "c_user" not in noms_presents or "xs" not in noms_presents:
+        logger.warning(
+            "Cookies 'c_user'/'xs' absents - la session sera probablement "
+            "considérée comme non authentifiée par Facebook."
+        )
+
+    return cookies
+
+
+def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
+    """Récupère le localStorage sauvegardé d'un run précédent (voir
+    `sauvegarder_storage_state`), pour que le navigateur ressemble à un appareil
+    qui revient plutôt qu'à un navigateur vierge à chaque exécution. Les
+    cookies, eux, viennent TOUJOURS de FB_COOKIES_JSON (source de vérité pour
+    l'authentification) - on ne réutilise ici que le localStorage/origins.
+    """
+    if not config.STORAGE_STATE_PATH.exists():
+        return []
+    try:
+        with config.STORAGE_STATE_PATH.open(encoding="utf-8") as f:
+            return json.load(f).get("origins", [])
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("storage_state.json illisible (%s) - repart sans localStorage sauvegardé.", exc)
+        return []
+
+
+async def sauvegarder_storage_state(contexte: BrowserContext) -> None:
+    """Sauvegarde cookies + localStorage en fin de run pour la prochaine exécution.
+
+    Note CI : ce fichier vit dans data/state/, qui n'est PAS versionné (voir
+    .gitignore) - en GitHub Actions, sa persistance entre deux runs dépend d'un
+    cache explicite (voir .github/workflows/daily_scraper.yml). Sans ce cache,
+    chaque run repart d'un navigateur "neuf" et cette fonction ne sert à rien.
+    """
+    try:
+        config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        await contexte.storage_state(path=str(config.STORAGE_STATE_PATH))
+    except Exception:
+        logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
+
+
+async def creer_navigateur(playwright, cookies: list[dict[str, Any]]) -> tuple[Browser, BrowserContext]:
+    """Lance Chromium headless et prépare une session aussi cohérente que possible
+    d'un run à l'autre (cookies + localStorage réutilisé si disponible).
+
+    Limite assumée : aucune de ces mesures ne compense une mauvaise réputation
+    d'IP/ASN (voir README.md) - c'est un plafond bas, pas une garantie.
+    """
+    navigateur = await playwright.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    contexte = await navigateur.new_context(
+        viewport={"width": 1366, "height": 900},
+        locale="fr-FR",
+        timezone_id="Africa/Ouagadougou",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        storage_state={"cookies": [], "origins": _charger_origins_sauvegardees()},
+    )
+    # Masque le flag standard qui trahit un navigateur piloté par automation.
+    # Patch minimal et documenté publiquement (pas une suite de contournement) -
+    # voir README.md pour ce qui n'est délibérément PAS fait au-delà de ça.
+    await contexte.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
+    await contexte.add_cookies(cookies)
+    contexte.set_default_navigation_timeout(config.NAVIGATION_TIMEOUT_MS)
+    return navigateur, contexte
+
+
+async def echauffement(contexte: BrowserContext) -> None:
+    """Navigation de "mise en jambe" avant d'attaquer les groupes : ouvre le fil
+    d'actualité général plutôt que de foncer droit sur une URL de groupe dès la
+    première requête de la session. Best-effort : un échec ici ne doit jamais
+    arrêter le run (c'est une amélioration comportementale, pas une étape
+    critique). Pas de simulation de scroll ici : mbasic est server-rendered,
+    un scroll JS n'y a aucun effet réel (contrairement au Facebook standard).
+    """
+    page = await contexte.new_page()
+    try:
+        await page.goto(f"{config.MBASIC_BASE_URL}/", wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(3.0, 7.0))
+    except Exception as exc:
+        logger.debug("Échauffement ignoré (non bloquant) : %s", exc)
+    finally:
+        await page.close()
+
+
+# --------------------------------------------------------------------------- #
+# Détection anti-bot / session expirée
+# --------------------------------------------------------------------------- #
+
+
+async def detecter_blocage_ou_session_expiree(page: Page) -> None:
+    """Vérifie l'URL et le contenu visible pour détecter un mur anti-bot ou une
+    session expirée. Lève une exception dédiée dans les deux cas, pour que
+    l'appelant puisse arrêter proprement plutôt que de scraper une page d'erreur.
+    """
+    url = page.url.lower()
+    if any(fragment in url for fragment in SELECTEURS["checkpoint_url_fragments"]):
+        raise BlocageDetecteError(f"URL de checkpoint/connexion détectée : {page.url}")
+
+    try:
+        contenu = (await page.content()).lower()
+    except Exception:  # page déjà fermée, navigation en cours, etc.
+        return
+
+    if any(mot in contenu for mot in MOTS_CHECKPOINT_TEXTE):
+        raise BlocageDetecteError("Texte de vérification anti-bot détecté sur la page.")
+
+    if await page.locator(SELECTEURS["mur_connexion"]).count() > 0:
+        raise SessionExpireeError("Mur de connexion détecté - cookies probablement expirés.")
+
+
+# --------------------------------------------------------------------------- #
+# Extraction des posts visibles
+# --------------------------------------------------------------------------- #
+
+
+def _extraire_id_depuis_url(url: str | None) -> str | None:
+    """Extrait un identifiant stable de post depuis une URL de permalien."""
+    if not url:
+        return None
+    match = re.search(r"(?:/posts/|/permalink/|story_fbid=)(\d+)", url)
+    return match.group(1) if match else url  # fallback : l'URL elle-même comme id
+
+
+_MOIS_FR = {
+    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
+    "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
+    "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+}
+_MOTIF_MOIS_FR = "|".join(_MOIS_FR)
+
+
+def _parser_horodatage_relatif(texte: str | None, maintenant: datetime) -> datetime | None:
+    """Convertit le texte d'horodatage affiché par mbasic (français, locale du
+    contexte navigateur fixée à fr-FR) en `datetime` absolu.
+
+    Fonction PURE et entièrement testable sans navigateur, contrairement à
+    l'ancienne extraction qui dépendait d'un DOM live jamais accessible en
+    test. Formats couverts (best-effort, à valider en conditions réelles -
+    voir avertissement en tête de fichier) : "X min", "X h", "X j",
+    "Hier [à HH:MM]", "Aujourd'hui [à HH:MM]", "D mois [AAAA] [à HH:MM]".
+    Tout format non reconnu retourne None plutôt que de deviner - le post est
+    alors conservé avec `date_incertaine=True` (jamais supprimé silencieusement).
+    """
+    if not texte:
+        return None
+    t = texte.strip().lower()
+
+    if t in ("à l'instant", "a l'instant", "just now", "il y a quelques secondes"):
+        return maintenant
+
+    m = re.fullmatch(r"(\d+)\s*min", t)
+    if m:
+        return maintenant - timedelta(minutes=int(m.group(1)))
+
+    m = re.fullmatch(r"(\d+)\s*h", t)
+    if m:
+        return maintenant - timedelta(hours=int(m.group(1)))
+
+    m = re.fullmatch(r"(\d+)\s*j", t)
+    if m:
+        return maintenant - timedelta(days=int(m.group(1)))
+
+    m = re.fullmatch(r"hier(?:\s+[àa]\s+(\d{1,2})[:h](\d{2}))?", t)
+    if m:
+        heure = int(m.group(1)) if m.group(1) else 0
+        minute = int(m.group(2)) if m.group(2) else 0
+        veille = maintenant - timedelta(days=1)
+        return veille.replace(hour=heure, minute=minute, second=0, microsecond=0)
+
+    m = re.fullmatch(r"aujourd'?hui(?:\s+[àa]\s+(\d{1,2})[:h](\d{2}))?", t)
+    if m:
+        heure = int(m.group(1)) if m.group(1) else 0
+        minute = int(m.group(2)) if m.group(2) else 0
+        return maintenant.replace(hour=heure, minute=minute, second=0, microsecond=0)
+
+    m = re.fullmatch(
+        r"(\d{1,2})\s+(" + _MOTIF_MOIS_FR + r")(?:\s+(\d{4}))?(?:\s+[àa]\s+(\d{1,2})[:h](\d{2}))?",
+        t,
+    )
+    if m:
+        jour_n = int(m.group(1))
+        mois_n = _MOIS_FR[m.group(2)]
+        annee = int(m.group(3)) if m.group(3) else maintenant.year
+        # Heure inconnue -> midi par convention (précision réduite au jour près,
+        # suffisant pour un filtre `days_back`, jamais pour un tri fin).
+        heure = int(m.group(4)) if m.group(4) else 12
+        minute = int(m.group(5)) if m.group(5) else 0
+        try:
+            candidat = maintenant.replace(
+                year=annee, month=mois_n, day=jour_n,
+                hour=heure, minute=minute, second=0, microsecond=0,
+            )
+        except ValueError:
+            return None  # date invalide (ex: 31 février) - on ne devine pas
+        # Sans année explicite, une date qui tombe dans le futur signifie
+        # presque certainement l'année précédente ("1 août" affiché en janvier).
+        if not m.group(3) and candidat > maintenant:
+            candidat = candidat.replace(year=annee - 1)
+        return candidat
+
+    return None
+
+
+async def _extraire_horodatage(lien_temps, maintenant: datetime | None = None) -> datetime | None:
+    """Lit le texte visible du lien permalien (qui EST l'horodatage sur mbasic)
+    et le fait parser par `_parser_horodatage_relatif`. Retourne None sur
+    n'importe quel échec (élément absent, texte non reconnu) - jamais
+    d'exception propagée jusqu'à l'appelant.
+    """
+    try:
+        texte = (await lien_temps.inner_text()).strip()
+    except Exception:
+        return None
+    return _parser_horodatage_relatif(texte, maintenant or datetime.now(timezone.utc))
+
+
+async def extraire_posts_visibles(page: Page, groupe_id: str, groupe_nom: str) -> list[dict[str, Any]]:
+    """Extrait les posts actuellement chargés sur la page mbasic courante (une
+    page = un lot de posts, la pagination est gérée par l'appelant via
+    `_extraire_lien_page_suivante`). Ne fait AUCUN filtrage métier ici
+    (regex/LLM) : ce module ne fait que collecter le texte brut, conformément
+    à la séparation des responsabilités avec processor.py.
+    """
+    posts: list[dict[str, Any]] = []
+    elements = page.locator(SELECTEURS["post"])
+    total = await elements.count()
+    maintenant = datetime.now(timezone.utc)
+
+    for i in range(total):
+        element = elements.nth(i)
+        try:
+            texte = (await element.inner_text()).strip()
+        except Exception as exc:
+            logger.debug("Échec extraction texte post #%d : %s", i, exc)
+            continue
+
+        if not texte:
+            continue
+
+        lien = element.locator(SELECTEURS["lien_permalien"]).first
+        url_post = None
+        horodatage = None
+        if await lien.count() > 0:
+            try:
+                url_post = await lien.get_attribute("href")
+            except Exception:
+                url_post = None
+            horodatage = await _extraire_horodatage(lien, maintenant)
+
+        post_id = _extraire_id_depuis_url(url_post) or f"{groupe_id}_{hash(texte) & 0xFFFFFFFF}"
+
+        posts.append(
+            {
+                "id": post_id,
+                "groupe_id": groupe_id,
+                "groupe_nom": groupe_nom,
+                "url": url_post,
+                "texte": texte,
+                "date_publication": horodatage.isoformat() if horodatage else None,
+                "date_incertaine": horodatage is None,
+                "scrape_le": maintenant.isoformat(),
+            }
+        )
+
+    return posts
+
+
+async def _extraire_lien_page_suivante(page: Page) -> str | None:
+    """Retourne l'URL absolue du lien de pagination "plus ancien" s'il existe,
+    sinon None (fin de la liste de posts pour ce groupe).
+    """
+    lien = page.locator(SELECTEURS["lien_page_suivante"]).first
+    try:
+        if await lien.count() == 0:
+            return None
+        href = await lien.get_attribute("href")
+    except Exception:
+        return None
+    if not href:
+        return None
+    return href if href.startswith("http") else f"{config.MBASIC_BASE_URL}{href}"
+
+
+# --------------------------------------------------------------------------- #
+# Persistance incrémentale / déduplication
+# --------------------------------------------------------------------------- #
+
+
+def charger_seen_ids() -> dict[str, str]:
+    """Charge {post_id: date_iso_vu} pour dédupliquer entre exécutions."""
+    if not config.SEEN_IDS_PATH.exists():
+        return {}
+    try:
+        with config.SEEN_IDS_PATH.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Impossible de lire %s (%s) - repart d'un état vide.", config.SEEN_IDS_PATH, exc)
+        return {}
+
+
+def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> None:
+    """Sauvegarde l'état de déduplication, en purgeant les entrées trop anciennes
+    pour éviter une croissance illimitée du fichier au fil des runs quotidiens.
+    """
+    seuil = datetime.now(timezone.utc) - timedelta(days=retention_jours)
+    purge: dict[str, str] = {}
+    for post_id, date_str in seen.items():
+        try:
+            if datetime.fromisoformat(date_str) >= seuil:
+                purge[post_id] = date_str
+        except ValueError:
+            purge[post_id] = date_str  # date illisible : on garde par précaution
+
+    with config.SEEN_IDS_PATH.open("w", encoding="utf-8") as f:
+        json.dump(purge, f, ensure_ascii=False, indent=2)
+
+
+def verifier_cooldown() -> datetime | None:
+    """Retourne la date de fin de cooldown si un cooldown est encore actif, sinon None.
+
+    Fichier corrompu/absent -> pas de cooldown (on ne bloque pas un run à cause
+    d'un état illisible, mais on log un avertissement pour investigation).
+    """
+    if not config.COOLDOWN_PATH.exists():
+        return None
+    try:
+        with config.COOLDOWN_PATH.open(encoding="utf-8") as f:
+            contenu = json.load(f)
+        fin = datetime.fromisoformat(contenu["jusqu_a"])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning("Fichier de cooldown illisible (%s) - ignoré.", exc)
+        return None
+
+    if fin > datetime.now(timezone.utc):
+        return fin
+    return None
+
+
+def activer_cooldown(heures: float, raison: str) -> None:
+    """Enregistre un cooldown : aucun run ne devrait scraper avant `heures` heures."""
+    fin = datetime.now(timezone.utc) + timedelta(hours=heures)
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with config.COOLDOWN_PATH.open("w", encoding="utf-8") as f:
+        json.dump({"jusqu_a": fin.isoformat(), "raison": raison}, f, ensure_ascii=False, indent=2)
+    logger.critical("Cooldown activé jusqu'à %s (raison : %s)", fin.isoformat(), raison)
+
+
+# --------------------------------------------------------------------------- #
+# Throttle adaptatif (AIMD) : ralentit/réduit le volume automatiquement au
+# moindre signal de suspicion, ré-accélère lentement après des runs propres.
+# Fonctions pures (état en entrée -> nouvel état en sortie), testables sans
+# navigateur ni mock complexe - voir README.md pour la logique complète.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AjustementsSession:
+    """Réglages effectifs pour le run courant, dérivés du niveau de confiance."""
+
+    delai_multiplicateur: float  # >1.0 = délais rallongés (confiance basse)
+    ratio_groupes: float  # 0.0-1.0 = fraction des groupes normalement prévus réellement traités
+
+
+def charger_sante() -> dict[str, Any]:
+    """Charge l'état de santé persistant, ou un état initial "confiance maximale"
+    si aucun historique n'existe encore (premier run, ou fichier corrompu).
+    """
+    etat_initial = {
+        "niveau_confiance": config.NIVEAU_CONFIANCE_INITIAL,
+        "runs_propres_consecutifs": 0,
+        "cooldown_multiplicateur": 1,
+    }
+    if not config.SANTE_PATH.exists():
+        return etat_initial
+    try:
+        with config.SANTE_PATH.open(encoding="utf-8") as f:
+            etat = json.load(f)
+        etat_initial.update(etat)
+        return etat_initial
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("État de santé illisible (%s) - repart de la confiance maximale.", exc)
+        return etat_initial
+
+
+def sauvegarder_sante(etat: dict[str, Any]) -> None:
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with config.SANTE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(etat, f, ensure_ascii=False, indent=2)
+
+
+def calculer_ajustements(etat: dict[str, Any]) -> AjustementsSession:
+    """Traduit le niveau de confiance actuel en réglages concrets pour le run.
+
+    Confiance basse -> délais plus longs (jusqu'à x5 au plancher) ET moins de
+    groupes traités ce run (les groupes non traités seront repris aux runs
+    suivants, une fois la confiance remontée).
+    """
+    confiance = etat.get("niveau_confiance", config.NIVEAU_CONFIANCE_INITIAL)
+    confiance = max(config.NIVEAU_CONFIANCE_MIN, min(config.NIVEAU_CONFIANCE_MAX, confiance))
+    return AjustementsSession(
+        delai_multiplicateur=round(1.0 / confiance, 3),
+        ratio_groupes=confiance,
+    )
+
+
+def mettre_a_jour_apres_run(
+    etat: dict[str, Any],
+    anomalies: int,
+    total_groupes: int,
+    bloque: bool = False,
+    session_expiree: bool = False,
+) -> dict[str, Any]:
+    """Calcule le nouvel état de santé à partir de l'issue du run qui vient de
+    se terminer. Logique AIMD : diminution multiplicative rapide au moindre
+    signal négatif, augmentation additive lente seulement après plusieurs
+    runs propres consécutifs.
+
+    Args:
+        etat: état de santé chargé en début de run (voir `charger_sante`).
+        anomalies: nombre de groupes ayant levé une exception inattendue
+            (hors blocage/session expirée, déjà gérés à part).
+        total_groupes: nombre de groupes réellement tentés ce run.
+        bloque: un `BlocageDetecteError` a stoppé le run.
+        session_expiree: un `SessionExpireeError` a stoppé le run.
+    """
+    nouvel_etat = dict(etat)
+    confiance = etat.get("niveau_confiance", config.NIVEAU_CONFIANCE_INITIAL)
+    multiplicateur_cooldown = etat.get("cooldown_multiplicateur", 1)
+
+    if bloque:
+        nouvel_etat["niveau_confiance"] = config.NIVEAU_CONFIANCE_MIN
+        nouvel_etat["runs_propres_consecutifs"] = 0
+        nouvel_etat["cooldown_multiplicateur"] = min(
+            config.COOLDOWN_MULTIPLICATEUR_MAX, multiplicateur_cooldown * 2,
+        )
+    elif session_expiree:
+        # Signal plus faible qu'un blocage actif (probablement juste des
+        # cookies à renouveler) - on reste prudent sans punir aussi fort.
+        nouvel_etat["niveau_confiance"] = max(config.NIVEAU_CONFIANCE_MIN, confiance * 0.7)
+        nouvel_etat["runs_propres_consecutifs"] = 0
+    else:
+        ratio_anomalies = (anomalies / total_groupes) if total_groupes else 0.0
+        if ratio_anomalies > config.RATIO_ANOMALIES_SUSPICION:
+            nouvel_etat["niveau_confiance"] = max(
+                config.NIVEAU_CONFIANCE_MIN, confiance * config.NIVEAU_CONFIANCE_PALIER_SUSPICION,
+            )
+            nouvel_etat["runs_propres_consecutifs"] = 0
+        else:
+            propres = etat.get("runs_propres_consecutifs", 0) + 1
+            if propres >= config.RUNS_PROPRES_POUR_RAMPUP:
+                nouvel_etat["niveau_confiance"] = min(
+                    config.NIVEAU_CONFIANCE_MAX, confiance + config.RAMPUP_INCREMENT,
+                )
+                nouvel_etat["runs_propres_consecutifs"] = 0
+                nouvel_etat["cooldown_multiplicateur"] = 1  # reset après un vrai streak propre
+            else:
+                nouvel_etat["runs_propres_consecutifs"] = propres
+
+    nouvel_etat["derniere_maj"] = datetime.now(timezone.utc).isoformat()
+    return nouvel_etat
+
+
+def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Path:
+    """Sauvegarde incrémentale : un fichier par groupe traité, horodaté.
+
+    Objectif explicite du cahier des charges : ne pas perdre les données déjà
+    scrapées en cas de coupure sur un groupe suivant.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    chemin = config.RAW_DIR / f"{timestamp}_{groupe_id}.json"
+    with chemin.open("w", encoding="utf-8") as f:
+        json.dump(posts, f, ensure_ascii=False, indent=2)
+    logger.info("Groupe %s : %d posts sauvegardés -> %s", groupe_id, len(posts), chemin)
+    return chemin
+
+
+# --------------------------------------------------------------------------- #
+# Scraping d'un groupe (pagination mbasic + pauses aléatoires)
+# --------------------------------------------------------------------------- #
+
+
+async def scraper_groupe(
+    context: BrowserContext,
+    groupe: "config.Groupe",
+    max_days_back: int,
+    seen_ids: dict[str, str],
+    delai_multiplicateur: float = 1.0,
+) -> list[dict[str, Any]]:
+    """Parcourt un groupe Facebook (mbasic, page par page) et retourne les
+    nouveaux posts non vus.
+
+    Stratégie d'arrêt : on arrête la pagination quand `MAX_PAGES_SANS_NOUVEAU_POST`
+    pages consécutives n'apportent aucun post inédit, après `MAX_PAGES_ABSOLU`
+    pages (garde-fou dur), s'il n'y a plus de lien "page suivante", ou si tous
+    les posts visibles les plus récents sont plus vieux que `max_days_back` ET
+    que leur date est connue (les posts à date incertaine ne sont jamais
+    utilisés comme critère d'arrêt, pour éviter de couper la collecte à tort).
+
+    Args:
+        delai_multiplicateur: facteur appliqué aux délais entre pages (voir
+            `calculer_ajustements` - >1.0 quand le throttle adaptatif a perdu
+            confiance suite à des runs récents suspects).
+    """
+    date_limite = datetime.now(timezone.utc) - timedelta(days=max_days_back)
+    page = await context.new_page()
+    nouveaux_posts: list[dict[str, Any]] = []
+    url_courante = f"{config.MBASIC_BASE_URL}/groups/{groupe.id}/"
+
+    try:
+        logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_courante)
+
+        pages_sans_nouveau = 0
+        pages_visitees = 0
+
+        while url_courante and pages_visitees < config.MAX_PAGES_ABSOLU:
+            await page.goto(url_courante, wait_until="domcontentloaded")
+            await detecter_blocage_ou_session_expiree(page)
+            await asyncio.sleep(
+                random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S) * delai_multiplicateur
+            )
+
+            posts_visibles = await extraire_posts_visibles(page, groupe.id, groupe.nom)
+            posts_inedits = [p for p in posts_visibles if p["id"] not in seen_ids]
+
+            if posts_inedits:
+                pages_sans_nouveau = 0
+                for p in posts_inedits:
+                    seen_ids[p["id"]] = p["scrape_le"]
+                nouveaux_posts.extend(posts_inedits)
+            else:
+                pages_sans_nouveau += 1
+
+            # Critère d'arrêt "hors fenêtre temporelle" : uniquement sur posts datés.
+            posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
+            if posts_dates_connues:
+                plus_ancien = min(
+                    datetime.fromisoformat(p["date_publication"]) for p in posts_dates_connues
+                )
+                if plus_ancien < date_limite:
+                    logger.info(
+                        "Groupe %s : posts hors fenêtre de %d jour(s) atteints, arrêt de la pagination.",
+                        groupe.nom, max_days_back,
+                    )
+                    break
+
+            if pages_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
+                logger.info(
+                    "Groupe %s : %d page(s) sans nouveau post, arrêt.",
+                    groupe.nom, pages_sans_nouveau,
+                )
+                break
+
+            url_courante = await _extraire_lien_page_suivante(page)
+            pages_visitees += 1
+            if url_courante:
+                await asyncio.sleep(
+                    random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S) * delai_multiplicateur
+                )
+
+        if pages_visitees >= config.MAX_PAGES_ABSOLU:
+            logger.warning(
+                "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint (arrêt forcé).",
+                groupe.nom, config.MAX_PAGES_ABSOLU,
+            )
+
+    except PlaywrightTimeoutError as exc:
+        logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
+    finally:
+        await page.close()
+
+    return nouveaux_posts
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration : batches de groupes + pauses inter-batch
+# --------------------------------------------------------------------------- #
+
+
+async def executer_scraping(
+    mode: str,
+    days_back: int,
+    group_limit: int | None,
+    groups_batch_size: int,
+) -> list[Path]:
+    """Point d'entrée principal du module, appelé par main.py.
+
+    Args:
+        mode: "daily" ou "backfill" (influence uniquement le logging - le
+            comportement de pagination est identique, seul `days_back` change).
+        days_back: fenêtre temporelle en jours (1 pour le quotidien, jusqu'à
+            90 pour un rattrapage complet - à répartir en plusieurs runs
+            paramétrables via `days_back`/`group_limit` côté CLI/CI plutôt que
+            de tout tenter en un seul run, pour rester sous les limites mémoire
+            du navigateur headless et réduire le risque de détection).
+        group_limit: nombre max de groupes traités sur ce run (None = tous).
+        groups_batch_size: taille des lots de groupes entre deux pauses longues.
+
+    Returns:
+        Liste des chemins des fichiers JSON bruts sauvegardés (un par groupe).
+
+    Raises:
+        ValueError: FB_COOKIES_JSON absent/invalide, ou aucun groupe configuré.
+        CooldownActifError: un cooldown anti-blocage est encore actif (voir
+            `verifier_cooldown`) - le run s'arrête avant même d'ouvrir un navigateur.
+        SessionExpireeError: propagée si détectée sur un groupe (signal fort
+            que les cookies sont morts - inutile de continuer sur les autres).
+        BlocageDetecteError: propagée si un mur anti-bot est détecté - le run
+            s'arrête entièrement (voir stratégie anti-blocage dans README.md),
+            il ne continue PAS sur les groupes restants.
+    """
+    import os
+
+    cooldown_actif = verifier_cooldown()
+    if cooldown_actif:
+        raise CooldownActifError(
+            f"Cooldown anti-blocage actif jusqu'à {cooldown_actif.isoformat()} - run annulé."
+        )
+
+    cookies_json = os.environ.get(config.ENV_FB_COOKIES)
+    if not cookies_json:
+        raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
+    cookies = charger_cookies(cookies_json)
+
+    groupes = config.charger_groupes(limite=group_limit)
+
+    etat_sante = charger_sante()
+    ajustements = calculer_ajustements(etat_sante)
+    if ajustements.ratio_groupes < 1.0:
+        nb_avant = len(groupes)
+        groupes = groupes[: max(1, round(nb_avant * ajustements.ratio_groupes))]
+        logger.warning(
+            "Throttle adaptatif actif (confiance=%.2f) : %d/%d groupe(s) traités ce run, "
+            "délais x%.2f. Les groupes restants seront repris aux prochains runs.",
+            etat_sante.get("niveau_confiance", 1.0), len(groupes), nb_avant,
+            ajustements.delai_multiplicateur,
+        )
+
+    logger.info("Mode=%s | %d groupe(s) à traiter | days_back=%d | batch=%d",
+                mode, len(groupes), days_back, groups_batch_size)
+
+    seen_ids = charger_seen_ids()
+    fichiers_sauvegardes: list[Path] = []
+    debut_session = datetime.now(timezone.utc)
+    budget_depasse = False
+    anomalies = 0
+    bloque = False
+    session_expiree = False
+
+    async with async_playwright() as playwright:
+        navigateur, contexte = await creer_navigateur(playwright, cookies)
+        try:
+            await echauffement(contexte)
+
+            for debut_batch in range(0, len(groupes), groups_batch_size):
+                if budget_depasse:
+                    break
+
+                lot = groupes[debut_batch:debut_batch + groups_batch_size]
+                logger.info("--- Batch %d groupe(s) : %s ---",
+                            len(lot), ", ".join(g.nom for g in lot))
+
+                for i, groupe in enumerate(lot):
+                    ecoulees_min = (datetime.now(timezone.utc) - debut_session).total_seconds() / 60
+                    if ecoulees_min >= config.SESSION_DUREE_MAX_MINUTES:
+                        logger.warning(
+                            "Budget de session atteint (%.1f min) - arrêt propre, "
+                            "%d groupe(s) restant(s) traités au prochain run.",
+                            ecoulees_min, len(groupes) - (debut_batch + i),
+                        )
+                        budget_depasse = True
+                        break
+
+                    try:
+                        posts = await scraper_groupe(
+                            contexte, groupe, days_back, seen_ids,
+                            delai_multiplicateur=ajustements.delai_multiplicateur,
+                        )
+                    except SessionExpireeError as exc:
+                        logger.critical(
+                            "Session Facebook expirée sur le groupe %s. Arrêt du run - "
+                            "il faut régénérer FB_COOKIES_JSON.", groupe.nom,
+                        )
+                        session_expiree = True
+                        activer_cooldown(
+                            config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE,
+                            f"session expirée sur {groupe.nom}: {exc}",
+                        )
+                        raise
+                    except BlocageDetecteError as exc:
+                        logger.critical(
+                            "Blocage anti-bot détecté sur %s (%s) - arrêt COMPLET du run "
+                            "(les autres groupes ne sont pas tentés).", groupe.nom, exc,
+                        )
+                        bloque = True
+                        multiplicateur_cooldown = etat_sante.get("cooldown_multiplicateur", 1)
+                        activer_cooldown(
+                            config.COOLDOWN_HEURES_APRES_BLOCAGE * multiplicateur_cooldown,
+                            f"blocage détecté sur {groupe.nom}: {exc}",
+                        )
+                        raise
+                    except Exception:
+                        logger.exception("Erreur inattendue sur le groupe %s - groupe ignoré.", groupe.nom)
+                        anomalies += 1
+                        continue
+
+                    if posts:
+                        fichiers_sauvegardes.append(sauvegarder_posts_groupe(posts, groupe.id))
+                    sauvegarder_seen_ids(seen_ids)  # sauvegarde après CHAQUE groupe (résilience coupure)
+
+                    # Pause humaine entre deux groupes du même batch (pas seulement entre pages).
+                    if i < len(lot) - 1:
+                        await asyncio.sleep(
+                            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                            * ajustements.delai_multiplicateur
+                        )
+
+                # Pause plus longue entre deux batches de groupes.
+                if not budget_depasse and debut_batch + groups_batch_size < len(groupes):
+                    pause = random.uniform(
+                        config.PAUSE_ENTRE_BATCHES_MIN_S, config.PAUSE_ENTRE_BATCHES_MAX_S
+                    ) * ajustements.delai_multiplicateur
+                    logger.info("Pause inter-batch de %.1fs", pause)
+                    await asyncio.sleep(pause)
+        finally:
+            await sauvegarder_storage_state(contexte)
+            await contexte.close()
+            await navigateur.close()
+            nouvel_etat_sante = mettre_a_jour_apres_run(
+                etat_sante, anomalies=anomalies, total_groupes=len(groupes),
+                bloque=bloque, session_expiree=session_expiree,
+            )
+            sauvegarder_sante(nouvel_etat_sante)
+            if nouvel_etat_sante.get("niveau_confiance") != etat_sante.get("niveau_confiance"):
+                logger.info(
+                    "Confiance du throttle adaptatif : %.2f -> %.2f",
+                    etat_sante.get("niveau_confiance", 1.0), nouvel_etat_sante.get("niveau_confiance", 1.0),
+                )
+
+    return fichiers_sauvegardes
+
+
+if __name__ == "__main__":
+    # Exécution ad hoc pour test manuel local (main.py reste le point d'entrée CLI officiel).
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(executer_scraping(mode="daily", days_back=1, group_limit=1, groups_batch_size=1))

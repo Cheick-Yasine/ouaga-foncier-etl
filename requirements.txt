@@ -1,0 +1,38 @@
+# --- Scraping ---
+playwright==1.47.0
+
+# --- API LLM (structuration) ---
+# anthropic==0.34.2 était initialement prévu mais est INCOMPATIBLE avec httpx>=0.28
+# (TypeError: AsyncClient.__init__() got an unexpected keyword argument 'proxies').
+# Confirmé par exécution réelle de la suite de tests - 0.69.0 est validé fonctionnel.
+anthropic==0.69.0
+# socksio : requis par httpx dès qu'un proxy SOCKS est présent dans l'environnement
+# (variable ALL_PROXY/HTTPS_PROXY) - sans ça, la moindre config proxy fait planter
+# le client Anthropic à l'instanciation (testé en conditions réelles).
+socksio==1.0.0
+
+# --- Validation / parsing des données structurées ---
+pydantic==2.9.2
+
+# --- Base de données maître (PostgreSQL) ---
+# psycopg (v3) avec l'extra [binary] : évite d'avoir besoin des en-têtes de
+# compilation libpq sur la machine (CI comme poste local). Version installée
+# et validée par exécution réelle de la suite de tests contre un vrai serveur
+# PostgreSQL 16 le 2026-08-01 (upsert, types BOOLEAN/TIMESTAMPTZ, ON CONFLICT).
+psycopg[binary]==3.3.4
+
+# --- Lecture de la config des groupes (Groupe.xlsx -> groups.csv) ---
+openpyxl==3.1.5
+
+# --- Gestion des variables d'environnement en local ---
+python-dotenv==1.0.1
+
+# --- Tests ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# Versions validées par exécution réelle de `pip install -r requirements.txt` +
+# `pytest -q` (134/134 tests passés, y compris contre un vrai serveur PostgreSQL 16)
+# le 2026-08-01. playwright n'a PAS pu être testé en conditions réelles (pas d'accès
+# à facebook.com depuis ce sandbox) - seul son installation/import a pu être
+# vérifiée, pas le scraping live.
