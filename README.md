@@ -23,14 +23,23 @@ vous avant tout usage sérieux :
    cadre académique du projet — évaluez si une alternative (API officielle,
    service tiers comme Apify) est acceptable pour votre cas d'usage avant
    de lancer le pipeline en production.
-2. **Sélecteurs DOM de `scraper.py` non vérifiés en live.** Le scraper cible
-   maintenant `mbasic.facebook.com` (HTML léger, server-rendered) plutôt que
-   le Facebook standard - DOM historiquement plus stable, mais toujours pas
-   vérifié contre une session réelle (aucun accès réseau à facebook.com
-   depuis mon environnement). `SELECTEURS` dans `scraper.py` s'appuie sur des
-   patterns publiquement documentés pour mbasic (`data-ft`, liens "Voir
-   plus"), pas sur une observation live. Testez avec `--group-limit 1
-   --skip-llm` avant tout run sérieux.
+2. **Sélecteurs DOM de `scraper.py` - risque confirmé en conditions réelles
+   le 2026-08-01.** Premier run live : 0 post extrait. Le HTML de debug
+   sauvegardé (`data/logs/debug_page_vide_*.html`, voir mécanisme ajouté ce
+   jour-là) a révélé que `mbasic.facebook.com` avait renvoyé l'application
+   React moderne "Comet" (marqueurs `GroupsCometFeed`, `mount_0_0`,
+   `ssr-finished-successfully`) au lieu du HTML léger attendu - `data-ft` et
+   `<article>` totalement absents, donc `SELECTEURS` ne pouvait rien matcher.
+   Hypothèse retenue et codée : le rendu dépendrait du User-Agent envoyé -
+   `config.MBASIC_USER_AGENT` a été changé pour un vieux navigateur mobile.
+   **Non confirmé** (pas d'accès réseau depuis mon environnement pour
+   valider) : si un nouveau run produit encore un dump HTML sans `data-ft`,
+   c'est que cette hypothèse est fausse et que mbasic ne sert peut-être plus
+   de HTML léger du tout en 2026 pour les sessions authentifiées - dans ce
+   cas, l'architecture "scraping HTML léger server-rendered" choisie pour ce
+   projet ne tient plus et demanderait une refonte plus profonde (parsing des
+   blobs JSON embarqués dans le HTML SSR de Comet, beaucoup plus fragile).
+   Testez avec `--group-limit 1` avant tout run à volume.
 3. **Extraction de l'horodatage : logique implémentée et testée, format
    textuel non vérifié.** `_parser_horodatage_relatif` (fonction pure, 15
    tests unitaires) convertit correctement "3 h", "Hier à 14:30", "1 août
