@@ -119,30 +119,101 @@ MOTS_CHECKPOINT_TEXTE = [
 # --------------------------------------------------------------------------- #
 
 
-def charger_cookies(cookies_json: str) -> list[dict[str, Any]]:
-    """Parse et valide le contenu de la variable d'environnement FB_COOKIES_JSON.
+# BUG CORRIGÉ (trouvé en recevant un vrai export de cookies) : la docstring
+# d'origine annonçait un format "compatible Playwright" (`name`, `value`,
+# `domain`, `path`) mais AUCUN outil grand public n'exporte les cookies dans
+# ce format-là. Les extensions de navigateur courantes (Cookie-Editor et
+# équivalents, format `chrome.cookies`) exportent `expirationDate` (epoch
+# flottant) au lieu de `expires`, `sameSite` en minuscules avec des valeurs
+# ("no_restriction", "unspecified") que Playwright n'accepte pas telles
+# quelles, et des clés que Playwright ne reconnaît pas du tout (`hostOnly`,
+# `storeId`, `session`). Sans conversion, `context.add_cookies()` aurait donc
+# échoué (ou au mieux ignoré silencieusement `sameSite`) sur un export réel -
+# jamais détecté avant faute d'avoir reçu un vrai export pendant le
+# développement. `_normaliser_cookie` fait cette conversion.
+_SAMESITE_VERS_PLAYWRIGHT = {
+    "strict": "Strict",
+    "lax": "Lax",
+    "none": "None",
+    "no_restriction": "None",  # convention de l'API chrome.cookies (extensions d'export)
+    # "unspecified" = cookie sans attribut SameSite explicite. Les navigateurs
+    # modernes (Chrome >= 80) appliquent Lax par défaut dans ce cas - c'est
+    # l'hypothèse retenue ici, à confirmer si un cookie précis pose problème.
+    "unspecified": "Lax",
+}
 
-    Format attendu : liste d'objets cookie compatibles Playwright, ex.
-    `[{"name": "c_user", "value": "...", "domain": ".facebook.com", "path": "/"}, ...]`.
+
+def _normaliser_cookie(cookie: dict[str, Any]) -> dict[str, Any]:
+    """Convertit un cookie vers le format strict attendu par Playwright
+    (`SetCookieParam` : name, value, domain, path, expires, httpOnly, secure,
+    sameSite ∈ {"Strict","Lax","None"}), à partir soit du format déjà
+    Playwright, soit d'un export brut d'extension de navigateur.
+    """
+    converti: dict[str, Any] = {
+        "name": cookie["name"],
+        "value": cookie["value"],
+        "domain": cookie["domain"],
+        "path": cookie.get("path") or "/",
+    }
+    if cookie.get("httpOnly") is not None:
+        converti["httpOnly"] = bool(cookie["httpOnly"])
+    if cookie.get("secure") is not None:
+        converti["secure"] = bool(cookie["secure"])
+
+    # "expires" (format Playwright natif) a priorité sur "expirationDate"
+    # (format extension) si les deux sont présents.
+    expiration = cookie.get("expires", cookie.get("expirationDate"))
+    if expiration is not None and not cookie.get("session"):
+        converti["expires"] = float(expiration)
+    # Pas de date d'expiration (ou cookie marqué "session") : on omet
+    # "expires" plutôt que d'inventer une valeur - traité comme cookie de
+    # session par le navigateur, ce qui est le comportement correct ici.
+
+    same_site_brut = cookie.get("sameSite")
+    if same_site_brut:
+        same_site_normalise = _SAMESITE_VERS_PLAYWRIGHT.get(str(same_site_brut).lower())
+        if same_site_normalise:
+            converti["sameSite"] = same_site_normalise
+        else:
+            logger.warning(
+                "Cookie '%s' : valeur sameSite '%s' non reconnue, ignorée.",
+                cookie.get("name"), same_site_brut,
+            )
+        # Valeur non reconnue : on omet plutôt que d'envoyer à Playwright une
+        # valeur hors de l'enum Strict/Lax/None qu'il rejetterait.
+
+    return converti
+
+
+def charger_cookies(cookies_json: str) -> list[dict[str, Any]]:
+    """Parse, valide et normalise le contenu de la variable d'environnement
+    FB_COOKIES_JSON.
+
+    Accepte deux formats en entrée : le format Playwright natif
+    (`{"name", "value", "domain", "path", ...}`) et le format brut exporté par
+    les extensions de navigateur usuelles (`{"expirationDate", "hostOnly",
+    "sameSite": "no_restriction", ...}`) - voir `_normaliser_cookie`. Le
+    résultat retourné est toujours au format Playwright.
 
     Raises:
         ValueError: JSON invalide ou structure inattendue.
     """
     try:
-        cookies = json.loads(cookies_json)
+        cookies_bruts = json.loads(cookies_json)
     except json.JSONDecodeError as exc:
         raise ValueError(f"FB_COOKIES_JSON n'est pas un JSON valide : {exc}") from exc
 
-    if not isinstance(cookies, list) or not cookies:
+    if not isinstance(cookies_bruts, list) or not cookies_bruts:
         raise ValueError("FB_COOKIES_JSON doit être une liste non vide de cookies.")
 
     champs_requis = {"name", "value", "domain"}
-    for i, cookie in enumerate(cookies):
+    for i, cookie in enumerate(cookies_bruts):
         if not isinstance(cookie, dict) or not champs_requis.issubset(cookie):
             raise ValueError(
                 f"Cookie #{i} invalide : champs requis {champs_requis} manquants."
             )
-        cookie.setdefault("path", "/")
+
+    cookies = [_normaliser_cookie(c) for c in cookies_bruts]
 
     noms_presents = {c["name"] for c in cookies}
     if "c_user" not in noms_presents or "xs" not in noms_presents:

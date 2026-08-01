@@ -44,6 +44,63 @@ class TestChargerCookies:
         with pytest.raises(ValueError):
             scraper.charger_cookies(brut)
 
+    def test_export_extension_navigateur_est_converti_au_format_playwright(self):
+        # Format réel d'un export d'extension de navigateur (chrome.cookies) :
+        # expirationDate au lieu de expires, sameSite en minuscules avec des
+        # valeurs hors de l'enum Playwright, clés inconnues de Playwright.
+        # Valeurs synthétiques - jamais de vrai cookie de session dans les tests.
+        brut = json.dumps([
+            {
+                "domain": ".facebook.com", "expirationDate": 1999999999.5,
+                "hostOnly": False, "httpOnly": True, "name": "xs", "path": "/",
+                "sameSite": "no_restriction", "secure": True, "session": False,
+                "storeId": None, "value": "test_xs_value",
+            },
+            {
+                "domain": ".facebook.com", "expirationDate": 1999999999.0,
+                "hostOnly": False, "httpOnly": False, "name": "c_user", "path": "/",
+                "sameSite": "lax", "secure": True, "session": False,
+                "storeId": None, "value": "test_c_user_value",
+            },
+            {
+                # cookie de session : pas d'expirationDate, sameSite absent
+                "domain": ".facebook.com", "hostOnly": False, "httpOnly": False,
+                "name": "presence", "path": "/", "sameSite": None, "secure": True,
+                "session": True, "storeId": None, "value": "test_presence_value",
+            },
+        ])
+        cookies = scraper.charger_cookies(brut)
+        par_nom = {c["name"]: c for c in cookies}
+
+        # Clés non reconnues par Playwright supprimées.
+        for c in cookies:
+            assert set(c).issubset({"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"})
+
+        assert par_nom["xs"]["sameSite"] == "None"  # no_restriction -> None
+        assert par_nom["xs"]["expires"] == 1999999999.5  # expirationDate -> expires
+        assert par_nom["c_user"]["sameSite"] == "Lax"  # lax -> Lax
+
+        assert "expires" not in par_nom["presence"]  # cookie de session : pas de date inventée
+        assert "sameSite" not in par_nom["presence"]  # valeur absente : pas de défaut inventé
+
+    def test_sameSite_non_reconnu_est_ignore_sans_lever_derreur(self):
+        brut = json.dumps([
+            {"name": "c_user", "value": "v", "domain": ".facebook.com", "sameSite": "valeur_inconnue"},
+        ])
+        cookies = scraper.charger_cookies(brut)
+        assert "sameSite" not in cookies[0]
+
+    def test_format_playwright_natif_reste_accepte(self):
+        # Rétrocompatibilité : un cookie déjà au format Playwright (expires,
+        # sameSite en PascalCase) doit passer sans être altéré.
+        brut = json.dumps([
+            {"name": "c_user", "value": "v", "domain": ".facebook.com",
+             "path": "/", "expires": 1999999999.0, "sameSite": "Strict"},
+        ])
+        cookies = scraper.charger_cookies(brut)
+        assert cookies[0]["expires"] == 1999999999.0
+        assert cookies[0]["sameSite"] == "Strict"
+
 
 class TestExtraireIdDepuisUrl:
     @pytest.mark.parametrize(
