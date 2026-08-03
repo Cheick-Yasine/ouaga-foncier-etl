@@ -700,12 +700,21 @@ def _parser_horodatage_relatif(
 
 
 async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
-    """Sauvegarde le HTML brut de la page courante quand 0 post est extrait.
+    """Sauvegarde le HTML brut de la page courante quand aucun post "mis en
+    avant" n'est trouvé dans le HTML initial d'un groupe.
 
     Sert à diagnostiquer un échec d'extraction JSON sans session live pour
     inspecter manuellement (voir `extraire_stories_depuis_json`). Fichier
-    écrit dans data/logs/ (jamais commité - voir .gitignore, jamais uploadé en
-    artefact CI - voir daily_scraper.yml qui ne prend que *.log).
+    écrit dans data/logs/ (jamais commité - voir .gitignore ; inclus dans
+    l'artefact du run CI - voir daily_scraper.yml, `data/logs/debug_page_vide_*.html`).
+
+    INCERTITUDE LEVÉE le 2026-08-03 : ce cas n'implique PAS systématiquement
+    un problème. Sur un run à 14 groupes, 3 groupes ont déclenché ce
+    diagnostic (0 post "mis en avant") mais ont ensuite trouvé 78 à 179
+    posts via le scroll - `highlight_units` peut légitimement être vide pour
+    un groupe qui n'a simplement aucun post épinglé. Seul un groupe
+    réellement vrai échec (0 post après le scroll aussi) mérite une
+    inspection du HTML.
 
     Best-effort : une erreur d'écriture ne doit jamais faire échouer le run.
     """
@@ -715,11 +724,14 @@ async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
         chemin.parent.mkdir(parents=True, exist_ok=True)
         contenu = await page.content()
         chemin.write_text(contenu, encoding="utf-8")
-        logger.warning(
-            "0 post extrait pour le groupe %s - HTML sauvegardé pour diagnostic "
-            "-> %s (structure JSON Comet probablement changée : ouvrez ce "
-            "fichier et cherchez un bloc <script type=\"application/json\"> "
-            "contenant un texte de post connu pour retrouver le nouveau chemin).",
+        logger.info(
+            "0 post \"mis en avant\" pour le groupe %s (HTML sauvegardé -> %s, "
+            "au cas où - voir data/logs/). Peut être normal si le groupe n'a "
+            "aucun post épinglé : le scroll va quand même chercher le fil "
+            "normal. Si le run se termine ENCORE à 0 post pour ce groupe "
+            "après le scroll, inspectez le fichier (bloc <script "
+            "type=\"application/json\"> contenant un texte de post connu, "
+            "pour vérifier si la structure JSON Comet a changé).",
             groupe_id, chemin,
         )
         return chemin
