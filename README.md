@@ -69,5 +69,4 @@ pytest -q
 ## Limites connues
 
 - L'automatisation d'une session Facebook authentifiée contrevient aux CGU de Meta — usage sur un compte dédié, à volume mesuré, jamais sur un compte personnel principal.
-- Le groupe privé `1412949025757240` est désactivé (`actif=false` dans `groups.csv`) : le compte de scraping n'y est pas membre.
 - L'API interne de Facebook (JSON Comet, GraphQL) n'est pas documentée officiellement et peut changer sans préavis ; le parsing repose sur une signature structurelle plutôt que sur des chemins de clés fixes pour limiter l'impact.
