@@ -338,6 +338,24 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
     if any(mot in contenu for mot in MOTS_CHECKPOINT_TEXTE):
         raise BlocageDetecteError("Texte de vérification anti-bot détecté sur la page.")
 
+    # BUG RÉEL rencontré le 2026-08-01 (run 30715788089) : aucun des checks
+    # ci-dessus ne détecte une session Comet simplement déconnectée (pas de
+    # redirection d'URL, pas de texte de vérification, pas de formulaire
+    # `#login_form`/`input[name="pass"]` - ce sélecteur visait mbasic et ne
+    # matche pas la page "déconnectée" de web.facebook.com/Comet). Résultat :
+    # 5 groupes revenus à 0 post sans qu'aucune erreur ne soit levée, cooldown
+    # anti-blocage jamais déclenché. Confirmé en analysant le dump HTML réel :
+    # la page contenait `"USER_ID":"0"` et `"actorID":"0"` (identifiants
+    # Facebook internes de l'utilisateur anonyme/déconnecté - un vrai user
+    # connecté a un identifiant numérique réel), ainsi que de vrais liens
+    # "Se connecter" vers `/login/`. Marqueur fiable et spécifique (peu de
+    # risque de faux positif contrairement à un mot générique).
+    if '"user_id":"0"' in contenu or '"actorid":"0"' in contenu:
+        raise SessionExpireeError(
+            "Session Comet déconnectée détectée (USER_ID/actorID à 0) - "
+            "cookies probablement invalidés côté serveur Facebook."
+        )
+
     if await page.locator(SELECTEURS["mur_connexion"]).count() > 0:
         raise SessionExpireeError(
             "Mur de connexion détecté - cookies probablement expirés."

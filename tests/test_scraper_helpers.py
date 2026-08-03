@@ -404,6 +404,75 @@ class TestExtraireStoriesDepuisScriptsJson:
         assert scraper._extraire_stories_depuis_scripts_json(html, "grp1", "Groupe Test") == []
 
 
+class _FausseLocator:
+    """Simule `page.locator(...)` (uniquement `.count()`, seul appel utilisé
+    par `detecter_blocage_ou_session_expiree`)."""
+
+    def __init__(self, count: int = 0):
+        self._count = count
+
+    async def count(self):
+        return self._count
+
+
+class _FaussePage:
+    """Simule les 3 accès Playwright utilisés par
+    `detecter_blocage_ou_session_expiree` (url, content(), locator(...).count()) -
+    évite d'avoir besoin d'un vrai navigateur pour tester cette logique pure.
+    """
+
+    def __init__(
+        self,
+        url: str = "https://web.facebook.com/groups/1/",
+        contenu: str = "<html><body>GroupsCometFeed contenu normal</body></html>",
+        nb_mur_connexion: int = 0,
+    ):
+        self.url = url
+        self._contenu = contenu
+        self._nb_mur_connexion = nb_mur_connexion
+
+    async def content(self):
+        return self._contenu
+
+    def locator(self, _selecteur):
+        return _FausseLocator(self._nb_mur_connexion)
+
+
+class TestDetecterBlocageOuSessionExpiree:
+    async def test_page_saine_ne_leve_rien(self):
+        page = _FaussePage()
+        await scraper.detecter_blocage_ou_session_expiree(page)  # ne doit pas lever
+
+    async def test_url_de_checkpoint_leve_blocage_detecte(self):
+        page = _FaussePage(url="https://www.facebook.com/checkpoint/123/")
+        with pytest.raises(scraper.BlocageDetecteError):
+            await scraper.detecter_blocage_ou_session_expiree(page)
+
+    async def test_texte_de_verification_leve_blocage_detecte(self):
+        page = _FaussePage(contenu="<html>Nous voulons juste vérifier que c'est bien vous.</html>")
+        with pytest.raises(scraper.BlocageDetecteError):
+            await scraper.detecter_blocage_ou_session_expiree(page)
+
+    async def test_user_id_zero_leve_session_expiree(self):
+        # RÉGRESSION du bug réel du 2026-08-01 (run 30715788089) : 5 groupes
+        # revenus à 0 post sans qu'aucune erreur ne soit levée - la page
+        # Comet déconnectée ne redirige pas l'URL et n'affiche aucun texte de
+        # vérification, juste USER_ID/actorID à "0" (confirmé sur le dump
+        # HTML réel).
+        page = _FaussePage(contenu='<html><script>{"USER_ID":"0","actorID":"0"}</script></html>')
+        with pytest.raises(scraper.SessionExpireeError):
+            await scraper.detecter_blocage_ou_session_expiree(page)
+
+    async def test_user_id_non_nul_ne_leve_rien(self):
+        page = _FaussePage(contenu='<html><script>{"USER_ID":"61592012785019"}</script></html>')
+        await scraper.detecter_blocage_ou_session_expiree(page)  # ne doit pas lever
+
+    async def test_mur_connexion_dom_leve_session_expiree(self):
+        page = _FaussePage(nb_mur_connexion=1)
+        with pytest.raises(scraper.SessionExpireeError):
+            await scraper.detecter_blocage_ou_session_expiree(page)
+
+
 class TestSeenIds:
     def test_charger_sans_fichier_retourne_dict_vide(self, repertoires_isoles):
         assert scraper.charger_seen_ids() == {}
