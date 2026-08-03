@@ -37,34 +37,44 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         description="Pipeline ETL annonces foncières Ouagadougou (Facebook -> CSV structuré).",
     )
     parseur.add_argument(
-        "--mode", choices=["daily", "backfill"], default="daily",
+        "--mode",
+        choices=["daily", "backfill"],
+        default="daily",
         help="daily = dernières 24h ; backfill = rattrapage historique paramétrable.",
     )
     parseur.add_argument(
-        "--days-back", type=int, default=None,
+        "--days-back",
+        type=int,
+        default=None,
         help=(
             "Nombre de jours à remonter. Défaut : 1 en mode daily, "
             f"{config.MAX_DAYS_BACK_BACKFILL_DEFAULT} en mode backfill."
         ),
     )
     parseur.add_argument(
-        "--group-limit", type=int, default=0,
+        "--group-limit",
+        type=int,
+        default=0,
         help="Nombre max de groupes traités sur ce run (0 = tous les groupes actifs).",
     )
     parseur.add_argument(
-        "--batch-size", type=int, default=config.GROUPS_BATCH_SIZE_DEFAULT,
+        "--batch-size",
+        type=int,
+        default=config.GROUPS_BATCH_SIZE_DEFAULT,
         help="Nombre de groupes scrollés avant une pause longue inter-batch.",
     )
     parseur.add_argument(
-        "--skip-llm", action="store_true",
+        "--skip-llm",
+        action="store_true",
         help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API Claude. "
-             "Utile pour tester/débugger le scraper sans consommer de crédits API.",
+        "Utile pour tester/débugger le scraper sans consommer de crédits API.",
     )
     args = parseur.parse_args(argv)
 
     if args.days_back is None:
         args.days_back = (
-            config.MAX_DAYS_BACK_DAILY if args.mode == "daily"
+            config.MAX_DAYS_BACK_DAILY
+            if args.mode == "daily"
             else config.MAX_DAYS_BACK_BACKFILL_DEFAULT
         )
     if args.days_back <= 0:
@@ -124,7 +134,11 @@ def _ecrire_resume_github_actions(resultat: processor.ResultatTraitement) -> Non
 async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitement:
     logger.info(
         "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d skip_llm=%s ===",
-        args.mode, args.days_back, args.group_limit or "tous", args.batch_size, args.skip_llm,
+        args.mode,
+        args.days_back,
+        args.group_limit or "tous",
+        args.batch_size,
+        args.skip_llm,
     )
 
     fichiers_bruts = await scraper.executer_scraping(
@@ -144,12 +158,20 @@ async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitem
     if args.skip_llm:
         posts = processor.charger_posts_bruts(fichiers_bruts)
         candidats, _ = processor.filtrer_candidats(posts)
-        logger.info("--skip-llm actif : %d candidats identifiés, structuration LLM ignorée.", len(candidats))
+        logger.info(
+            "--skip-llm actif : %d candidats identifiés, structuration LLM ignorée.",
+            len(candidats),
+        )
         chemin_csv = config.PROCESSED_DIR / "candidats_sans_llm.csv"
         # export brut des candidats (sans les champs LLM) pour inspection manuelle
         import csv as _csv
+
         with chemin_csv.open("w", encoding="utf-8-sig", newline="") as f:
-            ecrivain = _csv.DictWriter(f, fieldnames=["id", "groupe_nom", "url", "texte_nettoye"], extrasaction="ignore")
+            ecrivain = _csv.DictWriter(
+                f,
+                fieldnames=["id", "groupe_nom", "url", "texte_nettoye"],
+                extrasaction="ignore",
+            )
             ecrivain.writeheader()
             ecrivain.writerows(candidats)
         return chemin_csv
@@ -176,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     except scraper.BlocageDetecteError as exc:
         logger.critical(
             "Blocage anti-bot détecté - run arrêté, cooldown de %dh activé : %s",
-            config.COOLDOWN_HEURES_APRES_BLOCAGE, exc,
+            config.COOLDOWN_HEURES_APRES_BLOCAGE,
+            exc,
         )
         return 3
     except Exception:
@@ -186,7 +209,9 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(resultat, processor.ResultatTraitement):
         logger.info(
             "=== Pipeline terminé -> DB=%s | XLSX=%s | %d annonce(s) valide(s) ce run ===",
-            _masquer_dsn(resultat.database_url), resultat.chemin_xlsx, resultat.nb_valides,
+            _masquer_dsn(resultat.database_url),
+            resultat.chemin_xlsx,
+            resultat.nb_valides,
         )
         _exposer_sortie_github_actions("xlsx_path", str(resultat.chemin_xlsx))
         _ecrire_resume_github_actions(resultat)
