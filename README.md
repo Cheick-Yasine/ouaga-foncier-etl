@@ -53,16 +53,18 @@ vous avant tout usage sérieux :
    réponses réseau GraphQL via `page.on("response", ...)` et les parser avec
    le même `extraire_stories_depuis_json`, (c) simuler un scroll
    (`window.scrollBy`) entre chaque étape pour déclencher ce chargement.
-   **Confirmé en conditions réelles le 2026-08-01** (`--group-limit 1`,
-   `--mode daily`) : sur 4 posts collectés, 1 provenait bien de la capture
-   GraphQL déclenchée par le scroll (horodatage `scrape_le` distinct des 3
-   posts "mis en avant", texte différent) - la mécanique fonctionne, mais
-   n'a été validée que sur ce seul run/groupe. Restent non vérifiés sur la
-   durée : la stabilité du motif d'URL GraphQL (`config.GRAPHQL_URL_FRAGMENTS
-   = ["/api/graphql/"]`) et le comportement sur des groupes à fort volume ou
-   sur beaucoup de pas de scroll d'affilée. Surveillez les logs sur les
-   prochains runs (`--group-limit 1` d'abord) et signalez tout retour à 0/peu
-   de posts.
+   **Confirmé en conditions réelles à l'échelle le 2026-08-03** (`--group-limit
+   1`, `--days-back 7`, `seen_ids` vidé pour le test) : 181 posts collectés sur
+   un seul groupe en 60 étapes de scroll (garde-fou `MAX_PAGES_ABSOLU`
+   atteint - normal avec `seen_ids` vide, un run quotidien s'arrêtera bien
+   avant), dont 26 annonces valides après filtrage regex + structuration
+   OpenAI. Un premier test plus modeste le 2026-08-01 avait déjà confirmé le
+   principe (1 post sur 4 provenant de la capture GraphQL). Le mécanisme est
+   donc validé à l'échelle, pas seulement sur un post isolé. Reste non
+   garanti sur la durée : la stabilité du motif d'URL GraphQL
+   (`config.GRAPHQL_URL_FRAGMENTS = ["/api/graphql/"]`) si Facebook fait
+   évoluer son API interne (non documentée, changement possible sans
+   préavis) - à surveiller sur les prochains runs quotidiens.
    **Décision assumée sur les posts "mis en avant"** : ils sont toujours
    inclus, sans filtre sur `max_days_back` (contrairement aux posts trouvés
    par scroll, où seule la décision de continuer ou non dépend de la date -

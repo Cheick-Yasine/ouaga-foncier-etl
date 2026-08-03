@@ -38,18 +38,23 @@ Deux sources de blobs JSON exploitées :
    principal, chargé dynamiquement - Facebook ne l'inclut plus dans la
    réponse HTML initiale).
 
-LIMITE TECHNIQUE IMPORTANTE - le scroll + capture réseau reste non vérifié
+STATUT - scroll + capture réseau CONFIRMÉ en conditions réelles (2026-08-03)
 ----------------------------------------------------------------------------
 Le parseur JSON pur (`extraire_stories_depuis_json`) est testé et vérifié
-contre un échantillon RÉEL (structure confirmée, pas une supposition). En
-revanche, la partie qui simule le scroll et intercepte les réponses réseau
-GraphQL (`scraper_groupe`) n'a pas pu être testée en conditions réelles -
-aucun accès réseau à facebook.com depuis mon environnement. Deux
-incertitudes assumées : (1) le pattern d'URL utilisé pour repérer les
-requêtes GraphQL (`config.GRAPHQL_URL_FRAGMENTS`) est une hypothèse
-documentée publiquement, pas une vérification directe ; (2) rien ne garantit
-que le scroll simulé par Playwright déclenche les mêmes appels réseau qu'un
-scroll humain. Testez avec `--group-limit 1` avant tout run sérieux.
+contre plusieurs échantillons RÉELS (structure confirmée, pas une
+supposition). La partie scroll + capture réseau GraphQL (`scraper_groupe`),
+elle, n'avait jamais pu être testée en conditions réelles depuis mon
+environnement de développement (aucun accès réseau à facebook.com) - c'est
+désormais chose faite : le run CI du 2026-08-03 (`--group-limit 1`,
+`--days-back 7`, avec `seen_ids` vidé pour le test) a collecté 181 posts sur
+un seul groupe (60 étapes de scroll, garde-fou `MAX_PAGES_ABSOLU` atteint -
+attendu vu `seen_ids` vide, un run quotidien normal s'arrêtera bien avant),
+dont 26 se sont révélées être des annonces foncières valides après filtrage
+regex + structuration OpenAI. Le mécanisme fonctionne donc à l'échelle, pas
+seulement sur un post isolé. Reste non garanti sur la durée : la stabilité
+du motif d'URL GraphQL (`config.GRAPHQL_URL_FRAGMENTS`) si Facebook fait
+évoluer son API interne (non documentée publiquement, changement possible
+sans préavis) - à surveiller sur les prochains runs quotidiens.
 """
 
 from __future__ import annotations
