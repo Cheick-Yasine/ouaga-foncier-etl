@@ -87,6 +87,35 @@ class TestNormaliserQuartier:
         assert config.normaliser_quartier("") is None
 
 
+class TestNormaliserStatutDocument:
+    def test_correspondance_exacte(self):
+        assert config.normaliser_statut_document("Titre foncier") == "Titre foncier"
+
+    def test_correspondance_insensible_a_la_casse(self):
+        # Régression du bug réel du 2026-08-03 : "attestation", "ATTESTATION"
+        # et "Attestation" coexistaient comme 3 valeurs distinctes en base
+        # car cette fonction existait mais n'était jamais appelée dans
+        # processor.py (contrairement à normaliser_quartier).
+        assert config.normaliser_statut_document("attestation") == "Attestation"
+        assert config.normaliser_statut_document("ATTESTATION") == "Attestation"
+
+    def test_attestation_dattribution_reste_distincte_dattestation(self):
+        # Volontaire (voir commentaire dans config.py) : ne pas fusionner des
+        # statuts sémantiquement différents juste parce qu'ils se
+        # ressemblent - seule la casse/forme est normalisée.
+        assert config.normaliser_statut_document("attestation d'attribution") == "Attestation d'attribution"
+        assert config.normaliser_statut_document("Attestation") == "Attestation"
+
+    def test_valeur_absente_de_la_liste_est_conservee(self):
+        assert config.normaliser_statut_document("Un statut jamais vu") == "Un statut jamais vu"
+
+    def test_valeur_none_retourne_none(self):
+        assert config.normaliser_statut_document(None) is None
+
+    def test_chaine_vide_retourne_none(self):
+        assert config.normaliser_statut_document("") is None
+
+
 class TestChargerGroupes:
     def test_charge_uniquement_les_groupes_actifs(self, fichier_groupes_valide):
         groupes = config.charger_groupes(chemin=fichier_groupes_valide)

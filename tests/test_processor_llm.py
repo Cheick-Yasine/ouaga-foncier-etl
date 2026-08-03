@@ -188,6 +188,8 @@ class TestStructurerLot:
         assert len(non_valides) == 1 and non_valides[0]["id"] == "p2"
         # La normalisation du quartier doit avoir été appliquée sur le résultat valide.
         assert valides[0]["quartier_zone"] == "Ouaga 2000"
+        # Idem pour statut_document (régression : cet appel manquait, voir processor.py).
+        assert valides[0]["statut_document"] == "Titre foncier"
 
     async def test_llm_juge_invalide_va_dans_non_valides(self, monkeypatch):
         candidats = [{"id": "p1", "texte_nettoye": "annonce suspecte"}]

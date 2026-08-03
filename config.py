@@ -291,6 +291,41 @@ def normaliser_quartier(valeur: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Statut du document foncier (normalisation)
+# --------------------------------------------------------------------------- #
+
+# Liste initiale constituée le 2026-08-03 à partir des valeurs RÉELLEMENT
+# renvoyées par le LLM sur 224 annonces (pas une liste théorique/inventée) -
+# à COMPLÉTER au fil de l'eau, même logique que QUARTIERS_OUAGA ci-dessus.
+# "Attestation" et "Attestation d'attribution" sont volontairement gardées
+# SÉPARÉES : rien ne garantit qu'un vendeur écrivant juste "attestation" veut
+# dire "attestation d'attribution" plutôt qu'un autre type - les fusionner
+# serait une supposition non vérifiée, pas une normalisation de casse/forme.
+STATUTS_DOCUMENT = [
+    "Titre foncier",
+    "APFR",
+    "PUH",
+    "Attestation d'attribution",
+    "Fiche d'attribution",
+    "Attestation",
+]
+
+_STATUTS_DOCUMENT_NORMALISES = {s.lower(): s for s in STATUTS_DOCUMENT}
+
+
+def normaliser_statut_document(valeur: str | None) -> str | None:
+    """Tente de faire correspondre un statut de document libre à la liste
+    normalisée - même logique et mêmes garanties que `normaliser_quartier`
+    (correspondance stricte insensible à la casse, aucune perte de donnée
+    sur une valeur non reconnue, pas de fuzzy-matching).
+    """
+    if not valeur:
+        return None
+    nettoye = valeur.strip()
+    return _STATUTS_DOCUMENT_NORMALISES.get(nettoye.lower(), nettoye)
+
+
+# --------------------------------------------------------------------------- #
 # Paramètres de scraping / anti-détection
 # --------------------------------------------------------------------------- #
 

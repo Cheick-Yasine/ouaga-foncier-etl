@@ -253,6 +253,13 @@ async def structurer_lot(
             non_valides.append({**post, "motif_rejet": "llm_juge_invalide", **structure})
         else:
             structure["quartier_zone"] = config.normaliser_quartier(structure.get("quartier_zone"))
+            # BUG RÉEL trouvé le 2026-08-03 en analysant les 224 premières
+            # annonces réelles : `normaliser_statut_document` existait dans
+            # config.py mais n'était jamais appelé ici (contrairement à
+            # normaliser_quartier, juste au-dessus) - "attestation",
+            # "ATTESTATION" et "Attestation" restaient 3 valeurs distinctes
+            # en base au lieu d'être fusionnées par casse.
+            structure["statut_document"] = config.normaliser_statut_document(structure.get("statut_document"))
             valides.append({**post, **structure})
 
     logger.info(
