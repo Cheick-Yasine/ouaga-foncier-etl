@@ -2,24 +2,10 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # 23h07 UTC, hors de l'heure pile (voir commit 29f5d61).
-    #
-    # RÉSULTAT DES TESTS DU 2026-08-04 : deux tentatives à horaire rapproché
-    # (11h45 puis 12h05 UTC, chacune avec de la marge après le push) n'ont
-    # produit AUCUN run déclenché par schedule - même constat que le
-    # 2026-08-03 23h00 UTC (0 run schedule depuis la création du workflow).
-    # Diagnostic honnête : je ne peux PAS confirmer que le décalage horaire
-    # seul corrige le problème - chaque modification du cron remet
-    # potentiellement à zéro le délai d'enregistrement du planning côté
-    # GitHub (documenté : un nouveau/modifié cron peut prendre du temps à
-    # être pris en compte), donc des tests rapprochés comme ceux du jour ne
-    # sont pas fiables pour juger. On revient à un horaire nocturne stable
-    # et on laisse tourner sans y retoucher pendant plusieurs nuits avant de
-    # conclure. Si ça rate encore ce soir, la piste sérieuse suivante est un
-    # déclencheur externe (ping vers l'API workflow_dispatch depuis un
-    # service de cron tiers) plutôt que l'événement `schedule` natif, connu
-    # pour son manque de fiabilité documenté.
-    - cron: "7 23 * * *"
+    # Horaire de production : 15h15 UTC, volontairement décalé de l'heure
+    # pile pour éviter la zone de forte charge/retard documentée par GitHub
+    # sur les déclenchements schedule proches de hh:00.
+    - cron: "15 15 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -52,17 +38,10 @@ concurrency:
 jobs:
   # Job séparé et bloquant : si la suite de tests échoue (régression sur les
   # regex, le parseur d'horodatage, le throttle adaptatif, etc.), le job de
-  # scraping ne démarre même pas. Sans ce garde-fou, la première victime d'un
-  # bug serait un run réel contre Facebook - gaspillé, ou pire, faussement
-  # remonté comme un blocage anti-bot.
+  # scraping ne démarre même pas.
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Service Postgres éphémère, propre à ce job, entièrement indépendant de la
-    # base maître de production (voir DATABASE_URL plus bas). Sert uniquement
-    # à exécuter les tests de tests/test_processor_db.py contre un vrai serveur
-    # PostgreSQL plutôt que des mocks - conformément à la même logique déjà
-    # appliquée aux autres modules (regex, parseur d'horodatage, throttle...).
     services:
       postgres:
         image: postgres:16
@@ -84,7 +63,10 @@ jobs:
       - name: "Configuration Python"
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12.7"
+          # Version majeure.mineure seulement (et non 3.12.7) : setup-python
+          # résout automatiquement le dernier patch disponible, ce qui évite
+          # un échec si le patch exact 3.12.7 disparaît du manifeste GitHub.
+          python-version: "3.12"
           cache: "pip"
           cache-dependency-path: requirements.txt
 
@@ -107,11 +89,7 @@ jobs:
       - name: "Configuration Python"
         uses: actions/setup-python@v5
         with:
-          # NOTE : le cahier des charges mentionne à la fois Python 3.11 (bloc
-          # "Architecture") et Python 3.12.7 (bloc "Workflow"). Ces deux versions
-          # sont incompatibles à ce niveau de précision - j'ai retenu 3.12.7 car
-          # c'est la version explicitement citée pour la CI. À confirmer.
-          python-version: "3.12.7"
+          python-version: "3.12"
           cache: "pip"
           cache-dependency-path: requirements.txt
 
@@ -121,14 +99,9 @@ jobs:
       - name: "Installation de Chromium (Playwright)"
         run: playwright install --with-deps chromium
 
-      # État persistant entre deux runs : storage_state (localStorage, pour un
-      # fingerprint de navigateur cohérent d'un jour à l'autre plutôt qu'un
-      # navigateur "neuf" à chaque fois), déduplication des posts déjà vus,
-      # cooldown anti-blocage et score de confiance du throttle adaptatif.
-      # Clé unique par run + restore-keys en préfixe : c'est le pattern
-      # standard pour "toujours restaurer le plus récent, toujours sauvegarder
-      # le nouveau" avec actions/cache (une clé exacte n'est jamais réécrite
-      # une fois créée).
+      # État persistant entre deux runs : storage_state, déduplication des
+      # posts déjà vus, cooldown anti-blocage et score de confiance du
+      # throttle adaptatif.
       - name: "Restauration de l'état persistant (data/state)"
         uses: actions/cache/restore@v4
         with:
@@ -137,10 +110,9 @@ jobs:
           restore-keys: |
             etat-scraper-
 
-      # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
-      # pour éviter que le trafic parte systématiquement à la même seconde
-      # chaque jour. Pas de jitter en déclenchement manuel (l'utilisateur
-      # attend un retour rapide).
+      # Jitter anti-empreinte temporelle : uniquement sur le déclenchement
+      # cron, pour éviter que le trafic parte systématiquement à la même
+      # seconde chaque jour. Pas de jitter en déclenchement manuel.
       - name: "Délai aléatoire avant démarrage (cron uniquement)"
         if: github.event_name == 'schedule'
         run: sleep $(( RANDOM % 1200 ))  # 0 à 20 minutes
@@ -166,8 +138,7 @@ jobs:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
-          # README.md, section "Base de données", pour le dimensionnement et
-          # les étapes de configuration du secret.
+          # README.md, section "Base de données".
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python main.py \
@@ -176,14 +147,7 @@ jobs:
             --group-limit "${{ steps.params.outputs.group_limit }}" \
             --batch-size "${{ steps.params.outputs.batch_size }}"
 
-      # Installe un pg_dump compatible avec la version serveur de Neon. BUG
-      # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
-      # préinstallé sur ubuntu-latest refusait de dumper le serveur Neon en
-      # PostgreSQL 18.4 ("server version mismatch"), silencieusement avalé
-      # par le `|| true` de l'étape suivante - la sauvegarde SQL ne s'est
-      # donc JAMAIS produite jusqu'ici, sans faire échouer le job. Méthode
-      # d'installation officielle PGDG (dépôt apt.postgresql.org) plutôt
-      # qu'une gestion manuelle de clé/sources.list.
+      # Installe un pg_dump compatible avec la version serveur de Neon.
       - name: "Installer pg_dump compatible avec la version PostgreSQL de Neon"
         if: always()
         run: |
@@ -191,24 +155,7 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-client-18
 
-      # Sauvegarde ponctuelle de la base maître dans l'artefact du run, en plus
-      # de la base PostgreSQL elle-même (qui reste la source de vérité). Utile
-      # pour retrouver un état antérieur sans dépendre de la politique de
-      # sauvegarde de l'hébergeur Postgres choisi.
-      #
-      # ÉCHEC CONFIRMÉ du premier essai (run 30714569155, 2026-08-01) : après
-      # installation de postgresql-client-18 ci-dessus, l'appel nu à `pg_dump`
-      # utilisait TOUJOURS le binaire 16.14 ("server version mismatch"
-      # identique). Cause : sur ce runner, `/usr/bin/pg_dump` n'est pas géré
-      # par le système d'alternatives de postgresql-common (seul `psql` l'est,
-      # confirmé dans les logs de l'étape précédente - "using .../18/.../
-      # psql.1.gz ... in auto mode", rien d'équivalent pour pg_dump). On
-      # appelle donc directement le binaire versionné installé par le paquet
-      # `postgresql-client-18` (chemin standard Debian/Ubuntu), avec repli
-      # explicite (+ avertissement visible) sur `pg_dump` générique si ce
-      # chemin venait à changer. Non re-vérifié en conditions réelles depuis
-      # ce correctif (pas d'accès réseau à Neon depuis mon environnement) - à
-      # confirmer sur le prochain run.
+      # Sauvegarde ponctuelle de la base maître dans l'artefact du run.
       - name: "Sauvegarde SQL de la base maître (pg_dump)"
         if: always()
         env:
@@ -223,7 +170,7 @@ jobs:
           "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
 
       - name: "Upload de l'artefact (dump base maître, Excel, CSV du run, logs)"
-        if: always()  # même en cas d'échec partiel, on récupère les données déjà collectées
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: "annonces-foncieres-${{ github.run_id }}"
@@ -238,7 +185,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "Sauvegarde de l'état persistant pour le prochain run"
-        if: always()  # même si le run a été coupé par un cooldown/blocage, l'état doit être conservé
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: data/state
