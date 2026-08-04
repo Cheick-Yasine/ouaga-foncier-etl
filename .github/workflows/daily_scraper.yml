@@ -2,12 +2,14 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # TEST TEMPORAIRE (2026-08-04) : horaire décalé à 11h45 UTC pour
-    # vérifier que le cron se déclenche bien après le run manquant du
-    # 2026-08-03 23h00 UTC. À REMETTRE sur un horaire nocturne (ex. "7 23
-    # * * *", hors de l'heure pile - voir commit 29f5d61) une fois le test
-    # confirmé.
-    - cron: "45 11 * * *"  # TEMPORAIRE : test à 11h45 UTC
+    # TEST TEMPORAIRE (2026-08-04) : horaire décalé pour vérifier que le
+    # cron se déclenche bien après le run manquant du 2026-08-03 23h00 UTC.
+    # 1re tentative à 11h45 UTC non concluante (push arrivé trop près de
+    # l'heure cible, propagation GitHub pas garantie à temps) - 2e tentative
+    # avec ~15 min de marge après le push. À REMETTRE sur un horaire
+    # nocturne (ex. "7 23 * * *", hors de l'heure pile - voir commit
+    # 29f5d61) une fois le test confirmé.
+    - cron: "5 12 * * *"  # TEMPORAIRE : test à 12h05 UTC
   workflow_dispatch:
     inputs:
       mode:
