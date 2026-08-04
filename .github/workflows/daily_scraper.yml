@@ -2,13 +2,12 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # 23h07 UTC plutôt que 23h00 pile : GitHub documente que les cron à
-    # l'heure pile (:00) sont les plus exposés aux pics de charge et peuvent
-    # être RETARDÉS voire purement ABANDONNÉS (pas juste en retard) si la
-    # charge est trop forte - source : docs.github.com/actions, section
-    # "schedule" event. Confirmé comme cause probable du run manquant du
-    # 2026-08-03 23h00 UTC (aucun run du tout dans l'historique Actions).
-    - cron: "7 23 * * *"  # Quotidien, ~23h07 UTC
+    # TEST TEMPORAIRE (2026-08-04) : horaire décalé à 11h45 UTC pour
+    # vérifier que le cron se déclenche bien après le run manquant du
+    # 2026-08-03 23h00 UTC. À REMETTRE sur un horaire nocturne (ex. "7 23
+    # * * *", hors de l'heure pile - voir commit 29f5d61) une fois le test
+    # confirmé.
+    - cron: "45 11 * * *"  # TEMPORAIRE : test à 11h45 UTC
   workflow_dispatch:
     inputs:
       mode:
