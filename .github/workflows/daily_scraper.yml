@@ -2,10 +2,10 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # Horaire de production : 15h15 UTC, volontairement décalé de l'heure
+    # Horaire de production : 15h30 UTC, volontairement décalé de l'heure
     # pile pour éviter la zone de forte charge/retard documentée par GitHub
     # sur les déclenchements schedule proches de hh:00.
-    - cron: "15 15 * * *"
+    - cron: "30 15 * * *"
   workflow_dispatch:
     inputs:
       mode:
