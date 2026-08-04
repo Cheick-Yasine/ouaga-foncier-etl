@@ -2,14 +2,24 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # TEST TEMPORAIRE (2026-08-04) : horaire décalé pour vérifier que le
-    # cron se déclenche bien après le run manquant du 2026-08-03 23h00 UTC.
-    # 1re tentative à 11h45 UTC non concluante (push arrivé trop près de
-    # l'heure cible, propagation GitHub pas garantie à temps) - 2e tentative
-    # avec ~15 min de marge après le push. À REMETTRE sur un horaire
-    # nocturne (ex. "7 23 * * *", hors de l'heure pile - voir commit
-    # 29f5d61) une fois le test confirmé.
-    - cron: "5 12 * * *"  # TEMPORAIRE : test à 12h05 UTC
+    # 23h07 UTC, hors de l'heure pile (voir commit 29f5d61).
+    #
+    # RÉSULTAT DES TESTS DU 2026-08-04 : deux tentatives à horaire rapproché
+    # (11h45 puis 12h05 UTC, chacune avec de la marge après le push) n'ont
+    # produit AUCUN run déclenché par schedule - même constat que le
+    # 2026-08-03 23h00 UTC (0 run schedule depuis la création du workflow).
+    # Diagnostic honnête : je ne peux PAS confirmer que le décalage horaire
+    # seul corrige le problème - chaque modification du cron remet
+    # potentiellement à zéro le délai d'enregistrement du planning côté
+    # GitHub (documenté : un nouveau/modifié cron peut prendre du temps à
+    # être pris en compte), donc des tests rapprochés comme ceux du jour ne
+    # sont pas fiables pour juger. On revient à un horaire nocturne stable
+    # et on laisse tourner sans y retoucher pendant plusieurs nuits avant de
+    # conclure. Si ça rate encore ce soir, la piste sérieuse suivante est un
+    # déclencheur externe (ping vers l'API workflow_dispatch depuis un
+    # service de cron tiers) plutôt que l'événement `schedule` natif, connu
+    # pour son manque de fiabilité documenté.
+    - cron: "7 23 * * *"
   workflow_dispatch:
     inputs:
       mode:
