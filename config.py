@@ -426,7 +426,7 @@ JSON_PROFONDEUR_MAX = 12
 # repos avant tout nouveau run - retenter aussitôt après un blocage est le
 # signal le plus voyant possible pour un système anti-bot.
 COOLDOWN_HEURES_APRES_BLOCAGE = 24
-COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 6  # probablement juste les cookies à renouveler, pas un blocage actif
+COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 1  # probablement juste les cookies à renouveler, pas un blocage actif
 
 # Durée maximale d'un run, tous groupes confondus. Une session de scraping qui
 # tourne des heures d'affilée est un signal comportemental fort ; mieux vaut
