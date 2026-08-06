@@ -283,16 +283,18 @@ async def creer_navigateur(
         args=["--disable-blink-features=AutomationControlled"],
     )
     contexte = await navigateur.new_context(
-        # Viewport réduit : cohérent avec le User-Agent d'ancien navigateur
-        # mobile ci-dessous (voir config.MBASIC_USER_AGENT) - un viewport
-        # desktop 1366x900 combiné à un UA mobile serait un signal incohérent
-        # facilement détectable.
-        viewport={"width": 360, "height": 640},
-        locale="fr-FR",
-        timezone_id="Africa/Ouagadougou",
-        user_agent=config.MBASIC_USER_AGENT,
-        storage_state={"cookies": [], "origins": _charger_origins_sauvegardees()},
-    )
+    # Viewport desktop : cohérent avec le User-Agent Chrome/Windows utilisé
+    # ci-dessous (config.MBASIC_USER_AGENT, malgré son nom historique, est
+    # en réalité un UA Chrome desktop standard depuis le passage à Comet -
+    # voir historique dans config.py). Un viewport mobile (360x640) combiné
+    # à un UA desktop était un signal incohérent facilement détectable par
+    # Facebook, corrigé le 2026-08-06.
+    viewport={"width": 1366, "height": 900},
+    locale="fr-FR",
+    timezone_id="Africa/Ouagadougou",
+    user_agent=config.MBASIC_USER_AGENT,
+    storage_state={"cookies": [], "origins": _charger_origins_sauvegardees()},
+)
     # Masque le flag standard qui trahit un navigateur piloté par automation.
     # Patch minimal et documenté publiquement (pas une suite de contournement) -
     # voir README.md pour ce qui n'est délibérément PAS fait au-delà de ça.
