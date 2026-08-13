@@ -1116,7 +1116,7 @@ async def scraper_groupe(
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
-          logger.info(
+            logger.info(
                 "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
                 "| posts capturés cumulés=%d",
                 groupe.nom, etapes_scroll, diag_reponses_totales,
