@@ -1008,20 +1008,19 @@ async def scraper_groupe(
     posts_captures: list[dict[str, Any]] = []
     taches_en_cours: set[asyncio.Task] = set()
 
+# --- INSTRUMENTATION TEMPORAIRE DE DIAGNOSTIC (à retirer une fois la
+    # cause confirmée - voir conversation du 2026-08-13) ---
+    diag_reponses_totales = 0
+    diag_reponses_matchees = 0
+    diag_urls_matchees_echantillon: list[str] = []
+
     async def _traiter_reponse_graphql(reponse: Any) -> None:
-        """Parse une réponse réseau GraphQL et accumule les posts trouvés dans
-        `posts_captures`. Best-effort : toute erreur est avalée pour ne
-        jamais interrompre le scraping sur une réponse mal formée.
-        """
         try:
             corps = await reponse.text()
         except Exception:
             return
-        # Ancien préfixe anti-JSON-hijacking parfois toujours présent.
         corps = corps.removeprefix("for (;;);")
-        # Une réponse GraphQL Facebook peut contenir plusieurs objets JSON
-        # concaténés ligne par ligne ("multipart") - on tente le corps entier
-        # puis chaque ligne individuellement.
+        posts_trouves_ici = 0
         for candidat in (corps, *corps.splitlines()):
             candidat = candidat.strip()
             if not candidat:
@@ -1030,19 +1029,30 @@ async def scraper_groupe(
                 payload = json.loads(candidat)
             except json.JSONDecodeError:
                 continue
-            posts_captures.extend(
-                extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
+            nouveaux = extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
+            posts_captures.extend(nouveaux)
+            posts_trouves_ici += len(nouveaux)
+        if posts_trouves_ici == 0:
+            logger.debug(
+                "Groupe %s : réponse GraphQL matchée (%s) mais 0 post extrait "
+                "(corps %d octets) - JSON valide mais structure story non reconnue ?",
+                groupe.nom, reponse.url, len(corps),
             )
 
     def _sur_reponse(reponse: Any) -> None:
-        # Callback SYNCHRONE (API d'événements Playwright) : on ne fait que
-        # planifier le traitement async (reponse.text() est une coroutine).
+        nonlocal diag_reponses_totales, diag_reponses_matchees
+        diag_reponses_totales += 1
         if any(fragment in reponse.url for fragment in config.GRAPHQL_URL_FRAGMENTS):
+            diag_reponses_matchees += 1
+            if len(diag_urls_matchees_echantillon) < 3:
+                diag_urls_matchees_echantillon.append(reponse.url)
             tache = asyncio.ensure_future(_traiter_reponse_graphql(reponse))
             taches_en_cours.add(tache)
             tache.add_done_callback(taches_en_cours.discard)
 
     page.on("response", _sur_reponse)
+    # --- FIN INSTRUMENTATION ---
+  
     url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
 
     try:
@@ -1106,6 +1116,12 @@ async def scraper_groupe(
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
+          logger.info(
+                "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
+                "| posts capturés cumulés=%d",
+                groupe.nom, etapes_scroll, diag_reponses_totales,
+                diag_reponses_matchees, len(posts_captures),
+            )
             nouveaux_bruts = posts_captures[debut_capture:]
             vus_cette_etape: set[str] = set()
             posts_inedits: list[dict[str, Any]] = []
