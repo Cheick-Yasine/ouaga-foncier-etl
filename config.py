@@ -8,6 +8,7 @@ valeur hardcodée dispersée.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import re
@@ -33,6 +34,7 @@ SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
 COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
 STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
 SANTE_PATH = STATE_DIR / "sante_scraper.json"
+INDEX_PROCHAIN_GROUPE_PATH = STATE_DIR / "prochain_groupe_index.json"
 
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
 # SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir
@@ -159,6 +161,36 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
         groupes_actifs = groupes_actifs[:limite]
 
     return groupes_actifs
+
+
+# --------------------------------------------------------------------------- #
+# Rotation "round-robin" des groupes entre plusieurs runs (voir --round-robin
+# dans main.py). Permet de traiter 1 (ou quelques) groupe(s) par run plutôt
+# que tous les groupes d'un coup dans la même session - l'espacement entre
+# deux groupes est alors obtenu naturellement en espaçant les runs eux-mêmes
+# (via la planification cron), pas en faisant "dormir" un job.
+# --------------------------------------------------------------------------- #
+
+
+def charger_index_prochain_groupe() -> int:
+    """Index (dans la liste des groupes actifs) du prochain groupe à traiter.
+
+    Fichier absent/corrompu -> on repart de 0 (premier groupe) plutôt que de
+    bloquer le run pour un problème d'état non critique.
+    """
+    if not INDEX_PROCHAIN_GROUPE_PATH.exists():
+        return 0
+    try:
+        with INDEX_PROCHAIN_GROUPE_PATH.open(encoding="utf-8") as f:
+            return int(json.load(f).get("index", 0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+
+
+def sauvegarder_index_prochain_groupe(index: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with INDEX_PROCHAIN_GROUPE_PATH.open("w", encoding="utf-8") as f:
+        json.dump({"index": index}, f)
 
 
 # --------------------------------------------------------------------------- #
@@ -410,6 +442,13 @@ GRAPHQL_URL_FRAGMENTS = ["/api/graphql/"]
 # posts - protection contre un coût CPU excessif sur un payload très large
 # et profondément imbriqué (observé : blobs de 170 Ko+, des centaines par page).
 JSON_PROFONDEUR_MAX = 12
+
+# Nombre d'échantillons bruts de réponses GraphQL matchées à conserver pour
+# diagnostic quand un groupe termine son scroll sans avoir trouvé aucun post
+# (voir `_sauvegarder_echantillons_graphql_debug` dans scraper.py) - juste de
+# quoi inspecter manuellement ce que Facebook renvoie réellement, sans saturer
+# le disque sur un run avec des centaines de réponses matchées.
+NB_ECHANTILLONS_DEBUG_GRAPHQL = 3
 
 # --------------------------------------------------------------------------- #
 # Stratégie anti-blocage : circuit breaker + budget de session
