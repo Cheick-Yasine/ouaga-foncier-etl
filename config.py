@@ -31,6 +31,14 @@ for _dir in (RAW_DIR, PROCESSED_DIR, STATE_DIR, LOG_DIR):
 
 GROUPS_CSV_PATH = BASE_DIR / "groups.csv"
 SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
+# {groupe_id: post_id} du post le plus récent connu pour chaque groupe, au
+# moment où le run précédent a terminé son scroll. Sert de repère d'arrêt :
+# au prochain passage sur ce groupe, on scrolle depuis le haut du fil jusqu'à
+# retrouver ce post précis, puis on s'arrête - on sait alors avec certitude
+# qu'on a rattrapé TOUT ce qui a été publié depuis la dernière visite, sans
+# dépendre d'un plafond de scrolls arbitraire (voir MAX_PAGES_ABSOLU ci-dessous,
+# qui reste un filet de sécurité, plus le mécanisme d'arrêt principal).
+DERNIER_POST_CONNU_PATH = STATE_DIR / "dernier_post_connu.json"
 COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
 STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
 SANTE_PATH = STATE_DIR / "sante_scraper.json"
@@ -421,11 +429,38 @@ MBASIC_USER_AGENT = (
 
 PAGE_DELAY_MIN_S = 2.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
 PAGE_DELAY_MAX_S = 5.0
-PAUSE_ENTRE_BATCHES_MIN_S = 15.0
-PAUSE_ENTRE_BATCHES_MAX_S = 45.0
+
+# Pause entre deux groupes consécutifs du même lot (batch) - AUGMENTÉE le
+# 2026-08-15 de 2-5s à 10-15 MINUTES à la demande explicite de l'utilisateur,
+# suite au passage à un run unique toutes les 12h traitant tous les groupes
+# (voir daily_scraper.yml). Ces deux constantes étaient auparavant confondues
+# avec PAGE_DELAY_MIN_S/MAX_S ci-dessus (même valeur réutilisée pour "entre
+# deux scrolls" ET "entre deux groupes") - séparées ici car leurs échelles de
+# temps n'ont plus rien à voir (secondes vs minutes).
+PAUSE_ENTRE_GROUPES_MIN_S = 600.0  # 10 minutes
+PAUSE_ENTRE_GROUPES_MAX_S = 900.0  # 15 minutes
+
+# Pause entre deux LOTS (batches) de groupes - AUGMENTÉE le 2026-08-15 de
+# 15-45s à 20-30 MINUTES, même contexte que ci-dessus.
+PAUSE_ENTRE_BATCHES_MIN_S = 1200.0  # 20 minutes
+PAUSE_ENTRE_BATCHES_MAX_S = 1800.0  # 30 minutes
 
 MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
-MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini
+
+# FILET DE SÉCURITÉ uniquement depuis l'introduction du repère de reprise
+# (DERNIER_POST_CONNU_PATH, voir plus haut) : l'arrêt "normal" du scroll se
+# fait maintenant en retrouvant le dernier post connu du run précédent, pas
+# en comptant les scrolls. Ce plafond ne sert donc qu'à éviter un scroll
+# infini dans deux cas limites : (1) le post-repère a été supprimé entre-temps
+# par son auteur et ne sera donc jamais retrouvé, (2) tout premier run sur un
+# groupe (aucun repère encore connu). Fixé à 100 (valeur choisie par
+# l'utilisateur le 2026-08-15) - avant, c'était le mécanisme d'arrêt PRINCIPAL
+# sur un groupe très actif, donc une valeur basse (60) était plus prudente ;
+# maintenant que ce n'est plus qu'un filet de secours, cette valeur ne coûte
+# rien la plupart du temps (on s'arrête bien avant, dès que le repère est
+# retrouvé) tout en couvrant un rattrapage raisonnable si le repère est
+# introuvable.
+MAX_PAGES_ABSOLU = 100
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
@@ -471,7 +506,28 @@ COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 1  # probablement juste les cookies à r
 # tourne des heures d'affilée est un signal comportemental fort ; mieux vaut
 # couper proprement (les groupes restants seront traités au run suivant) que
 # de pousser un run interminable.
-SESSION_DUREE_MAX_MINUTES = 45
+#
+# RÉAJUSTÉ le 2026-08-15 (300 min) suite au passage à un cron fixe 00h/12h
+# traitant TOUS les groupes en un seul run, AVEC des pauses volontairement
+# longues entre eux (10-15 min/groupe, 20-30 min/lot de 5 - voir
+# PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_* ci-dessous). Plafonné à 300
+# (pas plus) à cause d'une limite DURE de GitHub Actions : un job sur un
+# runner hébergé ne peut jamais dépasser 6h (360 min), quelle que soit la
+# valeur de `timeout-minutes` dans le workflow - infranchissable. Les 60
+# minutes de marge restantes (360-300) couvrent le reste du run (checkout,
+# installation des dépendances, jitter anti-empreinte, structuration LLM
+# après le scraping, sauvegarde PostgreSQL, upload) - voir
+# daily_scraper.yml pour le détail de ces étapes.
+#
+# CE PLAFOND EST SERRÉ avec ~13 groupes actifs et ces pauses longues (voir le
+# calcul détaillé dans daily_scraper.yml) : à surveiller impérativement sur
+# les premiers runs réels via le log "Budget de session atteint" dans
+# scraper.py. S'il apparaît régulièrement avant la fin de tous les groupes,
+# il faut réduire le nombre de groupes actifs, ou raccourcir
+# PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*, plutôt que remonter cette
+# valeur au-delà de ~300-320 (la marge de 360 min étant déjà comptée au plus
+# juste).
+SESSION_DUREE_MAX_MINUTES = 300
 
 # --------------------------------------------------------------------------- #
 # Throttle adaptatif (AIMD) : ajuste automatiquement délais et volume selon
