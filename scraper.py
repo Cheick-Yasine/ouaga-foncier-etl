@@ -701,6 +701,43 @@ def _parser_horodatage_relatif(
     return None
 
 
+def _sauvegarder_echantillons_graphql_debug(
+    echantillons: list[dict[str, Any]], groupe_id: str
+) -> Path | None:
+    """Sauvegarde quelques réponses GraphQL brutes (URL + corps tronqué) quand
+    un groupe a reçu des réponses matchant `GRAPHQL_URL_FRAGMENTS` pendant le
+    scroll mais que `extraire_stories_depuis_json` n'y a trouvé AUCUN post.
+
+    Sert à trancher entre les deux causes possibles sans avoir à deviner :
+    soit ce sont bien de vraies réponses "fil du groupe" mais dont la
+    structure interne a changé (le parseur ne les reconnaît plus), soit ce
+    sont des réponses GraphQL d'un autre type (notifications, chat,
+    suggestions...) qui matchent le même fragment d'URL par coïncidence sans
+    jamais avoir contenu de post. Fichier écrit dans data/logs/ (jamais
+    commité, inclus dans l'artefact du run CI - voir daily_scraper.yml).
+
+    Best-effort : une erreur d'écriture ne doit jamais faire échouer le run.
+    """
+    try:
+        horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        chemin = config.LOG_DIR / f"debug_scroll_vide_{groupe_id}_{horodatage}.json"
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        with chemin.open("w", encoding="utf-8") as f:
+            json.dump(echantillons, f, ensure_ascii=False, indent=2)
+        logger.warning(
+            "Groupe %s : scroll terminé sans AUCUN post trouvé alors que %d réponse(s) "
+            "GraphQL ont matché - %d échantillon(s) brut(s) sauvegardé(s) -> %s. "
+            "À inspecter : soit ce sont de vraies réponses \"fil du groupe\" dont la "
+            "structure JSON a changé, soit ce sont des réponses GraphQL d'un autre type "
+            "(notifications, chat...) qui matchent le même fragment d'URL par coïncidence.",
+            groupe_id, len(echantillons), len(echantillons), chemin,
+        )
+        return chemin
+    except Exception as exc:  # ne doit jamais interrompre le scraping
+        logger.debug("Échec sauvegarde des échantillons GraphQL de debug : %s", exc)
+        return None
+
+
 async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
     """Sauvegarde le HTML brut de la page courante quand aucun post "mis en
     avant" n'est trouvé dans le HTML initial d'un groupe.
@@ -1007,20 +1044,33 @@ async def scraper_groupe(
     nouveaux_posts: list[dict[str, Any]] = []
     posts_captures: list[dict[str, Any]] = []
     taches_en_cours: set[asyncio.Task] = set()
-
-# --- INSTRUMENTATION TEMPORAIRE DE DIAGNOSTIC (à retirer une fois la
-    # cause confirmée - voir conversation du 2026-08-13) ---
-    diag_reponses_totales = 0
-    diag_reponses_matchees = 0
-    diag_urls_matchees_echantillon: list[str] = []
+    nb_posts_trouves_via_scroll = 0  # exclut les posts "mis en avant" du HTML initial
+    compteur_reponses_vues = 0
+    compteur_reponses_matchees = 0
+    # Échantillons bruts (URL + corps tronqué) des réponses GraphQL matchées,
+    # gardés même si aucun post n'y est trouvé - sert de diagnostic best-effort
+    # (voir `_sauvegarder_echantillons_graphql_debug`) sans jamais peser sur la
+    # mémoire grâce au plafond `NB_ECHANTILLONS_DEBUG_GRAPHQL`.
+    echantillons_graphql_bruts: list[dict[str, Any]] = []
 
     async def _traiter_reponse_graphql(reponse: Any) -> None:
+        """Parse une réponse réseau GraphQL et accumule les posts trouvés dans
+        `posts_captures`. Best-effort : toute erreur est avalée pour ne
+        jamais interrompre le scraping sur une réponse mal formée.
+        """
         try:
             corps = await reponse.text()
         except Exception:
             return
+        # Ancien préfixe anti-JSON-hijacking parfois toujours présent.
         corps = corps.removeprefix("for (;;);")
-        posts_trouves_ici = 0
+        if len(echantillons_graphql_bruts) < config.NB_ECHANTILLONS_DEBUG_GRAPHQL:
+            echantillons_graphql_bruts.append(
+                {"url": reponse.url, "corps_tronque": corps[:5000]}
+            )
+        # Une réponse GraphQL Facebook peut contenir plusieurs objets JSON
+        # concaténés ligne par ligne ("multipart") - on tente le corps entier
+        # puis chaque ligne individuellement.
         for candidat in (corps, *corps.splitlines()):
             candidat = candidat.strip()
             if not candidat:
@@ -1029,30 +1079,22 @@ async def scraper_groupe(
                 payload = json.loads(candidat)
             except json.JSONDecodeError:
                 continue
-            nouveaux = extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
-            posts_captures.extend(nouveaux)
-            posts_trouves_ici += len(nouveaux)
-        if posts_trouves_ici == 0:
-            logger.debug(
-                "Groupe %s : réponse GraphQL matchée (%s) mais 0 post extrait "
-                "(corps %d octets) - JSON valide mais structure story non reconnue ?",
-                groupe.nom, reponse.url, len(corps),
+            posts_captures.extend(
+                extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
             )
 
     def _sur_reponse(reponse: Any) -> None:
-        nonlocal diag_reponses_totales, diag_reponses_matchees
-        diag_reponses_totales += 1
+        # Callback SYNCHRONE (API d'événements Playwright) : on ne fait que
+        # planifier le traitement async (reponse.text() est une coroutine).
+        nonlocal compteur_reponses_vues, compteur_reponses_matchees
+        compteur_reponses_vues += 1
         if any(fragment in reponse.url for fragment in config.GRAPHQL_URL_FRAGMENTS):
-            diag_reponses_matchees += 1
-            if len(diag_urls_matchees_echantillon) < 3:
-                diag_urls_matchees_echantillon.append(reponse.url)
+            compteur_reponses_matchees += 1
             tache = asyncio.ensure_future(_traiter_reponse_graphql(reponse))
             taches_en_cours.add(tache)
             tache.add_done_callback(taches_en_cours.discard)
 
     page.on("response", _sur_reponse)
-    # --- FIN INSTRUMENTATION ---
-  
     url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
 
     try:
@@ -1116,12 +1158,6 @@ async def scraper_groupe(
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
-            logger.info(
-                "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
-                "| posts capturés cumulés=%d",
-                groupe.nom, etapes_scroll, diag_reponses_totales,
-                diag_reponses_matchees, len(posts_captures),
-            )
             nouveaux_bruts = posts_captures[debut_capture:]
             vus_cette_etape: set[str] = set()
             posts_inedits: list[dict[str, Any]] = []
@@ -1135,8 +1171,16 @@ async def scraper_groupe(
                 for p in posts_inedits:
                     seen_ids[p["id"]] = p["scrape_le"]
                 nouveaux_posts.extend(posts_inedits)
+                nb_posts_trouves_via_scroll += len(posts_inedits)
             else:
                 etapes_sans_nouveau += 1
+
+            logger.info(
+                "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
+                "| posts capturés cumulés=%d",
+                groupe.nom, etapes_scroll, compteur_reponses_vues,
+                compteur_reponses_matchees, len(posts_captures),
+            )
 
             # Critère d'arrêt "hors fenêtre temporelle" : uniquement sur posts datés.
             posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
@@ -1170,6 +1214,9 @@ async def scraper_groupe(
                 config.MAX_PAGES_ABSOLU,
             )
 
+        if nb_posts_trouves_via_scroll == 0 and echantillons_graphql_bruts:
+            _sauvegarder_echantillons_graphql_debug(echantillons_graphql_bruts, groupe.id)
+
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
     finally:
@@ -1191,6 +1238,7 @@ async def executer_scraping(
     days_back: int,
     group_limit: int | None,
     groups_batch_size: int,
+    round_robin: bool = False,
 ) -> list[Path]:
     """Point d'entrée principal du module, appelé par main.py.
 
@@ -1202,8 +1250,20 @@ async def executer_scraping(
             paramétrables via `days_back`/`group_limit` côté CLI/CI plutôt que
             de tout tenter en un seul run, pour rester sous les limites mémoire
             du navigateur headless et réduire le risque de détection).
-        group_limit: nombre max de groupes traités sur ce run (None = tous).
+        group_limit: en mode normal, nombre max de groupes traités sur ce run
+            (None = tous). En mode `round_robin`, nombre de groupes traités à
+            CE run parmi la rotation (voir ci-dessous) - None équivaut à 1.
         groups_batch_size: taille des lots de groupes entre deux pauses longues.
+        round_robin: si True, ne traite qu'un sous-ensemble tournant des
+            groupes actifs à chaque run (au lieu de tous les groupes d'un
+            coup) - l'état de rotation persiste entre les runs via
+            `config.INDEX_PROCHAIN_GROUPE_PATH`. Pensé pour être appelé
+            fréquemment (ex : cron horaire) avec un `group_limit` petit (1-2),
+            afin que l'espacement entre deux passages sur un MÊME groupe soit
+            obtenu naturellement par l'espacement des runs eux-mêmes, plutôt
+            que de scroller tous les groupes à la suite dans une seule session
+            (ce qui semble accélérer un frein de Facebook en cours de run,
+            voir README.md).
 
     Returns:
         Liste des chemins des fichiers JSON bruts sauvegardés (un par groupe).
@@ -1231,7 +1291,25 @@ async def executer_scraping(
         raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
     cookies = charger_cookies(cookies_json)
 
-    groupes = config.charger_groupes(limite=group_limit)
+    if round_robin:
+        tous_les_groupes_actifs = config.charger_groupes(limite=None)
+        nb_a_traiter = group_limit or 1
+        total = len(tous_les_groupes_actifs)
+        index_depart = config.charger_index_prochain_groupe() % total
+        nb_a_traiter = min(nb_a_traiter, total)
+        groupes = [
+            tous_les_groupes_actifs[(index_depart + i) % total]
+            for i in range(nb_a_traiter)
+        ]
+        nouvel_index = (index_depart + nb_a_traiter) % total
+        config.sauvegarder_index_prochain_groupe(nouvel_index)
+        logger.info(
+            "Round-robin : %d/%d groupe(s) traité(s) ce run (index %d -> %d) : %s",
+            nb_a_traiter, total, index_depart, nouvel_index,
+            ", ".join(g.nom for g in groupes),
+        )
+    else:
+        groupes = config.charger_groupes(limite=group_limit)
 
     etat_sante = charger_sante()
     ajustements = calculer_ajustements(etat_sante)
