@@ -817,6 +817,36 @@ def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> Non
         json.dump(purge, f, ensure_ascii=False, indent=2)
 
 
+def charger_dernier_post_connu() -> dict[str, str]:
+    """Charge {groupe_id: post_id} du post le plus récent connu pour chaque
+    groupe, tel qu'établi à la fin du run précédent - voir
+    `config.DERNIER_POST_CONNU_PATH`. Sert de repère d'arrêt du scroll dans
+    `scraper_groupe` : dès qu'on le retrouve en scrollant depuis le haut, on
+    sait qu'on a rattrapé tout ce qui a été publié depuis la dernière visite.
+
+    Fichier absent/corrompu -> dict vide (pas de repère connu), traité comme
+    un premier run sur chaque groupe concerné - jamais bloquant.
+    """
+    if not config.DERNIER_POST_CONNU_PATH.exists():
+        return {}
+    try:
+        with config.DERNIER_POST_CONNU_PATH.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Fichier de repère illisible (%s) - repart sans repère de reprise "
+            "pour ce run (comportement équivalent à un premier passage).",
+            exc,
+        )
+        return {}
+
+
+def sauvegarder_dernier_post_connu(reperes: dict[str, str]) -> None:
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with config.DERNIER_POST_CONNU_PATH.open("w", encoding="utf-8") as f:
+        json.dump(reperes, f, ensure_ascii=False, indent=2)
+
+
 def verifier_cooldown() -> datetime | None:
     """Retourne la date de fin de cooldown si un cooldown est encore actif, sinon None.
 
@@ -1005,9 +1035,29 @@ async def scraper_groupe(
     max_days_back: int,
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
-) -> list[dict[str, Any]]:
+    post_repere: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
-    réseau GraphQL) et retourne les nouveaux posts non vus.
+    réseau GraphQL) et retourne (les nouveaux posts non vus, le nouveau
+    post-repère à retenir pour le prochain passage sur ce groupe).
+
+    MÉCANISME D'ARRÊT PRINCIPAL - "post-repère" : `post_repere` est l'id du
+    post le plus récent connu lors du run précédent sur CE groupe (voir
+    `charger_dernier_post_connu`). On scrolle depuis le haut du fil (le plus
+    récent) et on s'arrête dès qu'on retrouve ce post précis dans une réponse
+    brute capturée - à ce moment-là, on a la CERTITUDE d'avoir collecté tout
+    ce qui a été publié depuis la dernière visite, contrairement à l'ancienne
+    heuristique ("4 scrolls sans nouveau post") qui pouvait s'arrêter trop tôt
+    sur un groupe très actif où de vrais posts inédits existent encore plus
+    bas dans le fil. `MAX_PAGES_ABSOLU` (voir config.py) reste un filet de
+    sécurité pour les cas où ce repère est introuvable (post supprimé entre-
+    temps, ou tout premier run sur ce groupe).
+
+    Le nouveau repère retourné est le premier post inédit rencontré durant ce
+    run (le plus proche du "haut" du fil, donc le plus récent) - si aucun
+    post inédit n'a été trouvé ce run (groupe déjà entièrement à jour),
+    `None` est retourné et l'appelant doit conserver l'ancien repère plutôt
+    que de l'effacer (voir `executer_scraping`).
 
     INCERTITUDE ASSUMÉE (voir avertissement en tête de fichier) : cette
     fonction n'a pas pu être testée en conditions réelles (aucun accès réseau
@@ -1045,6 +1095,10 @@ async def scraper_groupe(
     posts_captures: list[dict[str, Any]] = []
     taches_en_cours: set[asyncio.Task] = set()
     nb_posts_trouves_via_scroll = 0  # exclut les posts "mis en avant" du HTML initial
+    # Défini tôt (avant le try) pour être toujours retournable, y compris si
+    # une exception interrompt le scraping avant la fin normale de la fonction.
+    nouveau_repere: str | None = None
+    repere_trouve = False
     compteur_reponses_vues = 0
     compteur_reponses_matchees = 0
     # Échantillons bruts (URL + corps tronqué) des réponses GraphQL matchées,
@@ -1135,6 +1189,10 @@ async def scraper_groupe(
         for p in posts_inedits_initiaux:
             seen_ids[p["id"]] = p["scrape_le"]
         nouveaux_posts.extend(posts_inedits_initiaux)
+        # Note : les posts "mis en avant" ne sont volontairement PAS utilisés
+        # comme candidat pour `nouveau_repere` (pas de garantie chronologique,
+        # voir le commentaire détaillé plus haut sur ce même sujet) ni comme
+        # repère de recherche `repere_trouve` - seul le fil scrollé fait foi.
 
         await asyncio.sleep(
             random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
@@ -1159,6 +1217,20 @@ async def scraper_groupe(
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
             nouveaux_bruts = posts_captures[debut_capture:]
+
+            # Détection du post-repère AVANT filtrage par seen_ids : le
+            # repère provient forcément d'un run précédent, donc il est déjà
+            # dans seen_ids et n'apparaîtrait jamais dans `posts_inedits` -
+            # il faut le chercher dans les posts bruts capturés à cette étape.
+            if post_repere and not repere_trouve:
+                if any(p["id"] == post_repere for p in nouveaux_bruts):
+                    repere_trouve = True
+                    logger.info(
+                        "Groupe %s : post-repère du run précédent retrouvé - "
+                        "rattrapage complet, arrêt du scroll pour ce groupe.",
+                        groupe.nom,
+                    )
+
             vus_cette_etape: set[str] = set()
             posts_inedits: list[dict[str, Any]] = []
             for p in nouveaux_bruts:
@@ -1172,6 +1244,11 @@ async def scraper_groupe(
                     seen_ids[p["id"]] = p["scrape_le"]
                 nouveaux_posts.extend(posts_inedits)
                 nb_posts_trouves_via_scroll += len(posts_inedits)
+                # Le premier post inédit rencontré est le plus proche du haut
+                # du fil sur ce run, donc le candidat le plus fiable comme
+                # "post le plus récent" - servira de repère au prochain passage.
+                if nouveau_repere is None:
+                    nouveau_repere = posts_inedits[0]["id"]
             else:
                 etapes_sans_nouveau += 1
 
@@ -1181,6 +1258,11 @@ async def scraper_groupe(
                 groupe.nom, etapes_scroll, compteur_reponses_vues,
                 compteur_reponses_matchees, len(posts_captures),
             )
+
+            # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
+            # retrouvé -> on a la certitude d'avoir tout rattrapé sur ce groupe.
+            if repere_trouve:
+                break
 
             # Critère d'arrêt "hors fenêtre temporelle" : uniquement sur posts datés.
             posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
@@ -1207,11 +1289,17 @@ async def scraper_groupe(
 
             etapes_scroll += 1
 
-        if etapes_scroll >= config.MAX_PAGES_ABSOLU:
+        if etapes_scroll >= config.MAX_PAGES_ABSOLU and not repere_trouve:
             logger.warning(
-                "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint (arrêt forcé).",
+                "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint SANS avoir "
+                "retrouvé le post-repère du run précédent (id=%s) - soit ce post "
+                "a été supprimé/déplacé entre-temps, soit le groupe est "
+                "anormalement actif. Le rattrapage est donc potentiellement "
+                "incomplet pour ce groupe sur ce run ; il continuera au run "
+                "suivant à partir du nouveau repère.",
                 groupe.nom,
                 config.MAX_PAGES_ABSOLU,
+                post_repere,
             )
 
         if nb_posts_trouves_via_scroll == 0 and echantillons_graphql_bruts:
@@ -1225,7 +1313,7 @@ async def scraper_groupe(
             await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
         await page.close()
 
-    return nouveaux_posts
+    return nouveaux_posts, nouveau_repere
 
 
 # --------------------------------------------------------------------------- #
@@ -1334,6 +1422,7 @@ async def executer_scraping(
     )
 
     seen_ids = charger_seen_ids()
+    reperes_dernier_post = charger_dernier_post_connu()
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
     budget_depasse = False
@@ -1372,13 +1461,20 @@ async def executer_scraping(
                         break
 
                     try:
-                        posts = await scraper_groupe(
+                        posts, nouveau_repere = await scraper_groupe(
                             contexte,
                             groupe,
                             days_back,
                             seen_ids,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
+                            post_repere=reperes_dernier_post.get(groupe.id),
                         )
+                        # Ne remplace le repère existant QUE si un nouveau post
+                        # inédit a réellement été trouvé ce run - sinon (groupe
+                        # déjà à jour, ou run interrompu tôt) on garde l'ancien
+                        # repère plutôt que de le perdre avec une valeur `None`.
+                        if nouveau_repere:
+                            reperes_dernier_post[groupe.id] = nouveau_repere
                     except SessionExpireeError as exc:
                         logger.critical(
                             "Session Facebook expirée sur le groupe %s. Arrêt du run - "
@@ -1423,12 +1519,19 @@ async def executer_scraping(
                     sauvegarder_seen_ids(
                         seen_ids
                     )  # sauvegarde après CHAQUE groupe (résilience coupure)
+                    sauvegarder_dernier_post_connu(
+                        reperes_dernier_post
+                    )  # idem : le repère de reprise ne doit jamais se perdre
 
-                    # Pause humaine entre deux groupes du même batch (pas seulement entre pages).
+                    # Pause entre deux groupes du même lot - 10-15 minutes
+                    # (voir config.PAUSE_ENTRE_GROUPES_MIN_S/MAX_S), distincte
+                    # du délai entre étapes de scroll (config.PAGE_DELAY_*,
+                    # en secondes, utilisé PENDANT le scroll d'un même groupe).
                     if i < len(lot) - 1:
                         await asyncio.sleep(
                             random.uniform(
-                                config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S
+                                config.PAUSE_ENTRE_GROUPES_MIN_S,
+                                config.PAUSE_ENTRE_GROUPES_MAX_S,
                             )
                             * ajustements.delai_multiplicateur
                         )
