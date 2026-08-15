@@ -2,10 +2,16 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # 19h05 UTC = 19h05 heure du Burkina Faso (GMT, pas de décalage).
-    # Décalé de 5 minutes hors de l'heure pile pour éviter la congestion des
-    # crons déclenchés massivement à HH:00 sur l'infrastructure GitHub.
-    - cron: "5 19 * * *"
+    # Round-robin horaire : un run court (1-2 groupes) toutes les heures,
+    # plutôt qu'un run unique qui scrolle tous les groupes à la suite (voir
+    # historique dans README.md - un scroll intensif prolongé sur un groupe
+    # semble accélérer un frein de Facebook pour les groupes suivants dans la
+    # même session). Décalé de 5 minutes hors de l'heure pile pour éviter la
+    # congestion des crons déclenchés massivement à HH:00 sur l'infra GitHub.
+    # Avec ~13 groupes actifs, un cycle complet (chaque groupe revisité une
+    # fois) prend environ 13h - à ajuster (voir groups_per_run ci-dessous ou
+    # la fréquence du cron) si le nombre de groupes change significativement.
+    - cron: "5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -17,8 +23,16 @@ on:
         description: "Nombre de jours à remonter (surtout pertinent en mode backfill)"
         type: string
         default: "7"
+      round_robin:
+        description: "Round-robin (1-2 groupes/run) plutôt que tous les groupes d'un coup"
+        type: boolean
+        default: true
+      groups_per_run:
+        description: "Nombre de groupes traités ce run (utilisé si round_robin=true)"
+        type: string
+        default: "1"
       group_limit:
-        description: "Nombre max de groupes traités sur ce run (0 = tous les groupes actifs)"
+        description: "Nombre max de groupes traités sur ce run (ignoré si round_robin=true ; 0 = tous)"
         type: string
         default: "0"
       batch_size:
@@ -122,12 +136,14 @@ jobs:
             etat-scraper-
 
       # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
-      # pour éviter que le trafic parte systématiquement à la même seconde
-      # chaque jour. Pas de jitter en déclenchement manuel (l'utilisateur
-      # attend un retour rapide).
+      # pour que deux groupes ne soient jamais espacés d'exactement 1h00min00s
+      # à chaque fois. Combiné au cron horaire ci-dessus, ça donne un espacement
+      # réel d'environ 30 à 70 minutes entre deux groupes traités - proche de la
+      # fourchette 30min-1h visée. Pas de jitter en déclenchement manuel
+      # (l'utilisateur attend un retour rapide).
       - name: "Délai aléatoire avant démarrage (cron uniquement)"
         if: github.event_name == 'schedule'
-        run: sleep $(( RANDOM % 1200 ))  # 0 à 20 minutes
+        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes
 
       - name: "Résolution des paramètres d'exécution"
         id: params
@@ -136,11 +152,15 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
             echo "days_back=1" >> "$GITHUB_OUTPUT"
+            echo "round_robin=true" >> "$GITHUB_OUTPUT"
+            echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
             echo "group_limit=0" >> "$GITHUB_OUTPUT"
             echo "batch_size=5" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
             echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
+            echo "round_robin=${{ github.event.inputs.round_robin }}" >> "$GITHUB_OUTPUT"
+            echo "groups_per_run=${{ github.event.inputs.groups_per_run }}" >> "$GITHUB_OUTPUT"
             echo "group_limit=${{ github.event.inputs.group_limit }}" >> "$GITHUB_OUTPUT"
             echo "batch_size=${{ github.event.inputs.batch_size }}" >> "$GITHUB_OUTPUT"
           fi
@@ -154,11 +174,16 @@ jobs:
           # les étapes de configuration du secret.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python main.py \
-            --mode "${{ steps.params.outputs.mode }}" \
-            --days-back "${{ steps.params.outputs.days_back }}" \
-            --group-limit "${{ steps.params.outputs.group_limit }}" \
+          ARGS=(
+            --mode "${{ steps.params.outputs.mode }}"
+            --days-back "${{ steps.params.outputs.days_back }}"
+            --group-limit "${{ steps.params.outputs.group_limit }}"
             --batch-size "${{ steps.params.outputs.batch_size }}"
+          )
+          if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
+            ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
+          fi
+          python main.py "${ARGS[@]}"
 
       # Installe un pg_dump compatible avec la version serveur de Neon. BUG
       # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
@@ -216,6 +241,7 @@ jobs:
             data/processed/rejetes_*.json
             data/logs/*.log
             data/logs/debug_page_vide_*.html
+            data/logs/debug_scroll_vide_*.json
           retention-days: 30
           if-no-files-found: warn
 
