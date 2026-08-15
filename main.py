@@ -64,6 +64,23 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Nombre de groupes scrollés avant une pause longue inter-batch.",
     )
     parseur.add_argument(
+        "--round-robin",
+        action="store_true",
+        help=(
+            "Traite un sous-ensemble tournant des groupes actifs à chaque run "
+            "(voir --groups-per-run) au lieu de tous les groupes d'un coup dans la "
+            "même session. Pensé pour un cron fréquent (ex : toutes les heures) : "
+            "l'espacement entre deux passages sur un même groupe vient alors de "
+            "l'espacement entre les runs, pas d'une pause interne au run."
+        ),
+    )
+    parseur.add_argument(
+        "--groups-per-run",
+        type=int,
+        default=1,
+        help="Nombre de groupes traités à ce run en mode --round-robin (défaut : 1).",
+    )
+    parseur.add_argument(
         "--skip-llm",
         action="store_true",
         help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API Claude. "
@@ -83,6 +100,8 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parseur.error("--batch-size doit être strictement positif.")
     if args.group_limit < 0:
         parseur.error("--group-limit doit être positif ou nul (0 = tous les groupes).")
+    if args.groups_per_run <= 0:
+        parseur.error("--groups-per-run doit être strictement positif.")
 
     return args
 
@@ -133,19 +152,23 @@ def _ecrire_resume_github_actions(resultat: processor.ResultatTraitement) -> Non
 
 async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitement:
     logger.info(
-        "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d skip_llm=%s ===",
+        "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d "
+        "round_robin=%s groups_per_run=%d skip_llm=%s ===",
         args.mode,
         args.days_back,
         args.group_limit or "tous",
         args.batch_size,
+        args.round_robin,
+        args.groups_per_run,
         args.skip_llm,
     )
 
     fichiers_bruts = await scraper.executer_scraping(
         mode=args.mode,
         days_back=args.days_back,
-        group_limit=args.group_limit or None,
+        group_limit=(args.groups_per_run if args.round_robin else (args.group_limit or None)),
         groups_batch_size=args.batch_size,
+        round_robin=args.round_robin,
     )
 
     if not fichiers_bruts:
