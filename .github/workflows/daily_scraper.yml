@@ -2,16 +2,26 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # Round-robin horaire : un run court (1-2 groupes) toutes les heures,
-    # plutôt qu'un run unique qui scrolle tous les groupes à la suite (voir
-    # historique dans README.md - un scroll intensif prolongé sur un groupe
-    # semble accélérer un frein de Facebook pour les groupes suivants dans la
-    # même session). Décalé de 5 minutes hors de l'heure pile pour éviter la
-    # congestion des crons déclenchés massivement à HH:00 sur l'infra GitHub.
-    # Avec ~13 groupes actifs, un cycle complet (chaque groupe revisité une
-    # fois) prend environ 13h - à ajuster (voir groups_per_run ci-dessous ou
-    # la fréquence du cron) si le nombre de groupes change significativement.
-    - cron: "5 * * * *"
+    # Deux horaires fixes par jour : 00h00 et 12h00 UTC (demande explicite de
+    # l'utilisateur). Un run traite TOUS les groupes actifs d'affilée, un par
+    # un, avec des pauses volontairement longues entre eux (10-15 min entre
+    # deux groupes, 20-30 min entre deux lots de 5 - voir
+    # config.PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*). Le rattrapage
+    # complet par groupe est garanti par le mécanisme de "post-repère" (voir
+    # DERNIER_POST_CONNU_PATH dans config.py), pas par l'espacement des runs -
+    # celui-ci ne sert qu'à limiter le rythme d'activité de la session vis-à-
+    # vis de Facebook.
+    #
+    # ATTENTION - risque de dépassement de la limite GitHub Actions (6h/360min
+    # par job, infranchissable même en augmentant timeout-minutes) : avec ces
+    # pauses longues, ~13 groupes actifs consomment déjà 140-210 minutes rien
+    # qu'en pauses, avant le temps de scroll réel et la structuration LLM. À
+    # surveiller sur les premiers runs réels (voir le log "Budget de session
+    # atteint" dans scraper.py) - si le run est régulièrement tronqué avant la
+    # fin de tous les groupes, il faudra soit réduire batch_size/le nombre de
+    # groupes actifs, soit raccourcir ces pauses.
+    - cron: "0 0 * * *"
+    - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -26,7 +36,7 @@ on:
       round_robin:
         description: "Round-robin (1-2 groupes/run) plutôt que tous les groupes d'un coup"
         type: boolean
-        default: true
+        default: false
       groups_per_run:
         description: "Nombre de groupes traités ce run (utilisé si round_robin=true)"
         type: string
@@ -100,7 +110,11 @@ jobs:
   scrape-and-process:
     needs: tests
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 360 = LE MAXIMUM ABSOLU pour un runner hébergé GitHub (limite dure, non
+    # contournable même avec une valeur plus élevée ici - un job est tué
+    # d'office à 6h). Voir SESSION_DUREE_MAX_MINUTES dans config.py (plafonné
+    # à 300 pour laisser 60 min de marge aux étapes hors scraping).
+    timeout-minutes: 360
     steps:
       - name: "Checkout du dépôt"
         uses: actions/checkout@v4
@@ -136,11 +150,9 @@ jobs:
             etat-scraper-
 
       # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
-      # pour que deux groupes ne soient jamais espacés d'exactement 1h00min00s
-      # à chaque fois. Combiné au cron horaire ci-dessus, ça donne un espacement
-      # réel d'environ 30 à 70 minutes entre deux groupes traités - proche de la
-      # fourchette 30min-1h visée. Pas de jitter en déclenchement manuel
-      # (l'utilisateur attend un retour rapide).
+      # pour que le run ne démarre jamais à un horaire parfaitement fixe et
+      # prévisible (ex: toujours 00:05:00 pile). Pas de jitter en déclenchement
+      # manuel (l'utilisateur attend un retour rapide).
       - name: "Délai aléatoire avant démarrage (cron uniquement)"
         if: github.event_name == 'schedule'
         run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes
@@ -152,7 +164,7 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
             echo "days_back=1" >> "$GITHUB_OUTPUT"
-            echo "round_robin=true" >> "$GITHUB_OUTPUT"
+            echo "round_robin=false" >> "$GITHUB_OUTPUT"
             echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
             echo "group_limit=0" >> "$GITHUB_OUTPUT"
             echo "batch_size=5" >> "$GITHUB_OUTPUT"
