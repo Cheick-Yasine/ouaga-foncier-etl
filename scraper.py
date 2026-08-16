@@ -237,9 +237,7 @@ def charger_cookies(cookies_json: str) -> list[dict[str, Any]]:
 def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
     """Récupère le localStorage sauvegardé d'un run précédent (voir
     `sauvegarder_storage_state`), pour que le navigateur ressemble à un appareil
-    qui revient plutôt qu'à un navigateur vierge à chaque exécution. Les
-    cookies, eux, viennent TOUJOURS de FB_COOKIES_JSON (source de vérité pour
-    l'authentification) - on ne réutilise ici que le localStorage/origins.
+    qui revient plutôt qu'à un navigateur vierge à chaque exécution.
     """
     if not config.STORAGE_STATE_PATH.exists():
         return []
@@ -252,6 +250,73 @@ def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
             exc,
         )
         return []
+
+
+def _charger_cookies_caches() -> list[dict[str, Any]] | None:
+    """Cookies sauvegardés à la fin du run précédent (voir
+    `sauvegarder_storage_state`), à réutiliser en PRIORITÉ sur les cookies
+    statiques du secret FB_COOKIES_JSON.
+
+    RAISON D'ÊTRE (correction du 2026-08-16) : jusqu'ici, le code rechargeait
+    TOUJOURS les cookies figés de FB_COOKIES_JSON à chaque run, même après un
+    run réussi qui avait potentiellement obtenu des cookies renouvelés par
+    Facebook en cours de session (comportement standard : un navigateur qui
+    reste connecté voit ses cookies de session tourner/se rafraîchir au fil de
+    la navigation). Ignorer ce renouvellement en réappliquant systématiquement
+    l'ancien secret revenait à reculer volontairement d'une session à chaque
+    run, ce qui RAPPROCHE l'expiration au lieu de l'éloigner - un vrai
+    navigateur ne redemande jamais les identifiants tant que la session en
+    cours est valide, on reproduit ce comportement ici.
+
+    Retourne None (pas une liste vide) si le cache est absent, illisible, ou
+    manifestement invalide (cookies d'authentification absents ou expirés) -
+    l'appelant doit alors se rabattre sur FB_COOKIES_JSON. Ce repli garantit
+    qu'une régénération manuelle du secret (après une vraie expiration) est
+    bien prise en compte au run suivant plutôt que masquée par un vieux cache.
+    """
+    if not config.STORAGE_STATE_PATH.exists():
+        return None
+    try:
+        with config.STORAGE_STATE_PATH.open(encoding="utf-8") as f:
+            cookies = json.load(f).get("cookies", [])
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.info(
+            "storage_state.json illisible (%s) - repli sur FB_COOKIES_JSON.", exc
+        )
+        return None
+
+    if not cookies:
+        return None
+
+    noms_presents = {c.get("name") for c in cookies}
+    if "c_user" not in noms_presents or "xs" not in noms_presents:
+        logger.info(
+            "Cookies sauvegardés incomplets (c_user/xs absents) - "
+            "repli sur FB_COOKIES_JSON."
+        )
+        return None
+
+    # Format Playwright natif pour storage_state() : "expires" en epoch
+    # secondes, ou -1 pour un cookie de session (pas de date fixe - à ne PAS
+    # traiter comme "expiré", contrairement à une date passée classique).
+    maintenant = datetime.now(timezone.utc).timestamp()
+    for c in cookies:
+        expiration = c.get("expires")
+        if expiration is not None and expiration != -1 and expiration < maintenant:
+            logger.info(
+                "Cookie '%s' du cache expiré (%.0f < maintenant) - "
+                "repli sur FB_COOKIES_JSON.",
+                c.get("name"),
+                expiration,
+            )
+            return None
+
+    logger.info(
+        "Réutilisation de %d cookie(s) sauvegardés du run précédent (session "
+        "potentiellement déjà renouvelée par Facebook depuis FB_COOKIES_JSON).",
+        len(cookies),
+    )
+    return cookies
 
 
 async def sauvegarder_storage_state(contexte: BrowserContext) -> None:
@@ -1377,7 +1442,16 @@ async def executer_scraping(
     cookies_json = os.environ.get(config.ENV_FB_COOKIES)
     if not cookies_json:
         raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
-    cookies = charger_cookies(cookies_json)
+    cookies_secret = charger_cookies(cookies_json)
+
+    # Priorité aux cookies "vivants" du run précédent (potentiellement déjà
+    # renouvelés par Facebook) sur le secret statique - voir
+    # `_charger_cookies_caches` pour la justification complète. Repli
+    # automatique et silencieux sur le secret si le cache est absent/invalide,
+    # ce qui couvre aussi bien le premier run que le run juste après une
+    # régénération manuelle de FB_COOKIES_JSON suite à une vraie expiration.
+    cookies_caches = _charger_cookies_caches()
+    cookies = cookies_caches if cookies_caches is not None else cookies_secret
 
     if round_robin:
         tous_les_groupes_actifs = config.charger_groupes(limite=None)
