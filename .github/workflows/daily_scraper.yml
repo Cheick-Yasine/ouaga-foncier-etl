@@ -207,9 +207,39 @@ jobs:
       # qu'une gestion manuelle de clé/sources.list.
       - name: "Installer pg_dump compatible avec la version PostgreSQL de Neon"
         if: always()
+        # continue-on-error : cette étape est une sauvegarde OPTIONNELLE, pas
+        # le cœur du pipeline (scraping + insertion en base déjà faits avant).
+        # Un échec ici (verrou apt, dépôt PGDG temporairement indisponible,
+        # etc.) ne doit jamais faire échouer tout le run dans l'interface
+        # GitHub - ce qui masquerait à tort un scraping par ailleurs réussi.
+        continue-on-error: true
         run: |
+          # Attente du déverrouillage d'apt avant toute tentative - un
+          # processus système en arrière-plan (souvent unattended-upgrades,
+          # lancé automatiquement au démarrage du runner) peut détenir le
+          # verrou /var/lib/apt/lists/lock pendant quelques dizaines de
+          # secondes. ÉCHEC RÉEL CONSTATÉ (2026-08-17) : "Could not get lock
+          # ... held by process ...", faisant échouer tout le run malgré un
+          # scraping/traitement par ailleurs réussi - ce correctif attend
+          # jusqu'à 2 minutes (24 x 5s) que le verrou se libère avant
+          # d'abandonner, au lieu d'échouer immédiatement au premier essai.
+          attendre_deverrouillage_apt() {
+            for _ in $(seq 1 24); do
+              if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+                echo "Verrou apt détenu par un autre processus, attente 5s..."
+                sleep 5
+              else
+                return 0
+              fi
+            done
+            echo "::warning::Verrou apt toujours détenu après 2 min d'attente - tentative quand même."
+          }
+
+          attendre_deverrouillage_apt
           sudo apt-get install -y postgresql-common
+          attendre_deverrouillage_apt
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          attendre_deverrouillage_apt
           sudo apt-get install -y postgresql-client-18
 
       # Sauvegarde ponctuelle de la base maître dans l'artefact du run, en plus
@@ -230,6 +260,9 @@ jobs:
       # chemin venait à changer.
       - name: "Sauvegarde SQL de la base maître (pg_dump)"
         if: always()
+        # Même logique que l'étape précédente : sauvegarde optionnelle, ne
+        # doit jamais faire échouer tout le run.
+        continue-on-error: true
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
@@ -238,7 +271,7 @@ jobs:
             echo "::warning::$PG_DUMP_BIN introuvable, repli sur 'pg_dump' générique (risque de mismatch de version serveur)"
             PG_DUMP_BIN="pg_dump"
           fi
-          "$PG_DUMP_BIN" --version
+          "$PG_DUMP_BIN" --version || true
           "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
 
       - name: "Upload de l'artefact (dump base maître, Excel, CSV du run, logs)"
