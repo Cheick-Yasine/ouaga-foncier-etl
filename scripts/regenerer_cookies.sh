@@ -11,7 +11,10 @@
 # recopier à la main à chaque fois.
 #
 # Usage :
-#   ./scripts/regenerer_cookies.sh export_cookie_editor.json
+#   bash scripts/regenerer_cookies.sh export_cookie_editor.json
+# (ou ./scripts/regenerer_cookies.sh si le bit exécutable est présent -
+# `chmod +x scripts/regenerer_cookies.sh` sinon, ce que git ne garantit pas
+# selon comment le fichier a été créé/récupéré)
 #
 # Le fichier passé en argument est l'export BRUT de l'extension (Cookie-
 # Editor ou équivalent) - voir scripts/maj_cookies.py pour le détail du
