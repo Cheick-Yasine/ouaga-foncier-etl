@@ -30,19 +30,34 @@ Un throttle adaptatif (délais, volume traité) et un circuit breaker (arrêt + 
 
 Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret `FB_COOKIES_JSON` soit régénéré à la main.
 
+### Alerte automatique
+
+Dès qu'une `SessionExpireeError` est détectée, le workflow GitHub Actions (`daily_scraper.yml`) ouvre automatiquement une issue GitHub étiquetée `session-expiree` (ou commente l'issue déjà ouverte, pour éviter le spam à chaque run tant que ce n'est pas corrigé), avec le groupe concerné et un lien vers le run. Pas besoin de surveiller les logs Actions pour s'en rendre compte : une notification GitHub (email/app selon tes réglages de notifications) arrive dès l'ouverture de l'issue.
+
+### Régénérer (raccourci recommandé)
+
+```bash
+bash scripts/regenerer_cookies.sh export_cookie_editor.json
+# ou ./scripts/regenerer_cookies.sh si le bit exécutable est présent
+```
+
+Ce raccourci détecte le dépôt depuis le remote git courant, appelle `scripts/maj_cookies.py` avec `--set-secret --clear-actions-cache` (les deux options qu'on oublie sinon), et referme automatiquement l'issue `session-expiree` ouverte par le workflow si `gh` est authentifié — tout le geste tient en une commande.
+
+### Régénérer (étape par étape / équivalent manuel)
+
 Pour régénérer : ouvrir `web.facebook.com` connecté sur le compte dédié au scraping, exporter les cookies avec une extension type [Cookie-Editor](https://cookie-editor.com/) (format JSON brut, sans les modifier), puis lancer :
 
 ```bash
-python scripts/maj_cookies.py export_cookie_editor.json --repo <owner>/<repo> --set-secret
+python scripts/maj_cookies.py export_cookie_editor.json --repo <owner>/<repo> --set-secret --clear-actions-cache
 ```
 
 Ce script (`scripts/maj_cookies.py`) :
 1. Valide l'export (mêmes règles que `scraper.charger_cookies` — présence de `c_user`/`xs`, tolérance au format brut d'extension `expirationDate`/`sameSite`).
 2. Met à jour le secret GitHub `FB_COOKIES_JSON` via `gh secret set` (ou affiche la commande/le JSON si `gh` n'est pas installé/authentifié — mise à jour manuelle alors possible depuis Settings → Secrets and variables → Actions).
-3. Purge le cooldown et le `storage_state` en cache localement (`data/state/`) — **étape nécessaire**, pas juste pratique : `scraper._charger_cookies_caches()` donne priorité au `storage_state` mis en cache sur `FB_COOKIES_JSON` à chaque run, et un cookie invalidé côté serveur Facebook n'a pas forcément de date d'expiration dépassée (le test de fraîcheur par date ne le détecte donc pas). Sans cette purge, le run suivant rechargeait silencieusement les cookies morts du cache au lieu des nouveaux, malgré la mise à jour du secret — le pipeline restait bloqué en boucle. (`scraper.invalider_storage_state` applique la même purge côté run : dès qu'une `SessionExpireeError` est détectée, le `storage_state` du run en cours n'est plus mis en cache du tout.)
+3. Purge le cooldown, le `storage_state` et le dernier incident signalé en cache localement (`data/state/`) — **étape nécessaire**, pas juste pratique : `scraper._charger_cookies_caches()` donne priorité au `storage_state` mis en cache sur `FB_COOKIES_JSON` à chaque run, et un cookie invalidé côté serveur Facebook n'a pas forcément de date d'expiration dépassée (le test de fraîcheur par date ne le détecte donc pas). Sans cette purge, le run suivant rechargeait silencieusement les cookies morts du cache au lieu des nouveaux, malgré la mise à jour du secret — le pipeline restait bloqué en boucle. (`scraper.invalider_storage_state` applique la même purge côté run : dès qu'une `SessionExpireeError` est détectée, le `storage_state` du run en cours n'est plus mis en cache du tout.)
 4. En option (`--clear-actions-cache`), supprime aussi le cache `actions/cache` `etat-scraper-*` côté CI (même contenu, côté GitHub Actions).
 
-Ajouter `--clear-actions-cache` si le run précédent a tourné en CI (sinon le prochain run restaurera le `storage_state` mort depuis le cache GitHub Actions, même après la purge locale). Sans `gh` installé, le script affiche le JSON compact à coller manuellement dans le secret, et il faut alors aussi vider le cache Actions à la main (onglet Actions → Caches).
+Ajouter `--clear-actions-cache` si le run précédent a tourné en CI (sinon le prochain run restaurera le `storage_state` mort depuis le cache GitHub Actions, même après la purge locale — `scripts/regenerer_cookies.sh` l'ajoute déjà par défaut). Sans `gh` installé, le script affiche le JSON compact à coller manuellement dans le secret, et il faut alors aussi vider le cache Actions et fermer l'issue `session-expiree` à la main.
 
 ## Structure du code
 
@@ -57,6 +72,7 @@ ouaga-foncier-etl/
 ├── .env.example      # FB_COOKIES_JSON, OPENAI_API_KEY, DATABASE_URL
 ├── .github/workflows/daily_scraper.yml  # job tests (bloquant) -> job scraping
 ├── scripts/maj_cookies.py  # recharge FB_COOKIES_JSON depuis un export Cookie-Editor (voir section ci-dessus)
+├── scripts/regenerer_cookies.sh  # raccourci one-shot autour de maj_cookies.py (--repo auto-détecté, referme l'issue d'alerte)
 └── tests/          # une suite par module, API OpenAI et navigateur entièrement mockés
 ```
 
