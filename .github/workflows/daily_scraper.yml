@@ -52,6 +52,9 @@ on:
 
 permissions:
   contents: read
+  # Écriture nécessaire à l'étape "Alerte : session Facebook expirée"
+  # ci-dessous (ouverture/commentaire/fermeture d'issue via `gh issue`).
+  issues: write
 
 # Un seul run actif à la fois : deux scrapes concurrents sur la même session
 # Facebook (mêmes cookies) multiplieraient le risque de détection anti-bot.
@@ -178,6 +181,7 @@ jobs:
           fi
 
       - name: "Exécution du pipeline ETL"
+        id: scraping
         env:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -195,7 +199,58 @@ jobs:
           if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
             ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
           fi
+          # Code de sortie capturé explicitement (voir main.py : 0=ok/cooldown,
+          # 2=session expirée, 3=blocage anti-bot, 1=erreur) - exploité par
+          # l'étape d'alerte ci-dessous ET par l'étape finale qui reflète
+          # l'échec dans le statut du job (voir plus bas). `set +e` évite que
+          # le `set -e` implicite du shell `run:` de GitHub Actions interrompe
+          # le script avant qu'on ait pu capturer $? proprement.
+          set +e
           python main.py "${ARGS[@]}"
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+            # Alerte automatique si la session Facebook a expiré (code de sortie 2,
+      # voir main.py) : ouvre une issue GitHub (ou commente l'issue déjà
+      # ouverte, pour éviter le spam à chaque run tant que ce n'est pas
+      # corrigé) précisant quel groupe a déclenché l'expiration - lu dans
+      # data/state/dernier_incident.json, écrit par
+      # `scraper.signaler_incident` au moment de la SessionExpireeError.
+      # `if: always()` : cette étape doit tourner même si l'étape précédente a
+      # fait échouer le job (comportement normal ici, pas un bug).
+      - name: "Alerte : session Facebook expirée"
+        if: always() && steps.scraping.outputs.exit_code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DETAIL="(aucun détail disponible dans data/state/dernier_incident.json)"
+          if [ -f data/state/dernier_incident.json ]; then
+            DETAIL="$(python3 -c 'import json; d = json.load(open("data/state/dernier_incident.json", encoding="utf-8")); print(d.get("details", "(détail manquant)"))')"
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          HORODATAGE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Le label doit exister avant `gh issue create --label` - création
+          # idempotente, silencieuse s'il existe déjà.
+          gh label create "session-expiree" --color "B60205" --description "Session Facebook expirée, cookies à régénérer" 2>/dev/null || true
+
+          EXISTANTE="$(gh issue list --state open --label "session-expiree" --json number --jq '.[0].number' || true)"
+
+          # `printf` (et non une chaîne bash multi-lignes littérale) pour que
+          # tout reste sur UNE ligne physique dans ce bloc YAML `|` - une
+          # ligne de contenu moins indentée que le bloc y mettrait fin
+          # prématurément et casserait le parsing du workflow.
+          if [ -n "$EXISTANTE" ]; then
+            COMMENTAIRE="$(printf "Nouvelle occurrence le %s (run %s).\n\n%s" "$HORODATAGE" "$RUN_URL" "$DETAIL")"
+            gh issue comment "$EXISTANTE" --body "$COMMENTAIRE"
+            echo "Issue #$EXISTANTE déjà ouverte, commentaire ajouté."
+          else
+            CORPS="$(printf "Le run %s du %s s'est arrêté car la session Facebook a expiré.\n\n%s\n\n**Pour régénérer :**\n1. Exporter les cookies avec Cookie-Editor sur le compte concerné.\n2. Lancer : \`bash scripts/regenerer_cookies.sh export_cookie_editor.json\` (ferme automatiquement cette issue si \`gh\` est authentifié).\n\nVoir la section \"Session expirée\" du README pour le détail." "$RUN_URL" "$HORODATAGE" "$DETAIL")"
+            gh issue create --title "Session Facebook expirée - cookies à régénérer" --label "session-expiree" --body "$CORPS"
+          fi
 
       # Installe un pg_dump compatible avec la version serveur de Neon. BUG
       # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
