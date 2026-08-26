@@ -589,6 +589,33 @@ class TestCooldown:
         assert scraper.verifier_cooldown() is None
 
 
+class TestInvaliderStorageState:
+    """`invalider_storage_state` purge le storage_state en cache quand on sait
+    que ses cookies sont morts (session expirée) - voir sa docstring pour le
+    bug réel que ça corrige : sans elle, `executer_scraping` réenregistrait
+    ces cookies morts en fin de run et ils masquaient tout renouvellement de
+    FB_COOKIES_JSON au run suivant (priorité du cache sur le secret dans
+    `_charger_cookies_caches`).
+    """
+
+    def test_supprime_le_fichier_existant(self, repertoires_isoles):
+        config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        config.STORAGE_STATE_PATH.write_text(
+            json.dumps({"cookies": [{"name": "xs", "value": "v"}], "origins": []}),
+            encoding="utf-8",
+        )
+        assert config.STORAGE_STATE_PATH.exists()
+
+        scraper.invalider_storage_state()
+
+        assert not config.STORAGE_STATE_PATH.exists()
+
+    def test_aucun_fichier_ne_leve_pas(self, repertoires_isoles):
+        assert not config.STORAGE_STATE_PATH.exists()
+        scraper.invalider_storage_state()  # ne doit pas lever
+        assert not config.STORAGE_STATE_PATH.exists()
+
+
 class TestThrottleAdaptatif:
     """Le throttle AIMD est composé de fonctions pures (état -> état), donc
     testable sans navigateur ni fichier - sauf charger_sante/sauvegarder_sante
