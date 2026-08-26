@@ -334,6 +334,27 @@ async def sauvegarder_storage_state(contexte: BrowserContext) -> None:
         logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
 
 
+def invalider_storage_state() -> None:
+    """Supprime le storage_state mis en cache (cookies + localStorage) - à
+    appeler quand on SAIT que les cookies qu'il contient sont morts (session
+    expirée détectée sur ce run).
+
+    BUG CORRIGÉ : sans ça, sauvegarder_storage_state réenregistrait les
+    cookies morts après une SessionExpireeError, et _charger_cookies_caches
+    donne PRIORITÉ à ce cache sur FB_COOKIES_JSON au run suivant - un cookie
+    invalidé côté serveur n'a pas forcément de date dépassée, donc le test de
+    fraîcheur ne le détecte pas. Résultat : régénérer FB_COOKIES_JSON à la
+    main (nouvel export Cookie-Editor) après une expiration ne servait à
+    rien, le run suivant rechargeait le cache mort en boucle. En supprimant
+    ce cache dès qu'une expiration est détectée, le run suivant retombe sur
+    FB_COOKIES_JSON, donc sur les cookies fraîchement fournis.
+    """
+    try:
+        config.STORAGE_STATE_PATH.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("Échec de suppression du storage_state invalide (non bloquant).")
+
+
 async def creer_navigateur(
     playwright, cookies: list[dict[str, Any]]
 ) -> tuple[Browser, BrowserContext]:
@@ -1624,7 +1645,13 @@ async def executer_scraping(
                     logger.info("Pause inter-batch de %.1fs", pause)
                     await asyncio.sleep(pause)
         finally:
-            await sauvegarder_storage_state(contexte)
+            if session_expiree:
+                # Cookies connus morts sur CE run - ne pas les mettre en cache
+                # (voir invalider_storage_state), sinon ils masqueraient tout
+                # renouvellement de FB_COOKIES_JSON au run suivant.
+                invalider_storage_state()
+            else:
+                await sauvegarder_storage_state(contexte)
             await contexte.close()
             await navigateur.close()
             nouvel_etat_sante = mettre_a_jour_apres_run(
