@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Recharge FB_COOKIES_JSON à partir d'un export "cookies gadget" (extension
+navigateur type Cookie-Editor), sans laisser le pipeline bloqué à attendre.
+
+Contexte : quand `SessionExpireeError` est levée pendant un run, le pipeline
+s'arrête, active un cooldown d'1h (config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE)
+et il faut régénérer le secret GitHub `FB_COOKIES_JSON` à la main. Ce script
+fait le lien entre "j'ai exporté de nouveaux cookies avec Cookie-Editor" et "le
+prochain run les utilise vraiment" :
+
+1. Valide/normalise le fichier exporté (mêmes règles que `scraper.charger_cookies`
+   : présence de c_user/xs, tolérance aux champs `expirationDate`/`sameSite`
+   propres au format des extensions de navigateur).
+2. Met à jour le secret GitHub `FB_COOKIES_JSON` (via `gh secret set`, si `gh`
+   est installé et authentifié - sinon affiche la commande à lancer soi-même).
+3. Purge l'état local qui bloquerait sinon le prochain run malgré les nouveaux
+   cookies : le cooldown anti-blocage ET le storage_state mis en cache (ce
+   dernier a PRIORITÉ sur FB_COOKIES_JSON au chargement - voir
+   `scraper._charger_cookies_caches` -, donc le laisser en place ferait
+   ignorer silencieusement les cookies fraîchement fournis ici. Voir aussi
+   `scraper.invalider_storage_state`, qui fait la même purge côté run).
+4. Optionnel (--clear-actions-cache) : supprime aussi le cache GitHub Actions
+   `etat-scraper-*`, qui contient la même chose côté CI, pour ne pas attendre
+   qu'il expire ou soit écrasé naturellement.
+
+Usage :
+    python scripts/maj_cookies.py export_cookie_editor.json
+    python scripts/maj_cookies.py export_cookie_editor.json --repo owner/repo --set-secret
+    python scripts/maj_cookies.py export_cookie_editor.json --repo owner/repo --set-secret --clear-actions-cache
+
+Le fichier `export_cookie_editor.json` est l'export BRUT de l'extension
+(liste de cookies avec `expirationDate`, `sameSite` en style `no_restriction`,
+etc.) - PAS besoin de le convertir à la main, `scraper.charger_cookies` s'en
+charge à l'exécution. C'est ce format brut (pas la version normalisée) qui est
+stocké dans le secret.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import config  # noqa: E402
+import scraper  # noqa: E402
+
+
+def valider_export(chemin: Path) -> str:
+    """Lit et valide le fichier d'export brut ; lève ValueError si invalide.
+
+    Retourne le JSON brut recompacté (PAS le JSON normalisé) : c'est ce format
+    - celui produit tel quel par l'extension - que `scraper.charger_cookies`
+    attend en entrée à l'exécution (voir sa docstring).
+    """
+    texte_brut = chemin.read_text(encoding="utf-8")
+    cookies_normalises = scraper.charger_cookies(texte_brut)  # lève ValueError si invalide
+
+    noms_presents = {c["name"] for c in cookies_normalises}
+    if not {"c_user", "xs"}.issubset(noms_presents):
+        print(
+            "AVERTISSEMENT : cookies 'c_user'/'xs' absents de l'export - "
+            "la session sera probablement considérée comme non authentifiée "
+            "malgré tout (voir README.md).",
+            file=sys.stderr,
+        )
+
+    return json.dumps(json.loads(texte_brut), separators=(",", ":"))
+
+
+def purger_etat_local() -> None:
+    """Supprime le cooldown actif et le storage_state en cache localement.
+
+    Sans ça, soit un cooldown encore actif, soit des cookies morts déjà en
+    cache, masqueraient les cookies frais qu'on vient de valider ci-dessus.
+    """
+    for chemin in (config.COOLDOWN_PATH, config.STORAGE_STATE_PATH):
+        if chemin.exists():
+            chemin.unlink()
+            print(f"État local purgé : {chemin}")
+
+
+def maj_secret_github(repo: str | None, cookies_json_compact: str, appliquer: bool) -> None:
+    if shutil.which("gh") is None:
+        print(
+            "`gh` (GitHub CLI) introuvable - mets à jour le secret manuellement :\n"
+            "  Repo -> Settings -> Secrets and variables -> Actions -> "
+            f"{config.ENV_FB_COOKIES}\n"
+            "avec le JSON ci-dessous (déjà validé) :\n"
+        )
+        print(cookies_json_compact)
+        return
+
+    commande = ["gh", "secret", "set", config.ENV_FB_COOKIES]
+    if repo:
+        commande += ["--repo", repo]
+
+    if not appliquer:
+        print(
+            "Commande prête (relancer avec --set-secret pour l'exécuter réellement) :\n  "
+            + " ".join(commande)
+        )
+        return
+
+    resultat = subprocess.run(commande, input=cookies_json_compact, text=True)
+    if resultat.returncode != 0:
+        print(
+            "Échec de `gh secret set` - mets à jour le secret manuellement.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"Secret {config.ENV_FB_COOKIES} mis à jour.")
+
+
+def purger_cache_actions(repo: str | None) -> None:
+    """Supprime les entrées `actions/cache` préfixées `etat-scraper-` (voir
+    .github/workflows/daily_scraper.yml) - best-effort, jamais bloquant.
+    """
+    if shutil.which("gh") is None:
+        print(
+            "`gh` introuvable - impossible de purger le cache GitHub Actions "
+            "automatiquement (préfixe 'etat-scraper-'). Depuis l'onglet Actions "
+            "du dépôt : Caches -> supprimer les entrées correspondantes.",
+            file=sys.stderr,
+        )
+        return
+
+    commande = ["gh", "cache", "list", "--json", "id,key"]
+    if repo:
+        commande += ["--repo", repo]
+    resultat = subprocess.run(commande, capture_output=True, text=True)
+    if resultat.returncode != 0:
+        print("Échec de `gh cache list` - purge du cache Actions ignorée.", file=sys.stderr)
+        return
+
+    try:
+        caches = json.loads(resultat.stdout or "[]")
+    except json.JSONDecodeError:
+        caches = []
+
+    for cache in caches:
+        cle = str(cache.get("key", ""))
+        if not cle.startswith("etat-scraper-"):
+            continue
+        commande_suppr = ["gh", "cache", "delete", str(cache["id"])]
+        if repo:
+            commande_suppr += ["--repo", repo]
+        subprocess.run(commande_suppr)
+        print(f"Cache Actions supprimé : {cle}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parseur = argparse.ArgumentParser(
+        description=(
+            "Recharge FB_COOKIES_JSON à partir d'un export d'extension de "
+            "cookies (Cookie-Editor ou équivalent), sans laisser le pipeline "
+            "bloqué à attendre."
+        ),
+    )
+    parseur.add_argument(
+        "export",
+        type=Path,
+        help="Fichier JSON exporté par l'extension (format brut, non modifié).",
+    )
+    parseur.add_argument(
+        "--repo",
+        help="owner/repo cible (défaut : dépôt courant détecté par `gh`).",
+    )
+    parseur.add_argument(
+        "--set-secret",
+        action="store_true",
+        help="Applique réellement `gh secret set` (sinon affiche juste la commande/le JSON).",
+    )
+    parseur.add_argument(
+        "--clear-actions-cache",
+        action="store_true",
+        help="Supprime aussi le cache GitHub Actions data/state (etat-scraper-*).",
+    )
+    parseur.add_argument(
+        "--no-purge-etat-local",
+        action="store_true",
+        help="Ne supprime pas le cooldown/storage_state locaux (data/state/).",
+    )
+    args = parseur.parse_args(argv)
+
+    if not args.export.exists():
+        parseur.error(f"Fichier introuvable : {args.export}")
+
+    try:
+        cookies_compacts = valider_export(args.export)
+    except (ValueError, json.JSONDecodeError) as exc:
+        parseur.error(f"Export invalide : {exc}")
+
+    maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret)
+
+    if not args.no_purge_etat_local:
+        purger_etat_local()
+
+    if args.clear_actions_cache:
+        purger_cache_actions(args.repo)
+
+    print(
+        "\nProchaine étape : relance le workflow manuellement depuis l'onglet "
+        "Actions (Run workflow) si tu veux vérifier tout de suite que ça "
+        "repasse, plutôt que d'attendre le prochain cron."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
