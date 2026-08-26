@@ -81,9 +81,22 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Nombre de groupes traités à ce run en mode --round-robin (défaut : 1).",
     )
     parseur.add_argument(
+        "--compte",
+        choices=sorted(config.COMPTES_VALIDES),
+        default=None,
+        help=(
+            "Identifiant du compte Facebook à utiliser (\"1\".. \"5\", voir "
+            "README.md section \"Multi-comptes\"). Restreint le run au secret "
+            "FB_COOKIES_JSON_<compte>, à un état persistant isolé, et aux "
+            "groupes de groups.csv assignés à ce compte (colonne `compte`). "
+            "Omis (défaut) : comportement historique mono-compte (secret "
+            "FB_COOKIES_JSON, tous les groupes actifs confondus)."
+        ),
+    )
+    parseur.add_argument(
         "--skip-llm",
         action="store_true",
-        help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API Claude. "
+        help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API OpenAI. "
         "Utile pour tester/débugger le scraper sans consommer de crédits API.",
     )
     args = parseur.parse_args(argv)
@@ -152,8 +165,9 @@ def _ecrire_resume_github_actions(resultat: processor.ResultatTraitement) -> Non
 
 async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitement:
     logger.info(
-        "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d "
+        "=== Démarrage pipeline | compte=%s mode=%s days_back=%d group_limit=%s batch_size=%d "
         "round_robin=%s groups_per_run=%d skip_llm=%s ===",
+        args.compte or "unique",
         args.mode,
         args.days_back,
         args.group_limit or "tous",
@@ -169,6 +183,7 @@ async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitem
         group_limit=(args.groups_per_run if args.round_robin else (args.group_limit or None)),
         groups_batch_size=args.batch_size,
         round_robin=args.round_robin,
+        compte=args.compte,
     )
 
     if not fichiers_bruts:

@@ -3,23 +3,23 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 on:
   schedule:
     # Deux horaires fixes par jour : 00h00 et 12h00 UTC (demande explicite de
-    # l'utilisateur). Un run traite TOUS les groupes actifs d'affilée, un par
-    # un, avec des pauses volontairement longues entre eux (10-15 min entre
-    # deux groupes, 20-30 min entre deux lots de 5 - voir
-    # config.PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*). Le rattrapage
-    # complet par groupe est garanti par le mécanisme de "post-repère" (voir
-    # DERNIER_POST_CONNU_PATH dans config.py), pas par l'espacement des runs -
-    # celui-ci ne sert qu'à limiter le rythme d'activité de la session vis-à-
-    # vis de Facebook.
+    # l'utilisateur). Chaque job matriciel traite TOUS les groupes actifs DE
+    # SON COMPTE d'affilée, un par un, avec des pauses volontairement longues
+    # entre eux (10-15 min entre deux groupes, 20-30 min entre deux lots de 5
+    # - voir config.PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*). Le
+    # rattrapage complet par groupe est garanti par le mécanisme de
+    # "post-repère" (voir DERNIER_POST_CONNU_PATH dans config.py), pas par
+    # l'espacement des runs - celui-ci ne sert qu'à limiter le rythme
+    # d'activité de chaque session vis-à-vis de Facebook.
     #
-    # ATTENTION - risque de dépassement de la limite GitHub Actions (6h/360min
-    # par job, infranchissable même en augmentant timeout-minutes) : avec ces
-    # pauses longues, ~13 groupes actifs consomment déjà 140-210 minutes rien
-    # qu'en pauses, avant le temps de scroll réel et la structuration LLM. À
-    # surveiller sur les premiers runs réels (voir le log "Budget de session
-    # atteint" dans scraper.py) - si le run est régulièrement tronqué avant la
-    # fin de tous les groupes, il faudra soit réduire batch_size/le nombre de
-    # groupes actifs, soit raccourcir ces pauses.
+    # Limite GitHub Actions (6h/360min par job, infranchissable même en
+    # augmentant timeout-minutes) : depuis le passage multi-comptes du
+    # 2026-08-26, un job ne traite plus ~21 groupes mais seulement les ~5 de
+    # son compte, soit 50-75 minutes de pauses inter-groupes, très en deçà de
+    # la limite (contre 140-210 min avec ~13 groupes sur un compte unique -
+    # d'où ce garde-fou à l'origine). À resurveiller (log "Budget de session
+    # atteint" dans scraper.py) si des groupes sont réassignés au point qu'un
+    # compte en concentre nettement plus que les autres.
     - cron: "0 0 * * *"
     - cron: "0 12 * * *"
   workflow_dispatch:
@@ -53,11 +53,14 @@ on:
 permissions:
   contents: read
 
-# Un seul run actif à la fois : deux scrapes concurrents sur la même session
-# Facebook (mêmes cookies) multiplieraient le risque de détection anti-bot.
-concurrency:
-  group: ouaga-foncier-etl
-  cancel-in-progress: false
+# PAS de `concurrency` global ici (contrairement à la version mono-compte) :
+# la sérialisation se fait maintenant PAR COMPTE, dans le job matriciel
+# ci-dessous (`group: ouaga-foncier-etl-compte-${{ matrix.compte }}`) - deux
+# comptes différents ont des cookies/sessions totalement indépendants et
+# n'ont donc AUCUNE raison de s'attendre l'un l'autre ; seuls deux runs sur
+# LE MÊME compte doivent rester exclusifs entre eux (même logique qu'avant :
+# deux scrapes concurrents sur la même session Facebook multiplieraient le
+# risque de détection anti-bot).
 
 jobs:
   # Job séparé et bloquant : si la suite de tests échoue (régression sur les
@@ -110,11 +113,33 @@ jobs:
   scrape-and-process:
     needs: tests
     runs-on: ubuntu-latest
+    # MULTI-COMPTES (2026-08-26, voir README.md section "Multi-comptes") : un
+    # job PAR COMPTE Facebook (1 à 5), chacun avec ses propres cookies (secret
+    # FB_COOKIES_JSON_<compte>), son propre état persistant (cache isolé par
+    # compte ci-dessous) et UNIQUEMENT les groupes de groups.csv qui lui sont
+    # assignés (colonne `compte`, ~4-5 groupes/compte au lieu de ~21 sur un
+    # seul compte auparavant). `fail-fast: false` : un compte bloqué/en
+    # cooldown ne doit JAMAIS annuler les 4 autres, qui n'ont rien à voir avec
+    # ce qui a déclenché le blocage sur celui-là.
+    strategy:
+      fail-fast: false
+      matrix:
+        compte: ["1", "2", "3", "4", "5"]
     # 360 = LE MAXIMUM ABSOLU pour un runner hébergé GitHub (limite dure, non
     # contournable même avec une valeur plus élevée ici - un job est tué
     # d'office à 6h). Voir SESSION_DUREE_MAX_MINUTES dans config.py (plafonné
-    # à 300 pour laisser 60 min de marge aux étapes hors scraping).
+    # à 300 pour laisser 60 min de marge aux étapes hors scraping) - large
+    # marge désormais avec seulement ~4-5 groupes par compte (contre ~21
+    # auparavant sur le compte unique).
     timeout-minutes: 360
+    # Sérialisation PAR COMPTE (voir note sur `concurrency` en tête de
+    # fichier) : deux runs concurrents sur LE MÊME compte partageraient la
+    # même session Facebook, ce qui multiplierait le risque de détection.
+    # Deux comptes différents (ex: 1 et 2) n'ont en revanche aucune raison de
+    # s'attendre : sessions, cookies et groupes cibles totalement distincts.
+    concurrency:
+      group: ouaga-foncier-etl-compte-${{ matrix.compte }}
+      cancel-in-progress: false
     steps:
       - name: "Checkout du dépôt"
         uses: actions/checkout@v4
@@ -141,13 +166,19 @@ jobs:
       # standard pour "toujours restaurer le plus récent, toujours sauvegarder
       # le nouveau" avec actions/cache (une clé exacte n'est jamais réécrite
       # une fois créée).
-      - name: "Restauration de l'état persistant (data/state)"
+      # Clé et préfixe de restauration incluant le compte (`compte_${{
+      # matrix.compte }}` correspond au sous-répertoire data/state/compte_N/
+      # créé par config.py) : sans ça, les 5 jobs matriciels restaureraient/
+      # écraseraient TOUS le même cache, mélangeant cookies, cooldown et score
+      # de confiance entre comptes qui n'ont rien à voir les uns avec les
+      # autres.
+      - name: "Restauration de l'état persistant (data/state/compte_<n>)"
         uses: actions/cache/restore@v4
         with:
-          path: data/state
-          key: etat-scraper-${{ github.run_id }}
+          path: data/state/compte_${{ matrix.compte }}
+          key: etat-scraper-compte-${{ matrix.compte }}-${{ github.run_id }}
           restore-keys: |
-            etat-scraper-
+            etat-scraper-compte-${{ matrix.compte }}-
 
       # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
       # pour que le run ne démarre jamais à un horaire parfaitement fixe et
@@ -179,14 +210,29 @@ jobs:
 
       - name: "Exécution du pipeline ETL"
         env:
-          FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
+          # Un secret par compte (FB_COOKIES_JSON_1 .. FB_COOKIES_JSON_5, à
+          # créer dans Settings -> Secrets and variables -> Actions - voir
+          # README.md section "Multi-comptes") - `--compte` ci-dessous
+          # sélectionne lequel main.py lit réellement pour CE job matriciel
+          # (config.nom_secret_cookies). Les 5 sont injectés systématiquement
+          # (variables d'env inertes pour les 4 non utilisées par ce job) car
+          # GitHub Actions n'autorise pas d'indexer `secrets` avec un nom
+          # construit dynamiquement à partir de `matrix.compte`.
+          FB_COOKIES_JSON_1: ${{ secrets.FB_COOKIES_JSON_1 }}
+          FB_COOKIES_JSON_2: ${{ secrets.FB_COOKIES_JSON_2 }}
+          FB_COOKIES_JSON_3: ${{ secrets.FB_COOKIES_JSON_3 }}
+          FB_COOKIES_JSON_4: ${{ secrets.FB_COOKIES_JSON_4 }}
+          FB_COOKIES_JSON_5: ${{ secrets.FB_COOKIES_JSON_5 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
           # README.md, section "Base de données", pour le dimensionnement et
-          # les étapes de configuration du secret.
+          # les étapes de configuration du secret. PARTAGÉE entre les 5
+          # comptes (upsert par id de post - source de vérité unique, quel
+          # que soit le compte qui a scrapé un post donné).
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           ARGS=(
+            --compte "${{ matrix.compte }}"
             --mode "${{ steps.params.outputs.mode }}"
             --days-back "${{ steps.params.outputs.days_back }}"
             --group-limit "${{ steps.params.outputs.group_limit }}"
@@ -278,7 +324,11 @@ jobs:
         if: always()  # même en cas d'échec partiel, on récupère les données déjà collectées
         uses: actions/upload-artifact@v4
         with:
-          name: "annonces-foncieres-${{ github.run_id }}"
+          # Nom incluant le compte : `github.run_id` est PARTAGÉ par les 5
+          # jobs de la matrice (c'est le même run de workflow) - sans le
+          # suffixe compte, les 5 uploads entreraient en collision sur un nom
+          # d'artefact identique et 4 des 5 échoueraient.
+          name: "annonces-foncieres-compte-${{ matrix.compte }}-${{ github.run_id }}"
           path: |
             data/processed/annonces_backup.sql
             data/processed/annonces.xlsx
@@ -294,5 +344,5 @@ jobs:
         if: always()  # même si le run a été coupé par un cooldown/blocage, l'état doit être conservé
         uses: actions/cache/save@v4
         with:
-          path: data/state
-          key: etat-scraper-${{ github.run_id }}
+          path: data/state/compte_${{ matrix.compte }}
+          key: etat-scraper-compte-${{ matrix.compte }}-${{ github.run_id }}

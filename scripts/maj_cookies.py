@@ -72,30 +72,38 @@ def valider_export(chemin: Path) -> str:
     return json.dumps(json.loads(texte_brut), separators=(",", ":"))
 
 
-def purger_etat_local() -> None:
-    """Supprime le cooldown actif et le storage_state en cache localement.
+def purger_etat_local(compte: str | None = None) -> None:
+    """Supprime le cooldown actif et le storage_state en cache localement,
+    pour le compte concerné (ou l'état historique mono-compte si `compte`
+    est None - voir config.cooldown_path/storage_state_path).
 
     Sans ça, soit un cooldown encore actif, soit des cookies morts déjà en
     cache, masqueraient les cookies frais qu'on vient de valider ci-dessus.
     """
-    for chemin in (config.COOLDOWN_PATH, config.STORAGE_STATE_PATH):
+    for chemin in (config.cooldown_path(compte), config.storage_state_path(compte)):
         if chemin.exists():
             chemin.unlink()
             print(f"État local purgé : {chemin}")
 
 
-def maj_secret_github(repo: str | None, cookies_json_compact: str, appliquer: bool) -> None:
+def maj_secret_github(
+    repo: str | None,
+    cookies_json_compact: str,
+    appliquer: bool,
+    compte: str | None = None,
+) -> None:
+    nom_secret = config.nom_secret_cookies(compte)
     if shutil.which("gh") is None:
         print(
             "`gh` (GitHub CLI) introuvable - mets à jour le secret manuellement :\n"
             "  Repo -> Settings -> Secrets and variables -> Actions -> "
-            f"{config.ENV_FB_COOKIES}\n"
+            f"{nom_secret}\n"
             "avec le JSON ci-dessous (déjà validé) :\n"
         )
         print(cookies_json_compact)
         return
 
-    commande = ["gh", "secret", "set", config.ENV_FB_COOKIES]
+    commande = ["gh", "secret", "set", nom_secret]
     if repo:
         commande += ["--repo", repo]
 
@@ -113,17 +121,19 @@ def maj_secret_github(repo: str | None, cookies_json_compact: str, appliquer: bo
             file=sys.stderr,
         )
         sys.exit(1)
-    print(f"Secret {config.ENV_FB_COOKIES} mis à jour.")
+    print(f"Secret {nom_secret} mis à jour.")
 
 
-def purger_cache_actions(repo: str | None) -> None:
-    """Supprime les entrées `actions/cache` préfixées `etat-scraper-` (voir
+def purger_cache_actions(repo: str | None, compte: str | None = None) -> None:
+    """Supprime les entrées `actions/cache` préfixées `etat-scraper-` (mono-
+    compte) ou `etat-scraper-compte-<compte>-` (voir
     .github/workflows/daily_scraper.yml) - best-effort, jamais bloquant.
     """
+    prefixe = f"etat-scraper-compte-{compte}-" if compte else "etat-scraper-"
     if shutil.which("gh") is None:
         print(
             "`gh` introuvable - impossible de purger le cache GitHub Actions "
-            "automatiquement (préfixe 'etat-scraper-'). Depuis l'onglet Actions "
+            f"automatiquement (préfixe '{prefixe}'). Depuis l'onglet Actions "
             "du dépôt : Caches -> supprimer les entrées correspondantes.",
             file=sys.stderr,
         )
@@ -144,7 +154,7 @@ def purger_cache_actions(repo: str | None) -> None:
 
     for cache in caches:
         cle = str(cache.get("key", ""))
-        if not cle.startswith("etat-scraper-"):
+        if not cle.startswith(prefixe):
             continue
         commande_suppr = ["gh", "cache", "delete", str(cache["id"])]
         if repo:
@@ -185,6 +195,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Ne supprime pas le cooldown/storage_state locaux (data/state/).",
     )
+    parseur.add_argument(
+        "--compte",
+        choices=sorted(config.COMPTES_VALIDES),
+        default=None,
+        help=(
+            "Compte Facebook concerné (\"1\"..\"5\", voir README.md section "
+            "\"Multi-comptes\") : cible le secret FB_COOKIES_JSON_<compte> et "
+            "purge uniquement l'état de CE compte (data/state/compte_<n>/, "
+            "cache Actions etat-scraper-compte-<n>-*). Omis (défaut) : secret "
+            "FB_COOKIES_JSON historique et état global (mono-compte)."
+        ),
+    )
     args = parseur.parse_args(argv)
 
     if not args.export.exists():
@@ -195,13 +217,13 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         parseur.error(f"Export invalide : {exc}")
 
-    maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret)
+    maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret, compte=args.compte)
 
     if not args.no_purge_etat_local:
-        purger_etat_local()
+        purger_etat_local(args.compte)
 
     if args.clear_actions_cache:
-        purger_cache_actions(args.repo)
+        purger_cache_actions(args.repo, args.compte)
 
     print(
         "\nProchaine étape : relance le workflow manuellement depuis l'onglet "

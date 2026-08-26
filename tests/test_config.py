@@ -146,3 +146,77 @@ class TestChargerGroupes:
         chemin.write_text("colonne_a,colonne_b\n1,2\n", encoding="utf-8")
         with pytest.raises(ValueError):
             config.charger_groupes(chemin=chemin)
+
+    def test_colonne_compte_absente_assigne_le_compte_1_par_defaut(
+        self, fichier_groupes_valide
+    ):
+        # Rétrocompatibilité : un groups.csv historique (sans colonne
+        # `compte`, comme la fixture) ne doit pas planter - tous les groupes
+        # sont considérés comme appartenant au compte "1".
+        groupes = config.charger_groupes(chemin=fichier_groupes_valide)
+        assert all(g.compte == "1" for g in groupes)
+
+    def test_filtre_par_compte(self, tmp_path):
+        chemin = tmp_path / "groups.csv"
+        chemin.write_text(
+            "id,nom,url,actif,compte\n"
+            '1111,"Groupe A","https://x/1111",true,1\n'
+            '2222,"Groupe B","https://x/2222",true,2\n'
+            '3333,"Groupe C","https://x/3333",true,1\n',
+            encoding="utf-8",
+        )
+        groupes_compte_1 = config.charger_groupes(chemin=chemin, compte="1")
+        assert [g.id for g in groupes_compte_1] == ["1111", "3333"]
+        groupes_compte_2 = config.charger_groupes(chemin=chemin, compte="2")
+        assert [g.id for g in groupes_compte_2] == ["2222"]
+
+    def test_compte_absent_de_groups_csv_leve_une_erreur(self, tmp_path):
+        chemin = tmp_path / "groups.csv"
+        chemin.write_text(
+            'id,nom,url,actif,compte\n1111,"Groupe A","https://x/1111",true,1\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            config.charger_groupes(chemin=chemin, compte="2")
+
+    def test_compte_invalide_leve_une_erreur(self, fichier_groupes_valide):
+        with pytest.raises(ValueError):
+            config.charger_groupes(chemin=fichier_groupes_valide, compte="9")
+
+    def test_valeur_de_compte_invalide_dans_le_csv_leve_une_erreur(self, tmp_path):
+        chemin = tmp_path / "groups.csv"
+        chemin.write_text(
+            'id,nom,url,actif,compte\n1111,"Groupe A","https://x/1111",true,9\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            config.charger_groupes(chemin=chemin)
+
+
+class TestEtatParCompte:
+    """Isolation de l'état persistant (cookies, cooldown, santé, rotation)
+    entre comptes Facebook - voir config.py, section "Multi-comptes"."""
+
+    def test_compte_none_retourne_les_chemins_historiques(self):
+        assert config.storage_state_path(None) == config.STORAGE_STATE_PATH
+        assert config.cooldown_path(None) == config.COOLDOWN_PATH
+        assert config.sante_path(None) == config.SANTE_PATH
+        assert config.dernier_post_connu_path(None) == config.DERNIER_POST_CONNU_PATH
+        assert (
+            config.index_prochain_groupe_path(None)
+            == config.INDEX_PROCHAIN_GROUPE_PATH
+        )
+
+    def test_chemins_distincts_par_compte(self):
+        chemin_1 = config.storage_state_path("1")
+        chemin_2 = config.storage_state_path("2")
+        assert chemin_1 != chemin_2
+        assert chemin_1 != config.STORAGE_STATE_PATH
+
+    def test_compte_invalide_leve_une_erreur(self):
+        with pytest.raises(ValueError):
+            config.storage_state_path("9")
+
+    def test_nom_secret_cookies(self):
+        assert config.nom_secret_cookies(None) == "FB_COOKIES_JSON"
+        assert config.nom_secret_cookies("3") == "FB_COOKIES_JSON_3"

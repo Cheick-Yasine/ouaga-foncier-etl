@@ -1,8 +1,8 @@
-"""Étape A (filtrage regex local, gratuit) + Étape B (structuration via API Claude).
+"""Étape A (filtrage regex local, gratuit) + Étape B (structuration via API OpenAI).
 
 Sépare volontairement les deux étapes en fonctions indépendantes et testables :
 `filtrer_candidats` ne fait aucun appel réseau (100% testable hors-ligne),
-`structurer_lot` est la seule partie qui appelle l'API Claude.
+`structurer_lot` est la seule partie qui appelle l'API OpenAI.
 """
 
 from __future__ import annotations

@@ -44,6 +44,73 @@ STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
 SANTE_PATH = STATE_DIR / "sante_scraper.json"
 INDEX_PROCHAIN_GROUPE_PATH = STATE_DIR / "prochain_groupe_index.json"
 
+# --------------------------------------------------------------------------- #
+# Multi-comptes : un état persistant ISOLÉ par compte Facebook (2026-08-26,
+# passage à 5 comptes se partageant les groupes de groups.csv, voir colonne
+# `compte` ci-dessous et le README, section "Multi-comptes").
+#
+# Chaque compte a SA PROPRE session (cookies/localStorage), SON PROPRE
+# cooldown, SON PROPRE historique de confiance (throttle adaptatif) : un
+# blocage ou une session expirée sur le compte 3 ne doit ni geler les 4
+# autres comptes (cooldown partagé), ni fausser leur score de confiance
+# (mettre_a_jour_apres_run partagé). Les constantes globales ci-dessus
+# (SEEN_IDS_PATH, STORAGE_STATE_PATH, etc.) restent inchangées et servent de
+# repli pour compte=None : c'est ce qui permet aux tests existants et à tout
+# appel historique sans paramètre `compte` de continuer à fonctionner à
+# l'identique (rétrocompatibilité - voir tests/test_scraper_helpers.py qui
+# écrit directement dans ces chemins).
+#
+# `seen_post_ids.json` (déduplication par id de post) reste en revanche
+# GLOBAL et partagé entre comptes, jamais isolé par compte : un même post
+# public est le même post, peu importe quel compte l'a vu, et le dédupliquer
+# par compte ferait retraiter inutilement (coût API OpenAI) un post déjà vu
+# par un autre compte si jamais deux comptes finissaient par voir le même
+# groupe (ex: réattribution manuelle future).
+COMPTES_VALIDES = {"1", "2", "3", "4", "5"}
+
+
+def _repertoire_compte(compte: str) -> Path:
+    """Sous-répertoire d'état dédié à un compte (créé si absent)."""
+    if compte not in COMPTES_VALIDES:
+        raise ValueError(
+            f"Compte '{compte}' inconnu (valeurs valides : {sorted(COMPTES_VALIDES)})."
+        )
+    repertoire = STATE_DIR / f"compte_{compte}"
+    repertoire.mkdir(parents=True, exist_ok=True)
+    return repertoire
+
+
+def dernier_post_connu_path(compte: str | None = None) -> Path:
+    return DERNIER_POST_CONNU_PATH if compte is None else _repertoire_compte(compte) / "dernier_post_connu.json"
+
+
+def cooldown_path(compte: str | None = None) -> Path:
+    return COOLDOWN_PATH if compte is None else _repertoire_compte(compte) / "cooldown_until.json"
+
+
+def storage_state_path(compte: str | None = None) -> Path:
+    return STORAGE_STATE_PATH if compte is None else _repertoire_compte(compte) / "storage_state.json"
+
+
+def sante_path(compte: str | None = None) -> Path:
+    return SANTE_PATH if compte is None else _repertoire_compte(compte) / "sante_scraper.json"
+
+
+def index_prochain_groupe_path(compte: str | None = None) -> Path:
+    return INDEX_PROCHAIN_GROUPE_PATH if compte is None else _repertoire_compte(compte) / "prochain_groupe_index.json"
+
+
+def nom_secret_cookies(compte: str | None = None) -> str:
+    """Nom de la variable d'environnement contenant les cookies FB à utiliser.
+
+    compte=None -> secret historique unique `FB_COOKIES_JSON` (rétrocompatibilité,
+    utilisé par défaut si le run ne précise pas de compte).
+    compte="1".."5" -> un secret dédié par compte : `FB_COOKIES_JSON_1` ...
+    `FB_COOKIES_JSON_5`, à créer dans Settings -> Secrets and variables ->
+    Actions pour chacun des 5 comptes (voir README.md, section "Multi-comptes").
+    """
+    return ENV_FB_COOKIES if compte is None else f"{ENV_FB_COOKIES}_{compte}"
+
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
 # SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir
 # processor.py). La base maître elle-même n'est plus un fichier local depuis
@@ -111,9 +178,19 @@ class Groupe:
     nom: str
     url: str
     actif: bool = True
+    # Compte Facebook assigné pour scraper CE groupe ("1".."5"). Colonne
+    # OPTIONNELLE dans groups.csv (voir charger_groupes) : absente ou vide ->
+    # "1" par défaut, pour rester compatible avec un groups.csv historique
+    # (mono-compte, avant le passage multi-comptes du 2026-08-26 - voir
+    # README.md, section "Multi-comptes").
+    compte: str = "1"
 
 
-def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -> list[Groupe]:
+def charger_groupes(
+    chemin: Path = GROUPS_CSV_PATH,
+    limite: int | None = None,
+    compte: str | None = None,
+) -> list[Groupe]:
     """Charge la liste des groupes depuis groups.csv (source unique de vérité).
 
     IMPORTANT : cette liste n'est PAS hardcodée dans le code. Le fichier
@@ -125,12 +202,25 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
     Args:
         chemin: chemin vers le fichier CSV des groupes.
         limite: si fourni, ne retourne que les N premiers groupes actifs
-            (utilisé par `--group-limit` en CLI pour les tests/rattrapages).
+            (après filtrage par `compte` le cas échéant) - utilisé par
+            `--group-limit` en CLI pour les tests/rattrapages.
+        compte: si fourni ("1".."5"), ne retourne que les groupes actifs
+            assignés à ce compte (colonne `compte` de groups.csv) - c'est ce
+            qui permet à un run donné de ne traiter QUE les groupes de son
+            compte Facebook, jamais ceux des 4 autres (voir README.md,
+            section "Multi-comptes"). None (défaut) = tous les comptes
+            confondus, comportement historique inchangé.
 
     Raises:
         FileNotFoundError: si groups.csv est absent.
-        ValueError: si le CSV est vide ou mal formé.
+        ValueError: si le CSV est vide ou mal formé, ou si `compte` n'est
+            pas une valeur reconnue (voir COMPTES_VALIDES).
     """
+    if compte is not None and compte not in COMPTES_VALIDES:
+        raise ValueError(
+            f"Compte '{compte}' inconnu (valeurs valides : {sorted(COMPTES_VALIDES)})."
+        )
+
     if not chemin.exists():
         raise FileNotFoundError(
             f"Fichier de groupes introuvable : {chemin}. "
@@ -146,23 +236,39 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
                 f"En-têtes CSV invalides dans {chemin} : attendu {colonnes_attendues}, "
                 f"trouvé {lecteur.fieldnames}"
             )
+        # "compte" reste une colonne OPTIONNELLE (rétrocompatibilité avec un
+        # groups.csv mono-compte antérieur) : absente du CSV -> "1" pour
+        # toutes les lignes.
+        colonne_compte_presente = "compte" in (lecteur.fieldnames or [])
         for ligne in lecteur:
             if ligne["id"].strip().upper().startswith("TODO"):
                 continue  # ligne placeholder non complétée : on l'ignore silencieusement
+            valeur_compte = (ligne.get("compte") or "").strip() if colonne_compte_presente else ""
+            valeur_compte = valeur_compte or "1"
+            if valeur_compte not in COMPTES_VALIDES:
+                raise ValueError(
+                    f"Compte '{valeur_compte}' invalide pour le groupe '{ligne['id'].strip()}' "
+                    f"dans {chemin} (valeurs valides : {sorted(COMPTES_VALIDES)})."
+                )
             groupes.append(
                 Groupe(
                     id=ligne["id"].strip(),
                     nom=ligne["nom"].strip(),
                     url=ligne["url"].strip(),
                     actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
+                    compte=valeur_compte,
                 )
             )
 
     groupes_actifs = [g for g in groupes if g.actif]
+    if compte is not None:
+        groupes_actifs = [g for g in groupes_actifs if g.compte == compte]
     if not groupes_actifs:
         raise ValueError(
-            f"Aucun groupe actif trouvé dans {chemin}. "
-            "Vérifiez que les lignes TODO ont bien été remplacées."
+            f"Aucun groupe actif trouvé dans {chemin}"
+            + (f" pour le compte '{compte}'" if compte is not None else "")
+            + ". Vérifiez que les lignes TODO ont bien été remplacées et que "
+            "la colonne 'compte' assigne bien des groupes à chaque compte."
         )
 
     if limite is not None and limite > 0:
@@ -180,24 +286,30 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
 # --------------------------------------------------------------------------- #
 
 
-def charger_index_prochain_groupe() -> int:
-    """Index (dans la liste des groupes actifs) du prochain groupe à traiter.
+def charger_index_prochain_groupe(compte: str | None = None) -> int:
+    """Index (dans la liste des groupes actifs DU COMPTE concerné) du prochain
+    groupe à traiter.
 
     Fichier absent/corrompu -> on repart de 0 (premier groupe) plutôt que de
-    bloquer le run pour un problème d'état non critique.
+    bloquer le run pour un problème d'état non critique. `compte` isole cet
+    index par compte Facebook (voir index_prochain_groupe_path) - sinon les 5
+    comptes partageraient la même rotation et tourneraient sur les groupes
+    des autres.
     """
-    if not INDEX_PROCHAIN_GROUPE_PATH.exists():
+    chemin = index_prochain_groupe_path(compte)
+    if not chemin.exists():
         return 0
     try:
-        with INDEX_PROCHAIN_GROUPE_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             return int(json.load(f).get("index", 0))
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return 0
 
 
-def sauvegarder_index_prochain_groupe(index: int) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with INDEX_PROCHAIN_GROUPE_PATH.open("w", encoding="utf-8") as f:
+def sauvegarder_index_prochain_groupe(index: int, compte: str | None = None) -> None:
+    chemin = index_prochain_groupe_path(compte)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
         json.dump({"index": index}, f)
 
 
@@ -568,7 +680,7 @@ LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate l
 LLM_MAX_RETRIES = 3
 LLM_BACKOFF_BASE_S = 2.0
 
-TYPES_BIEN_VALIDES = ["parcelle", "villa", "terrain", "autre"]
+TYPES_BIEN_VALIDES = ["parcelle", "maison", "villa", "ferme", "autre"]
 
 # Schéma JSON envoyé à l'API OpenAI via Structured Outputs (response_format
 # json_schema, strict=True) pour forcer une sortie JSON garantie conforme au

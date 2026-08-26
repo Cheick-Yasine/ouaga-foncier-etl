@@ -234,15 +234,18 @@ def charger_cookies(cookies_json: str) -> list[dict[str, Any]]:
     return cookies
 
 
-def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
+def _charger_origins_sauvegardees(compte: str | None = None) -> list[dict[str, Any]]:
     """Récupère le localStorage sauvegardé d'un run précédent (voir
     `sauvegarder_storage_state`), pour que le navigateur ressemble à un appareil
     qui revient plutôt qu'à un navigateur vierge à chaque exécution.
+
+    `compte` isole ce cache par compte Facebook - voir config.storage_state_path.
     """
-    if not config.STORAGE_STATE_PATH.exists():
+    chemin = config.storage_state_path(compte)
+    if not chemin.exists():
         return []
     try:
-        with config.STORAGE_STATE_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             return json.load(f).get("origins", [])
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning(
@@ -252,7 +255,7 @@ def _charger_origins_sauvegardees() -> list[dict[str, Any]]:
         return []
 
 
-def _charger_cookies_caches() -> list[dict[str, Any]] | None:
+def _charger_cookies_caches(compte: str | None = None) -> list[dict[str, Any]] | None:
     """Cookies sauvegardés à la fin du run précédent (voir
     `sauvegarder_storage_state`), à réutiliser en PRIORITÉ sur les cookies
     statiques du secret FB_COOKIES_JSON.
@@ -274,10 +277,11 @@ def _charger_cookies_caches() -> list[dict[str, Any]] | None:
     qu'une régénération manuelle du secret (après une vraie expiration) est
     bien prise en compte au run suivant plutôt que masquée par un vieux cache.
     """
-    if not config.STORAGE_STATE_PATH.exists():
+    chemin = config.storage_state_path(compte)
+    if not chemin.exists():
         return None
     try:
-        with config.STORAGE_STATE_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             cookies = json.load(f).get("cookies", [])
     except (OSError, json.JSONDecodeError) as exc:
         logger.info(
@@ -319,22 +323,26 @@ def _charger_cookies_caches() -> list[dict[str, Any]] | None:
     return cookies
 
 
-async def sauvegarder_storage_state(contexte: BrowserContext) -> None:
+async def sauvegarder_storage_state(
+    contexte: BrowserContext, compte: str | None = None
+) -> None:
     """Sauvegarde cookies + localStorage en fin de run pour la prochaine exécution.
 
     Note CI : ce fichier vit dans data/state/, qui n'est PAS versionné (voir
     .gitignore) - en GitHub Actions, sa persistance entre deux runs dépend d'un
     cache explicite (voir .github/workflows/daily_scraper.yml). Sans ce cache,
     chaque run repart d'un navigateur "neuf" et cette fonction ne sert à rien.
+    `compte` isole ce fichier par compte Facebook (voir config.storage_state_path).
     """
     try:
-        config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        await contexte.storage_state(path=str(config.STORAGE_STATE_PATH))
+        chemin = config.storage_state_path(compte)
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        await contexte.storage_state(path=str(chemin))
     except Exception:
         logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
 
 
-def invalider_storage_state() -> None:
+def invalider_storage_state(compte: str | None = None) -> None:
     """Supprime le storage_state mis en cache (cookies + localStorage) - à
     appeler quand on SAIT que les cookies qu'il contient sont morts (session
     expirée détectée sur ce run).
@@ -350,16 +358,20 @@ def invalider_storage_state() -> None:
     FB_COOKIES_JSON, donc sur les cookies fraîchement fournis.
     """
     try:
-        config.STORAGE_STATE_PATH.unlink(missing_ok=True)
+        config.storage_state_path(compte).unlink(missing_ok=True)
     except Exception:
         logger.exception("Échec de suppression du storage_state invalide (non bloquant).")
 
 
 async def creer_navigateur(
-    playwright, cookies: list[dict[str, Any]]
+    playwright, cookies: list[dict[str, Any]], compte: str | None = None
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
+
+    `compte` sélectionne le localStorage sauvegardé DU BON compte (voir
+    _charger_origins_sauvegardees) - sans ça, un run pour le compte 2
+    réutiliserait par erreur le fingerprint/localStorage du compte 1.
 
     Limite assumée : aucune de ces mesures ne compense une mauvaise réputation
     d'IP/ASN (voir README.md) - c'est un plafond bas, pas une garantie.
@@ -379,7 +391,7 @@ async def creer_navigateur(
     locale="fr-FR",
     timezone_id="Africa/Ouagadougou",
     user_agent=config.MBASIC_USER_AGENT,
-    storage_state={"cookies": [], "origins": _charger_origins_sauvegardees()},
+    storage_state={"cookies": [], "origins": _charger_origins_sauvegardees(compte)},
 )
     # Masque le flag standard qui trahit un navigateur piloté par automation.
     # Patch minimal et documenté publiquement (pas une suite de contournement) -
@@ -903,20 +915,25 @@ def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> Non
         json.dump(purge, f, ensure_ascii=False, indent=2)
 
 
-def charger_dernier_post_connu() -> dict[str, str]:
+def charger_dernier_post_connu(compte: str | None = None) -> dict[str, str]:
     """Charge {groupe_id: post_id} du post le plus récent connu pour chaque
     groupe, tel qu'établi à la fin du run précédent - voir
-    `config.DERNIER_POST_CONNU_PATH`. Sert de repère d'arrêt du scroll dans
+    `config.dernier_post_connu_path`. Sert de repère d'arrêt du scroll dans
     `scraper_groupe` : dès qu'on le retrouve en scrollant depuis le haut, on
     sait qu'on a rattrapé tout ce qui a été publié depuis la dernière visite.
+    `compte` isole ce repère par compte (chaque compte ne traite de toute
+    façon que ses propres groupes, voir config.charger_groupes(compte=...),
+    mais l'isolation évite tout mélange si un groupe changeait un jour
+    d'attribution entre deux comptes).
 
     Fichier absent/corrompu -> dict vide (pas de repère connu), traité comme
     un premier run sur chaque groupe concerné - jamais bloquant.
     """
-    if not config.DERNIER_POST_CONNU_PATH.exists():
+    chemin = config.dernier_post_connu_path(compte)
+    if not chemin.exists():
         return {}
     try:
-        with config.DERNIER_POST_CONNU_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning(
@@ -927,22 +944,29 @@ def charger_dernier_post_connu() -> dict[str, str]:
         return {}
 
 
-def sauvegarder_dernier_post_connu(reperes: dict[str, str]) -> None:
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with config.DERNIER_POST_CONNU_PATH.open("w", encoding="utf-8") as f:
+def sauvegarder_dernier_post_connu(
+    reperes: dict[str, str], compte: str | None = None
+) -> None:
+    chemin = config.dernier_post_connu_path(compte)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
         json.dump(reperes, f, ensure_ascii=False, indent=2)
 
 
-def verifier_cooldown() -> datetime | None:
+def verifier_cooldown(compte: str | None = None) -> datetime | None:
     """Retourne la date de fin de cooldown si un cooldown est encore actif, sinon None.
 
     Fichier corrompu/absent -> pas de cooldown (on ne bloque pas un run à cause
     d'un état illisible, mais on log un avertissement pour investigation).
+    `compte` isole ce cooldown par compte Facebook : un blocage détecté sur le
+    compte 3 ne doit JAMAIS geler les runs des comptes 1, 2, 4 et 5, qui
+    n'ont rien à voir avec ce qui a déclenché le blocage.
     """
-    if not config.COOLDOWN_PATH.exists():
+    chemin = config.cooldown_path(compte)
+    if not chemin.exists():
         return None
     try:
-        with config.COOLDOWN_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             contenu = json.load(f)
         fin = datetime.fromisoformat(contenu["jusqu_a"])
     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
@@ -954,11 +978,13 @@ def verifier_cooldown() -> datetime | None:
     return None
 
 
-def activer_cooldown(heures: float, raison: str) -> None:
-    """Enregistre un cooldown : aucun run ne devrait scraper avant `heures` heures."""
+def activer_cooldown(heures: float, raison: str, compte: str | None = None) -> None:
+    """Enregistre un cooldown : aucun run (sur CE compte) ne devrait scraper
+    avant `heures` heures."""
     fin = datetime.now(timezone.utc) + timedelta(hours=heures)
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with config.COOLDOWN_PATH.open("w", encoding="utf-8") as f:
+    chemin = config.cooldown_path(compte)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
         json.dump(
             {"jusqu_a": fin.isoformat(), "raison": raison},
             f,
@@ -986,19 +1012,23 @@ class AjustementsSession:
     )
 
 
-def charger_sante() -> dict[str, Any]:
+def charger_sante(compte: str | None = None) -> dict[str, Any]:
     """Charge l'état de santé persistant, ou un état initial "confiance maximale"
     si aucun historique n'existe encore (premier run, ou fichier corrompu).
+    `compte` isole ce score de confiance par compte Facebook : un compte qui
+    se fait repérer ne doit pas faire chuter la confiance (et donc ralentir/
+    réduire le volume) des 4 autres comptes, qui n'ont rien à voir avec ça.
     """
     etat_initial = {
         "niveau_confiance": config.NIVEAU_CONFIANCE_INITIAL,
         "runs_propres_consecutifs": 0,
         "cooldown_multiplicateur": 1,
     }
-    if not config.SANTE_PATH.exists():
+    chemin = config.sante_path(compte)
+    if not chemin.exists():
         return etat_initial
     try:
-        with config.SANTE_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             etat = json.load(f)
         etat_initial.update(etat)
         return etat_initial
@@ -1009,9 +1039,10 @@ def charger_sante() -> dict[str, Any]:
         return etat_initial
 
 
-def sauvegarder_sante(etat: dict[str, Any]) -> None:
-    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with config.SANTE_PATH.open("w", encoding="utf-8") as f:
+def sauvegarder_sante(etat: dict[str, Any], compte: str | None = None) -> None:
+    chemin = config.sante_path(compte)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
         json.dump(etat, f, ensure_ascii=False, indent=2)
 
 
@@ -1235,7 +1266,17 @@ async def scraper_groupe(
             tache.add_done_callback(taches_en_cours.discard)
 
     page.on("response", _sur_reponse)
-    url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
+    # Navigue vers `groupe.url` tel que renseigné dans groups.csv, plutôt que
+    # de reconstruire systématiquement une URL `/groups/<id>/` à partir de
+    # `groupe.id` (comportement d'origine, valable uniquement pour un vrai
+    # groupe). Ce changement généralise `scraper_groupe` aux Pages Facebook
+    # (URL du type `/NomDePage/`, sans id de groupe numérique) - voir
+    # README.md, section "Pages Facebook" : NON VALIDÉ en conditions réelles
+    # sur une vraie Page (structure JSON Comet potentiellement différente
+    # d'un groupe) - à surveiller sur le premier run réel, voir
+    # `_sauvegarder_html_debug`/`_sauvegarder_echantillons_graphql_debug` en
+    # cas de 0 post trouvé.
+    url_groupe = groupe.url
 
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
@@ -1245,7 +1286,7 @@ async def scraper_groupe(
         # Posts "mis en avant" présents dès le chargement initial.
         #
         # DÉCISION ASSUMÉE (confirmée en conditions réelles le 2026-08-01,
-        # voir README section "Risques et limites") : ces posts sont ajoutés
+        # voir README.md, section "Limites connues") : ces posts sont ajoutés
         # SANS filtre sur `max_days_back`, et leur date n'intervient JAMAIS
         # dans la décision de lancer ou non le scroll ci-dessous. Deux
         # raisons, pas un oubli :
@@ -1413,6 +1454,7 @@ async def executer_scraping(
     group_limit: int | None,
     groups_batch_size: int,
     round_robin: bool = False,
+    compte: str | None = None,
 ) -> list[Path]:
     """Point d'entrée principal du module, appelé par main.py.
 
@@ -1431,19 +1473,31 @@ async def executer_scraping(
         round_robin: si True, ne traite qu'un sous-ensemble tournant des
             groupes actifs à chaque run (au lieu de tous les groupes d'un
             coup) - l'état de rotation persiste entre les runs via
-            `config.INDEX_PROCHAIN_GROUPE_PATH`. Pensé pour être appelé
+            `config.index_prochain_groupe_path`. Pensé pour être appelé
             fréquemment (ex : cron horaire) avec un `group_limit` petit (1-2),
             afin que l'espacement entre deux passages sur un MÊME groupe soit
             obtenu naturellement par l'espacement des runs eux-mêmes, plutôt
             que de scroller tous les groupes à la suite dans une seule session
             (ce qui semble accélérer un frein de Facebook en cours de run,
             voir README.md).
+        compte: identifiant du compte Facebook à utiliser ("1".."5", voir
+            README.md section "Multi-comptes"). None (défaut) = comportement
+            historique mono-compte : secret `FB_COOKIES_JSON`, état global
+            (data/state/*.json), TOUS les groupes actifs de groups.csv quel
+            que soit leur colonne `compte`. Une valeur "1".."5" restreint le
+            run au secret `FB_COOKIES_JSON_<compte>`, à un état isolé
+            (data/state/compte_<compte>/) et UNIQUEMENT aux groupes assignés
+            à ce compte dans groups.csv - c'est ce qui permet de lancer les 5
+            comptes en parallèle (ou séquentiellement) sans qu'ils ne se
+            marchent dessus (mêmes cookies rechargés deux fois, cooldown ou
+            score de confiance partagé à tort, etc.).
 
     Returns:
         Liste des chemins des fichiers JSON bruts sauvegardés (un par groupe).
 
     Raises:
-        ValueError: FB_COOKIES_JSON absent/invalide, ou aucun groupe configuré.
+        ValueError: secret de cookies absent/invalide, ou aucun groupe configuré
+            pour ce compte.
         CooldownActifError: un cooldown anti-blocage est encore actif (voir
             `verifier_cooldown`) - le run s'arrête avant même d'ouvrir un navigateur.
         SessionExpireeError: propagée si détectée sur un groupe (signal fort
@@ -1454,15 +1508,16 @@ async def executer_scraping(
     """
     import os
 
-    cooldown_actif = verifier_cooldown()
+    cooldown_actif = verifier_cooldown(compte)
     if cooldown_actif:
         raise CooldownActifError(
             f"Cooldown anti-blocage actif jusqu'à {cooldown_actif.isoformat()} - run annulé."
         )
 
-    cookies_json = os.environ.get(config.ENV_FB_COOKIES)
+    nom_secret = config.nom_secret_cookies(compte)
+    cookies_json = os.environ.get(nom_secret)
     if not cookies_json:
-        raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
+        raise ValueError(f"Variable d'environnement {nom_secret} absente.")
     cookies_secret = charger_cookies(cookies_json)
 
     # Priorité aux cookies "vivants" du run précédent (potentiellement déjà
@@ -1470,31 +1525,31 @@ async def executer_scraping(
     # `_charger_cookies_caches` pour la justification complète. Repli
     # automatique et silencieux sur le secret si le cache est absent/invalide,
     # ce qui couvre aussi bien le premier run que le run juste après une
-    # régénération manuelle de FB_COOKIES_JSON suite à une vraie expiration.
-    cookies_caches = _charger_cookies_caches()
+    # régénération manuelle du secret suite à une vraie expiration.
+    cookies_caches = _charger_cookies_caches(compte)
     cookies = cookies_caches if cookies_caches is not None else cookies_secret
 
     if round_robin:
-        tous_les_groupes_actifs = config.charger_groupes(limite=None)
+        tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
         nb_a_traiter = group_limit or 1
         total = len(tous_les_groupes_actifs)
-        index_depart = config.charger_index_prochain_groupe() % total
+        index_depart = config.charger_index_prochain_groupe(compte) % total
         nb_a_traiter = min(nb_a_traiter, total)
         groupes = [
             tous_les_groupes_actifs[(index_depart + i) % total]
             for i in range(nb_a_traiter)
         ]
         nouvel_index = (index_depart + nb_a_traiter) % total
-        config.sauvegarder_index_prochain_groupe(nouvel_index)
+        config.sauvegarder_index_prochain_groupe(nouvel_index, compte)
         logger.info(
             "Round-robin : %d/%d groupe(s) traité(s) ce run (index %d -> %d) : %s",
             nb_a_traiter, total, index_depart, nouvel_index,
             ", ".join(g.nom for g in groupes),
         )
     else:
-        groupes = config.charger_groupes(limite=group_limit)
+        groupes = config.charger_groupes(limite=group_limit, compte=compte)
 
-    etat_sante = charger_sante()
+    etat_sante = charger_sante(compte)
     ajustements = calculer_ajustements(etat_sante)
     if ajustements.ratio_groupes < 1.0:
         nb_avant = len(groupes)
@@ -1509,7 +1564,8 @@ async def executer_scraping(
         )
 
     logger.info(
-        "Mode=%s | %d groupe(s) à traiter | days_back=%d | batch=%d",
+        "Compte=%s | Mode=%s | %d groupe(s) à traiter | days_back=%d | batch=%d",
+        compte or "unique",
         mode,
         len(groupes),
         days_back,
@@ -1517,7 +1573,7 @@ async def executer_scraping(
     )
 
     seen_ids = charger_seen_ids()
-    reperes_dernier_post = charger_dernier_post_connu()
+    reperes_dernier_post = charger_dernier_post_connu(compte)
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
     budget_depasse = False
@@ -1526,7 +1582,7 @@ async def executer_scraping(
     session_expiree = False
 
     async with async_playwright() as playwright:
-        navigateur, contexte = await creer_navigateur(playwright, cookies)
+        navigateur, contexte = await creer_navigateur(playwright, cookies, compte)
         try:
             await echauffement(contexte)
 
@@ -1580,6 +1636,7 @@ async def executer_scraping(
                         activer_cooldown(
                             config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE,
                             f"session expirée sur {groupe.nom}: {exc}",
+                            compte,
                         )
                         raise
                     except BlocageDetecteError as exc:
@@ -1597,6 +1654,7 @@ async def executer_scraping(
                             config.COOLDOWN_HEURES_APRES_BLOCAGE
                             * multiplicateur_cooldown,
                             f"blocage détecté sur {groupe.nom}: {exc}",
+                            compte,
                         )
                         raise
                     except Exception:
@@ -1615,7 +1673,7 @@ async def executer_scraping(
                         seen_ids
                     )  # sauvegarde après CHAQUE groupe (résilience coupure)
                     sauvegarder_dernier_post_connu(
-                        reperes_dernier_post
+                        reperes_dernier_post, compte
                     )  # idem : le repère de reprise ne doit jamais se perdre
 
                     # Pause entre deux groupes du même lot - 10-15 minutes
@@ -1648,10 +1706,10 @@ async def executer_scraping(
             if session_expiree:
                 # Cookies connus morts sur CE run - ne pas les mettre en cache
                 # (voir invalider_storage_state), sinon ils masqueraient tout
-                # renouvellement de FB_COOKIES_JSON au run suivant.
-                invalider_storage_state()
+                # renouvellement du secret de cookies au run suivant.
+                invalider_storage_state(compte)
             else:
-                await sauvegarder_storage_state(contexte)
+                await sauvegarder_storage_state(contexte, compte)
             await contexte.close()
             await navigateur.close()
             nouvel_etat_sante = mettre_a_jour_apres_run(
@@ -1661,7 +1719,7 @@ async def executer_scraping(
                 bloque=bloque,
                 session_expiree=session_expiree,
             )
-            sauvegarder_sante(nouvel_etat_sante)
+            sauvegarder_sante(nouvel_etat_sante, compte)
             if nouvel_etat_sante.get("niveau_confiance") != etat_sante.get(
                 "niveau_confiance"
             ):
