@@ -43,6 +43,12 @@ COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
 STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
 SANTE_PATH = STATE_DIR / "sante_scraper.json"
 INDEX_PROCHAIN_GROUPE_PATH = STATE_DIR / "prochain_groupe_index.json"
+# Dernier incident bloquant (session expirée, blocage anti-bot) signalé par
+# `scraper.signaler_incident` - lu par le workflow GitHub Actions pour
+# construire le corps de l'issue d'alerte automatique (voir daily_scraper.yml,
+# étape "Alerte : session Facebook expirée"). Purgé par
+# `scripts/maj_cookies.py` une fois les cookies régénérés.
+DERNIER_INCIDENT_PATH = STATE_DIR / "dernier_incident.json"
 
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
 # SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir

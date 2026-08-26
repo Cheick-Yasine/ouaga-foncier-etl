@@ -355,6 +355,33 @@ def invalider_storage_state() -> None:
         logger.exception("Échec de suppression du storage_state invalide (non bloquant).")
 
 
+def signaler_incident(type_incident: str, details: str) -> None:
+    """Écrit `config.DERNIER_INCIDENT_PATH` avec le dernier incident bloquant
+    (session expirée, blocage anti-bot) - lu par le workflow GitHub Actions
+    pour construire l'issue d'alerte automatique (voir daily_scraper.yml).
+
+    Best-effort et non bloquant, comme `sauvegarder_storage_state`/
+    `invalider_storage_state` : un échec d'écriture ici ne doit jamais faire
+    planter le run, l'alerte est une aide, pas une garantie.
+    """
+    try:
+        config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        config.DERNIER_INCIDENT_PATH.write_text(
+            json.dumps(
+                {
+                    "type": type_incident,
+                    "details": details,
+                    "horodatage": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("Échec d'écriture de l'incident signalé (non bloquant).")
+
+
 async def creer_navigateur(
     playwright, cookies: list[dict[str, Any]]
 ) -> tuple[Browser, BrowserContext]:
@@ -1577,6 +1604,10 @@ async def executer_scraping(
                             groupe.nom,
                         )
                         session_expiree = True
+                        signaler_incident(
+                            "session_expiree",
+                            f"Groupe concerné : {groupe.nom} (id={groupe.id}). Détail : {exc}",
+                        )
                         activer_cooldown(
                             config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE,
                             f"session expirée sur {groupe.nom}: {exc}",
