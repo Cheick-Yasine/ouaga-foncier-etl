@@ -427,8 +427,8 @@ MBASIC_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-PAGE_DELAY_MIN_S = 2.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
-PAGE_DELAY_MAX_S = 5.0
+PAGE_DELAY_MIN_S = 5.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
+PAGE_DELAY_MAX_S = 45.0  # élargi le 2026-08-26 (5-45s) à la demande explicite de l'utilisateur, pour réduire la fréquence de requêtes par groupe
 
 # Pause entre deux groupes consécutifs du même lot (batch) - AUGMENTÉE le
 # 2026-08-15 de 2-5s à 10-15 MINUTES à la demande explicite de l'utilisateur,
