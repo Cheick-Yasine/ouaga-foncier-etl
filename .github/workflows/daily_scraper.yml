@@ -351,3 +351,16 @@ jobs:
         with:
           path: data/state
           key: etat-scraper-${{ github.run_id }}
+
+      # Dernière étape du job, volontairement : reflète l'échec du scraping
+      # dans le statut du job APRÈS que toutes les étapes de sauvegarde/
+      # upload/alerte ci-dessus aient tourné (elles utilisent `if: always()`,
+      # donc elles s'exécutent même après un `exit` non-nul plus haut) - sans
+      # cette étape finale, capturer le code de sortie dans "Exécution du
+      # pipeline ETL" (au lieu de laisser `python main.py` faire échouer le
+      # step directement) aurait masqué l'échec dans l'interface GitHub.
+      - name: "Refléter l'échec du scraping dans le statut du job"
+        if: always() && steps.scraping.outputs.exit_code != '0' && steps.scraping.outputs.exit_code != ''
+        run: |
+          echo "::error::Le scraping a échoué avec le code ${{ steps.scraping.outputs.exit_code }} (voir l'étape 'Exécution du pipeline ETL')."
+          exit "${{ steps.scraping.outputs.exit_code }}"
