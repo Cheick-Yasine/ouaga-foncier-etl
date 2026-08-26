@@ -568,7 +568,7 @@ LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate l
 LLM_MAX_RETRIES = 3
 LLM_BACKOFF_BASE_S = 2.0
 
-TYPES_BIEN_VALIDES = ["parcelle", "maison", "villa", "ferme", "autre"]
+TYPES_BIEN_VALIDES = ["parcelle", "villa", "terrain", "autre"]
 
 # Schéma JSON envoyé à l'API OpenAI via Structured Outputs (response_format
 # json_schema, strict=True) pour forcer une sortie JSON garantie conforme au
