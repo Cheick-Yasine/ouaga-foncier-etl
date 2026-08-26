@@ -73,12 +73,21 @@ def valider_export(chemin: Path) -> str:
 
 
 def purger_etat_local() -> None:
-    """Supprime le cooldown actif et le storage_state en cache localement.
+    """Supprime le cooldown actif, le storage_state en cache et le dernier
+    incident signalé, localement.
 
     Sans ça, soit un cooldown encore actif, soit des cookies morts déjà en
     cache, masqueraient les cookies frais qu'on vient de valider ci-dessus.
+    `DERNIER_INCIDENT_PATH` est purgé pour la même raison que
+    `scripts/regenerer_cookies.sh` ferme l'issue GitHub d'alerte : une fois
+    les cookies régénérés, l'incident signalé ne doit plus traîner comme s'il
+    était toujours d'actualité.
     """
-    for chemin in (config.COOLDOWN_PATH, config.STORAGE_STATE_PATH):
+    for chemin in (
+        config.COOLDOWN_PATH,
+        config.STORAGE_STATE_PATH,
+        config.DERNIER_INCIDENT_PATH,
+    ):
         if chemin.exists():
             chemin.unlink()
             print(f"État local purgé : {chemin}")
