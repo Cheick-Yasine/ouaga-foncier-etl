@@ -364,10 +364,10 @@ def invalider_storage_state(compte: str | None = None) -> None:
 
 
 async def creer_navigateur(
-        playwright,
-      cookies: list[dict[str, Any]],
-      compte: str | None = None,
-      proxy: dict[str, str] | None = None,
+    playwright,
+    cookies: list[dict[str, Any]],
+    compte: str | None = None,
+    proxy: dict[str, str] | None = None,
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
@@ -381,7 +381,10 @@ async def creer_navigateur(
     comportement historique (pas de proxy).
 
     Limite assumée : aucune de ces mesures ne compense une mauvaise réputation
-    d'IP/ASN (voir README.md) - c'est un plafond bas, pas une garantie.
+    d'IP/ASN (voir README.md) - c'est un plafond bas, pas une garantie. Un
+    proxy résidentiel/mobile (voir `proxy` ci-dessus) réduit ce risque
+    précis, sans non plus le supprimer entièrement (le proxy lui-même a sa
+    propre réputation, pas forcément parfaite).
     """
     navigateur = await playwright.chromium.launch(
         headless=True,
@@ -1587,8 +1590,8 @@ async def executer_scraping(
             config.nom_secret_proxy(compte),
             proxy["server"],
         )
-      
-  seen_ids = charger_seen_ids()
+
+    seen_ids = charger_seen_ids()
     reperes_dernier_post = charger_dernier_post_connu(compte)
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
@@ -1598,7 +1601,7 @@ async def executer_scraping(
     session_expiree = False
 
     async with async_playwright() as playwright:
-            navigateur, contexte = await creer_navigateur(playwright, cookies, compte, proxy)
+        navigateur, contexte = await creer_navigateur(playwright, cookies, compte, proxy)
         try:
             await echauffement(contexte)
 
