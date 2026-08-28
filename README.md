@@ -61,6 +61,24 @@ Le facteur qui pèse le plus sur le risque de blocage n'est pas le code mais l'i
 
 Un cooldown actif fait sortir le run en code 0 (`CooldownActifError`) : c'est le mécanisme de sécurité qui fonctionne, pas un échec de workflow.
 
+## Proxy (réputation IP/ASN)
+
+Constat récurrent en CI : un run échoue avec `SessionExpireeError` dès la toute première requête (signature `USER_ID`/`actorID` à `0` dans les logs — voir `detecter_blocage_ou_session_expiree` dans `scraper.py`) **même juste après une régénération complète des cookies** (export frais + `scripts/maj_cookies.py --set-secret --clear-actions-cache`, donc ni cache local ni cache `actions/cache` en cause). Dans ce cas, le problème n'est pas le cookie mais l'IP d'où part la requête : un runner GitHub Actions utilise une IP de datacenter, jamais vue par le compte auparavant, que le système de risque de Facebook peut invalider instantanément côté serveur — indépendamment de la fraîcheur du cookie. C'est exactement la limite déjà annoncée dans la section "Stratégie anti-blocage" ci-dessus : aucune mesure de comportement ne compense une mauvaise réputation d'IP/ASN.
+
+Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'apporte rien de plus que l'IP du runner) fait sortir la session Facebook par une IP à réputation plus proche d'un usage humain normal :
+
+- Variable d'environnement `PROXY_URL` (repli global) ou `PROXY_URL_<n>` (dédiée à un compte, prioritaire — voir `config.nom_secret_proxy`), au format :
+  ```
+    http://utilisateur:motdepasse@hote:port
+    http://hote:port                          # proxy sans authentification
+    socks5://utilisateur:motdepasse@hote:port  # Playwright supporte aussi SOCKS5
+    ```
+  - **Entièrement optionnel** : absente ou vide, `config.proxy_playwright(compte)` retourne `None` et le run se comporte exactement comme avant (aucun proxy, sortie directe par l'IP du runner). Une valeur mal formée est aussi ignorée (avec un avertissement loggué), plutôt que de faire échouer le run.
+  - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
+  - En CI : créer les secrets `PROXY_URL_1`…`PROXY_URL_5` (Settings → Secrets and variables → Actions) — idéalement un proxy **distinct par compte**, pour que chacun des 5 comptes conserve une IP de sortie cohérente d'un run à l'autre (comme un vrai navigateur qui revient), plutôt que 5 comptes partageant une même IP proxy, qui reconstituerait le même signal de risque à une autre échelle. Le workflow (`daily_scraper.yml`) injecte déjà ces 5 secrets vers le job matriciel correspondant.
+
+  Limite assumée (même réserve que pour les autres mesures de "Stratégie anti-blocage") : un proxy réduit ce risque précis, il ne l'élimine pas — un proxy lui-même partagé/mal réputé peut rester détecté. Ce n'est pas non plus un contournement des CGU de Meta évoquées plus haut, seulement un changement d'infrastructure réseau.
+
 ## Session expirée : recharger les cookies sans bloquer le pipeline
 
 Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret de cookies du compte concerné soit régénéré à la main.
