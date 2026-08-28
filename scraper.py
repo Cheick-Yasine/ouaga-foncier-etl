@@ -364,7 +364,10 @@ def invalider_storage_state(compte: str | None = None) -> None:
 
 
 async def creer_navigateur(
-    playwright, cookies: list[dict[str, Any]], compte: str | None = None
+        playwright,
+      cookies: list[dict[str, Any]],
+      compte: str | None = None,
+      proxy: dict[str, str] | None = None,
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
@@ -373,12 +376,17 @@ async def creer_navigateur(
     _charger_origins_sauvegardees) - sans ça, un run pour le compte 2
     réutiliserait par erreur le fingerprint/localStorage du compte 1.
 
+    `proxy` (voir config.proxy_playwright) fait sortir TOUTE la session par ce
+    proxy plutôt que par l'IP du runner - None (par défaut) préserve le
+    comportement historique (pas de proxy).
+
     Limite assumée : aucune de ces mesures ne compense une mauvaise réputation
     d'IP/ASN (voir README.md) - c'est un plafond bas, pas une garantie.
     """
     navigateur = await playwright.chromium.launch(
         headless=True,
         args=["--disable-blink-features=AutomationControlled"],
+        proxy=proxy,
     )
     contexte = await navigateur.new_context(
     # Viewport desktop : cohérent avec le User-Agent Chrome/Windows utilisé
@@ -1572,7 +1580,15 @@ async def executer_scraping(
         groups_batch_size,
     )
 
-    seen_ids = charger_seen_ids()
+    proxy = config.proxy_playwright(compte)
+    if proxy is not None:
+        logger.info(
+            "Proxy configuré pour ce run (%s) : sortie via %s.",
+            config.nom_secret_proxy(compte),
+            proxy["server"],
+        )
+      
+  seen_ids = charger_seen_ids()
     reperes_dernier_post = charger_dernier_post_connu(compte)
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
@@ -1582,7 +1598,7 @@ async def executer_scraping(
     session_expiree = False
 
     async with async_playwright() as playwright:
-        navigateur, contexte = await creer_navigateur(playwright, cookies, compte)
+            navigateur, contexte = await creer_navigateur(playwright, cookies, compte, proxy)
         try:
             await echauffement(contexte)
 
