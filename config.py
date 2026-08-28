@@ -12,8 +12,11 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+
+_logger = logging.getLogger("ouaga_foncier_etl.config")
 
 # --------------------------------------------------------------------------- #
 # Arborescence
@@ -111,6 +114,72 @@ def nom_secret_cookies(compte: str | None = None) -> str:
     """
     return ENV_FB_COOKIES if compte is None else f"{ENV_FB_COOKIES}_{compte}"
 
+def nom_secret_proxy(compte: str | None = None) -> str:
+    """Nom de la variable d'environnement contenant l'URL du proxy à utiliser
+    pour ce compte (même convention que `nom_secret_cookies` ci-dessus).
+
+    compte=None -> secret partagé `PROXY_URL` (repli historique, utilisé si le
+    run ne précise pas de compte, ou si un seul proxy sert les 5 comptes).
+    compte="1".."5" -> un secret dédié par compte `PROXY_URL_1` ... `PROXY_URL_5`
+    (à créer dans Settings -> Secrets and variables -> Actions), pour que
+    chaque compte sorte par une IP distincte plutôt que de partager la même -
+    voir README.md, section "Proxy (réputation IP/ASN)".
+    """
+    return ENV_PROXY_URL if compte is None else f"{ENV_PROXY_URL}_{compte}"
+
+def proxy_playwright(compte: str | None = None) -> dict[str, str] | None:
+    """Lit et parse l'URL de proxy pour ce compte (voir `nom_secret_proxy`),
+    au format attendu par Playwright (`BrowserType.launch(proxy=...)`) :
+    `{"server": "schéma://hôte:port", "username"?: str, "password"?: str}`.
+
+    POURQUOI UN PROXY (voir README.md, section "Stratégie anti-blocage") : le
+    facteur qui pèse le plus sur le risque de blocage Facebook n'est pas le
+    comportement du scraper (délais, user-agent, etc.) mais la réputation de
+    l'IP/ASN d'où partent les requêtes. Une IP de datacenter GitHub Actions,
+    jamais associée au compte auparavant, peut faire invalider la session
+    immédiatement côté serveur Facebook (SessionExpireeError, signature
+    USER_ID/actorID à 0 - voir `detecter_blocage_ou_session_expiree` dans
+    scraper.py) même avec des cookies fraîchement régénérés. Un proxy
+    résidentiel/mobile donne une IP à réputation plus proche d'un usage
+    humain réel. Ce n'est PAS une garantie (même réserve assumée que pour les
+    autres mesures anti-blocage - voir `creer_navigateur`), seulement une
+    réduction de risque supplémentaire.
+
+    Format attendu de la variable d'environnement (ex. PROXY_URL_1) :
+        http://utilisateur:motdepasse@hote:port
+        http://hote:port                          (proxy sans authentification)
+        socks5://utilisateur:motdepasse@hote:port  (Playwright supporte aussi SOCKS5)
+
+    Retourne None si la variable est absente/vide (proxy OPTIONNEL : le
+    pipeline continue de fonctionner sans, comme avant l'introduction de cette
+    fonction) ou si elle est présente mais mal formée - un proxy mal
+    renseigné ne doit jamais empêcher tout un run, seulement rester sans
+    effet contre le blocage (dégradation silencieuse assumée, avec un
+    avertissement loggué pour rester diagnosticable).
+    """
+    valeur = os.environ.get(nom_secret_proxy(compte), "").strip()
+    if not valeur:
+        return None
+
+    analyse = urllib.parse.urlsplit(valeur)
+    if not analyse.scheme or not analyse.hostname:
+        _logger.warning(
+            "%s présente mais illisible comme URL de proxy "
+            "(format attendu : schéma://[utilisateur:motdepasse@]hôte:port) - "
+            "proxy ignoré, run sans proxy.",
+            nom_secret_proxy(compte),
+        )
+        return None
+
+    port = f":{analyse.port}" if analyse.port else ""
+    proxy: dict[str, str] = {"server": f"{analyse.scheme}://{analyse.hostname}{port}"}
+    if analyse.username:
+        proxy["username"] = urllib.parse.unquote(analyse.username)
+    if analyse.password:
+        proxy["password"] = urllib.parse.unquote(analyse.password)
+    return proxy
+
+
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
 # SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir
 # processor.py). La base maître elle-même n'est plus un fichier local depuis
@@ -124,6 +193,9 @@ MASTER_XLSX_PATH = PROCESSED_DIR / "annonces.xlsx"
 ENV_FB_COOKIES = "FB_COOKIES_JSON"
 ENV_OPENAI_KEY = "OPENAI_API_KEY"
 ENV_DATABASE_URL = "DATABASE_URL"
+# Proxy optionnel (voir `proxy_playwright` plus haut) - absent par défaut, le
+# pipeline fonctionne sans exactement comme avant l'ajout de cette variable.
+ENV_PROXY_URL = "PROXY_URL"
 
 # Base de données maître PostgreSQL (source de vérité, upsert par id de post).
 # Lue depuis l'environnement (secret GitHub Actions en CI, .env en local via
