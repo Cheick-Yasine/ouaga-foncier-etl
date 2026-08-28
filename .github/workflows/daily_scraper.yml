@@ -223,6 +223,19 @@ jobs:
           FB_COOKIES_JSON_3: ${{ secrets.FB_COOKIES_JSON_3 }}
           FB_COOKIES_JSON_4: ${{ secrets.FB_COOKIES_JSON_4 }}
           FB_COOKIES_JSON_5: ${{ secrets.FB_COOKIES_JSON_5 }}
+          # Proxy OPTIONNEL par compte (voir README.md, section "Proxy
+          # (réputation IP/ASN)" et config.proxy_playwright) : un secret
+          # absent/vide -> `config.proxy_playwright` retourne None -> le job
+          # tourne exactement comme avant, sans proxy, sur l'IP du runner.
+          # Même contrainte qu'au-dessus pour FB_COOKIES_JSON_<n> : les 5 sont
+          # injectés systématiquement (inertes pour les 4 comptes non
+          # concernés par ce job), GitHub Actions n'autorisant pas d'indexer
+          # `secrets` avec un nom construit dynamiquement.
+          PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
+          PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
+          PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
+          PROXY_URL_4: ${{ secrets.PROXY_URL_4 }}
+          PROXY_URL_5: ${{ secrets.PROXY_URL_5 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
           # README.md, section "Base de données", pour le dimensionnement et
