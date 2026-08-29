@@ -11,7 +11,6 @@ import csv
 import json
 import logging
 import os
-import random
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -132,7 +131,11 @@ def nom_secret_proxy(compte: str | None = None) -> str:
     """
     return ENV_PROXY_URL if compte is None else f"{ENV_PROXY_URL}_{compte}"
 
-def proxy_playwright(compte: str | None = None) -> dict[str, str] | None:
+def proxy_playwright(
+    compte: str | None = None,
+    *,
+    obligatoire: bool | None = None,
+) -> dict[str, str] | None:
     """Lit et parse l'URL de proxy pour ce compte (voir `nom_secret_proxy`),
     au format attendu par Playwright (`BrowserType.launch(proxy=...)`) :
     `{"server": "schéma://hôte:port", "username"?: str, "password"?: str}`.
@@ -155,34 +158,80 @@ def proxy_playwright(compte: str | None = None) -> dict[str, str] | None:
         http://hote:port                          (proxy sans authentification)
         socks5://utilisateur:motdepasse@hote:port  (Playwright supporte aussi SOCKS5)
 
-    Retourne None si la variable est absente/vide (proxy OPTIONNEL : le
-    pipeline continue de fonctionner sans, comme avant l'introduction de cette
-    fonction) ou si elle est présente mais mal formée - un proxy mal
-    renseigné ne doit jamais empêcher tout un run, seulement rester sans
-    effet contre le blocage (dégradation silencieuse assumée, avec un
-    avertissement loggué pour rester diagnosticable).
+    En mode multi-comptes, le proxy est obligatoire par défaut afin qu'un
+    secret absent ou mal formé ne fasse jamais basculer silencieusement le job
+    sur l'IP du runner GitHub. Le mode mono-compte historique reste optionnel.
     """
-    valeur = os.environ.get(nom_secret_proxy(compte), "").strip()
+    if obligatoire is None:
+        obligatoire = compte is not None
+
+    nom_variable = nom_secret_proxy(compte)
+    valeur = os.environ.get(nom_variable, "").strip()
     if not valeur:
+        if obligatoire:
+            raise ValueError(
+                f"{nom_variable} est absent ou vide : exécution refusée pour "
+                "éviter une sortie réseau accidentelle sans proxy."
+            )
         return None
 
-    analyse = urllib.parse.urlsplit(valeur)
-    if not analyse.scheme or not analyse.hostname:
-        _logger.warning(
-            "%s présente mais illisible comme URL de proxy "
-            "(format attendu : schéma://[utilisateur:motdepasse@]hôte:port) - "
-            "proxy ignoré, run sans proxy.",
-            nom_secret_proxy(compte),
+    try:
+        analyse = urllib.parse.urlsplit(valeur)
+        port = analyse.port
+    except ValueError as exc:
+        raise ValueError(f"{nom_variable} contient un port invalide.") from exc
+
+    schemas_acceptes = {"http", "https", "socks5"}
+    if analyse.scheme.lower() not in schemas_acceptes or not analyse.hostname:
+        message = (
+            f"{nom_variable} est invalide : format attendu "
+            "http(s)://[utilisateur:motdepasse@]hôte:port ou socks5://..."
         )
+        if obligatoire:
+            raise ValueError(message)
+        _logger.warning("%s Proxy ignoré.", message)
         return None
 
-    port = f":{analyse.port}" if analyse.port else ""
-    proxy: dict[str, str] = {"server": f"{analyse.scheme}://{analyse.hostname}{port}"}
+    suffixe_port = f":{port}" if port else ""
+    proxy: dict[str, str] = {
+        "server": f"{analyse.scheme.lower()}://{analyse.hostname}{suffixe_port}"
+    }
     if analyse.username:
         proxy["username"] = urllib.parse.unquote(analyse.username)
     if analyse.password:
         proxy["password"] = urllib.parse.unquote(analyse.password)
     return proxy
+
+
+@dataclass(frozen=True)
+class ParametresRegionaux:
+    pays: str
+    locale: str
+    fuseau_horaire: str
+
+
+def _variable_par_compte(nom: str, compte: str | None, defaut: str) -> str:
+    if compte is not None:
+        valeur_compte = os.environ.get(f"{nom}_{compte}", "").strip()
+        if valeur_compte:
+            return valeur_compte
+    return os.environ.get(nom, "").strip() or defaut
+
+
+def parametres_regionaux(compte: str | None = None) -> ParametresRegionaux:
+    """Configuration déclarée du proxy et du navigateur pour un compte."""
+    if compte is not None and compte not in COMPTES_VALIDES:
+        raise ValueError(f"Compte '{compte}' inconnu.")
+    pays = _variable_par_compte("PROXY_COUNTRY", compte, "BF").upper()
+    if not re.fullmatch(r"[A-Z]{2}", pays):
+        raise ValueError("PROXY_COUNTRY doit être un code ISO de deux lettres (ex. BF).")
+    return ParametresRegionaux(
+        pays=pays,
+        locale=_variable_par_compte("BROWSER_LOCALE", compte, "fr-FR"),
+        fuseau_horaire=_variable_par_compte(
+            "BROWSER_TIMEZONE", compte, "Africa/Ouagadougou"
+        ),
+    )
 
 
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
@@ -583,52 +632,74 @@ MOBILE_FACEBOOK_BASE_URL = "https://m.facebook.com"
 # Conservé pour référence/historique uniquement.
 MBASIC_BASE_URL = "https://mbasic.facebook.com"
 
-# Rotation de User-Agents mobiles (Android Chrome) - un par session, choisi
-# aléatoirement. Cohérent avec viewport mobile + is_mobile=True.
-MOBILE_USER_AGENTS = [
-    (
-        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.6613.99 Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/127.0.6533.103 Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android 13; SM-A536B) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.6478.186 Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android 14; SM-G991B) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.6613.88 Mobile Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) CriOS/128.0.6613.92 Mobile/15E148 Safari/604.1"
-    ),
+# Playwright 1.47 embarque Chromium 129. Les cinq profils restent donc Android
+# Chrome 129 et sont associés à un viewport précis. Un compte conserve le même
+# profil entre ses groupes et ses runs ; aucune combinaison indépendante ne
+# peut produire un appareil incohérent.
+MOBILE_PROFILES = [
+    {
+        "nom": "Galaxy S23",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+        ),
+        "viewport": {"width": 360, "height": 780},
+    },
+    {
+        "nom": "Pixel 8",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+        ),
+        "viewport": {"width": 412, "height": 915},
+    },
+    {
+        "nom": "Galaxy A53",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 13; SM-A536B) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+        ),
+        "viewport": {"width": 360, "height": 800},
+    },
+    {
+        "nom": "Redmi Note 11",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+        ),
+        "viewport": {"width": 393, "height": 873},
+    },
+    {
+        "nom": "Galaxy S21",
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 14; SM-G991B) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+        ),
+        "viewport": {"width": 384, "height": 854},
+    },
 ]
 
-# Viewports mobiles courants (largeur x hauteur), rotation aléatoire par session.
-MOBILE_VIEWPORTS = [
-    {"width": 390, "height": 844},   # iPhone 12/13/14
-    {"width": 360, "height": 800},   # Android moyen
-    {"width": 412, "height": 915},   # Pixel 7/8
-    {"width": 384, "height": 854},   # Galaxy S21/S22
-    {"width": 360, "height": 780},   # Android compact
-    {"width": 393, "height": 873},   # Pixel 6a
-]
-
-# Ancien UA desktop (conservé pour tests/rétrocompat si besoin).
-MBASIC_USER_AGENT = MOBILE_USER_AGENTS[0]
+MOBILE_USER_AGENTS = [profil["user_agent"] for profil in MOBILE_PROFILES]
+MOBILE_VIEWPORTS = [profil["viewport"] for profil in MOBILE_PROFILES]
+MBASIC_USER_AGENT = MOBILE_PROFILES[0]["user_agent"]
 
 
-def choisir_fingerprint_mobile() -> tuple[str, dict[str, int]]:
-    """Retourne (user_agent, viewport) aléatoires cohérents pour une session."""
-    return random.choice(MOBILE_USER_AGENTS), random.choice(MOBILE_VIEWPORTS)
+def choisir_fingerprint_mobile(
+    compte: str | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Retourne le profil Android stable associé au compte."""
+    if compte is None:
+        index = 0
+    else:
+        if compte not in COMPTES_VALIDES:
+            raise ValueError(f"Compte '{compte}' inconnu.")
+        index = int(compte) - 1
+    profil = MOBILE_PROFILES[index]
+    return str(profil["user_agent"]), dict(profil["viewport"])
+
+
+PROXY_GEO_CHECK_URL = "https://ipapi.co/json/"
+PROXY_GEO_CHECK_TIMEOUT_MS = 20_000
 
 
 # Délais entre étapes de scroll (secondes) - plus variables / humains.

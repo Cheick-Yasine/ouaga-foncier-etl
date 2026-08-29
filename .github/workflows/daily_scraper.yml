@@ -1,11 +1,12 @@
 name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
+  pull_request:
+    branches: [main]
   schedule:
-    # Deux créneaux/jour. Minutes NON nulles (jitter permanent dans l'expression
-    # cron elle-même). Changer manuellement la minute tous les mois pour
-    # éviter un motif trop régulier (ex. 17 -> 41, 41 -> 8, etc.).
-    # Jitter supplémentaire 0-30 min dans le step "Délai aléatoire" ci-dessous.
+    # Les expressions cron restent nécessairement statiques. Les minutes 17 et
+    # 41 peuvent être modifiées manuellement ; le véritable décalage aléatoire
+    # est appliqué au démarrage par le step de délai 0-30 min ci-dessous.
     - cron: "17 0 * * *"
     - cron: "41 12 * * *"
   workflow_dispatch:
@@ -77,6 +78,7 @@ jobs:
         run: pytest -q
 
   scrape-and-process:
+    if: github.event_name != 'pull_request'
     needs: tests
     runs-on: ubuntu-latest
     strategy:
@@ -148,6 +150,21 @@ jobs:
           PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
           PROXY_URL_4: ${{ secrets.PROXY_URL_4 }}
           PROXY_URL_5: ${{ secrets.PROXY_URL_5 }}
+          PROXY_COUNTRY_1: ${{ vars.PROXY_COUNTRY_1 }}
+          PROXY_COUNTRY_2: ${{ vars.PROXY_COUNTRY_2 }}
+          PROXY_COUNTRY_3: ${{ vars.PROXY_COUNTRY_3 }}
+          PROXY_COUNTRY_4: ${{ vars.PROXY_COUNTRY_4 }}
+          PROXY_COUNTRY_5: ${{ vars.PROXY_COUNTRY_5 }}
+          BROWSER_LOCALE_1: ${{ vars.BROWSER_LOCALE_1 }}
+          BROWSER_LOCALE_2: ${{ vars.BROWSER_LOCALE_2 }}
+          BROWSER_LOCALE_3: ${{ vars.BROWSER_LOCALE_3 }}
+          BROWSER_LOCALE_4: ${{ vars.BROWSER_LOCALE_4 }}
+          BROWSER_LOCALE_5: ${{ vars.BROWSER_LOCALE_5 }}
+          BROWSER_TIMEZONE_1: ${{ vars.BROWSER_TIMEZONE_1 }}
+          BROWSER_TIMEZONE_2: ${{ vars.BROWSER_TIMEZONE_2 }}
+          BROWSER_TIMEZONE_3: ${{ vars.BROWSER_TIMEZONE_3 }}
+          BROWSER_TIMEZONE_4: ${{ vars.BROWSER_TIMEZONE_4 }}
+          BROWSER_TIMEZONE_5: ${{ vars.BROWSER_TIMEZONE_5 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |

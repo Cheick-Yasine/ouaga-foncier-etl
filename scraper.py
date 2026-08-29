@@ -16,15 +16,14 @@ l'utilisateur de : (1) utiliser un compte dédié, pas un compte personnel
 principal, (2) ne pas redistribuer les données personnelles collectées,
 (3) vérifier la réglementation applicable avant tout usage en production.
 
-CHOIX D'ARCHITECTURE : extraction JSON depuis web.facebook.com (Comet)
-----------------------------------------------------------------------------
-Historique complet dans config.py (juste au-dessus de `WEB_FACEBOOK_BASE_URL`)
-- résumé : le plan initial ciblait mbasic.facebook.com pour son HTML léger
-server-rendered, mais un test en conditions réelles le 2026-08-01 (avec un
-vrai navigateur, aucune automation) a confirmé que mbasic redirige
-désormais systématiquement vers web.facebook.com, qui sert l'application
-React "Comet". Contrairement à ce qu'on pourrait croire, ce n'est PAS une
-impasse : Comet embarque les données de chaque post en clair dans des blobs
+CHOIX D'ARCHITECTURE : entrée mobile, extraction JSON Comet compatible
+-----------------------------------------------------------------------
+Les URLs sont normalisées vers m.facebook.com et chaque compte conserve un
+profil Android stable. Si Facebook redirige vers www/web, cette redirection est
+journalisée et le même parseur Comet reste utilisable. Une page sans JSON
+initial et sans réponse GraphQL reconnue provoque une erreur explicite au lieu
+d'être considérée silencieusement comme un groupe vide. Comet embarque les
+données de chaque post dans des blobs
 JSON (`<script type="application/json" data-sjs>`, format Relay/GraphQL
 interne à Facebook) pour l'hydratation côté client - texte, horodatage Unix
 exact, id et permalien y sont tous présents. `extraire_stories_depuis_json`
@@ -64,6 +63,7 @@ import json
 import logging
 import random
 import re
+import urllib.parse
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -89,6 +89,18 @@ class SessionExpireeError(Exception):
 
 class BlocageDetecteError(Exception):
     """Levée quand Facebook affiche un mur anti-bot (checkpoint/captcha)."""
+
+
+class ProxyIncoherentError(Exception):
+    """Levée si le proxy ne répond pas ou ne sort pas dans le pays attendu."""
+
+
+class InterfaceFacebookInattendueError(Exception):
+    """Levée lorsque la navigation quitte les domaines Facebook attendus."""
+
+
+class StructureFacebookInattendueError(Exception):
+    """Levée si la page ne présente aucun signal exploitable connu."""
 
 
 class CooldownActifError(Exception):
@@ -386,7 +398,8 @@ async def creer_navigateur(
     précis, sans non plus le supprimer entièrement (le proxy lui-même a sa
     propre réputation, pas forcément parfaite).
     """
-    user_agent, viewport = config.choisir_fingerprint_mobile()
+    user_agent, viewport = config.choisir_fingerprint_mobile(compte)
+    region = config.parametres_regionaux(compte)
     logger.info(
         "Fingerprint mobile : viewport=%sx%s | UA=%s...",
         viewport["width"],
@@ -403,8 +416,8 @@ async def creer_navigateur(
         user_agent=user_agent,
         is_mobile=True,
         has_touch=True,
-        locale="fr-FR",
-        timezone_id="Africa/Ouagadougou",
+        locale=region.locale,
+        timezone_id=region.fuseau_horaire,
         storage_state={"cookies": [], "origins": _charger_origins_sauvegardees(compte)},
     )
     # Masque le flag standard qui trahit un navigateur piloté par automation.
@@ -416,6 +429,69 @@ async def creer_navigateur(
     await contexte.add_cookies(cookies)
     contexte.set_default_navigation_timeout(config.NAVIGATION_TIMEOUT_MS)
     return navigateur, contexte
+
+
+async def verifier_proxy_et_region(
+    contexte: BrowserContext,
+    compte: str | None,
+) -> None:
+    """Vérifie la sortie réseau du contexte avant toute visite à Facebook."""
+    region = config.parametres_regionaux(compte)
+    page = await contexte.new_page()
+    try:
+        reponse = await page.goto(
+            config.PROXY_GEO_CHECK_URL,
+            wait_until="domcontentloaded",
+            timeout=config.PROXY_GEO_CHECK_TIMEOUT_MS,
+        )
+        if reponse is None or not reponse.ok:
+            statut = reponse.status if reponse is not None else "aucune réponse"
+            raise ProxyIncoherentError(
+                f"Vérification du proxy impossible ({statut})."
+            )
+        try:
+            donnees = json.loads(await page.locator("body").inner_text())
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ProxyIncoherentError(
+                "Le service de géolocalisation du proxy a renvoyé une réponse illisible."
+            ) from exc
+        pays_observe = str(
+            donnees.get("country_code") or donnees.get("country") or ""
+        ).upper()
+        if pays_observe != region.pays:
+            raise ProxyIncoherentError(
+                f"Pays du proxy incohérent : attendu={region.pays}, "
+                f"observé={pays_observe or 'inconnu'}."
+            )
+        logger.info(
+            "Proxy vérifié pour le compte %s : pays=%s, locale=%s, fuseau=%s.",
+            compte or "unique",
+            pays_observe,
+            region.locale,
+            region.fuseau_horaire,
+        )
+    except ProxyIncoherentError:
+        raise
+    except Exception as exc:
+        raise ProxyIncoherentError(
+            f"Proxy inutilisable ou contrôle géographique indisponible : {exc}"
+        ) from exc
+    finally:
+        await page.close()
+
+
+def _verifier_domaine_facebook(url: str) -> str:
+    """Valide l'hôte final et retourne le type d'interface observé."""
+    hote = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if hote == "m.facebook.com":
+        return "mobile"
+    if hote in {"www.facebook.com", "web.facebook.com"}:
+        return "comet"
+    if hote == "facebook.com":
+        return "standard"
+    raise InterfaceFacebookInattendueError(
+        f"Navigation Facebook redirigée vers un domaine inattendu : {url}"
+    )
 
 
 async def echauffement(contexte: BrowserContext) -> None:
@@ -1332,6 +1408,14 @@ async def scraper_groupe(
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
         await page.goto(url_groupe, wait_until="domcontentloaded")
+        interface = _verifier_domaine_facebook(page.url)
+        if interface != "mobile":
+            logger.warning(
+                "Facebook a redirigé %s vers l'interface %s (%s).",
+                groupe.nom,
+                interface,
+                page.url,
+            )
         await detecter_blocage_ou_session_expiree(page)
         await asyncio.sleep(
             random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
@@ -1486,6 +1570,11 @@ async def scraper_groupe(
 
         if nb_posts_trouves_via_scroll == 0 and echantillons_graphql_bruts:
             _sauvegarder_echantillons_graphql_debug(echantillons_graphql_bruts, groupe.id)
+        if not posts_initiaux and compteur_reponses_matchees == 0:
+            raise StructureFacebookInattendueError(
+                f"Aucun JSON initial ni réponse GraphQL reconnue pour {groupe.nom}; "
+                "le mode mobile ou la structure Facebook a probablement changé."
+            )
 
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
@@ -1575,15 +1664,6 @@ async def executer_scraping(
         raise ValueError(f"Variable d'environnement {nom_secret} absente.")
     cookies_secret = charger_cookies(cookies_json)
 
-    # Priorité aux cookies "vivants" du run précédent (potentiellement déjà
-    # renouvelés par Facebook) sur le secret statique - voir
-    # `_charger_cookies_caches` pour la justification complète. Repli
-    # automatique et silencieux sur le secret si le cache est absent/invalide,
-    # ce qui couvre aussi bien le premier run que le run juste après une
-    # régénération manuelle du secret suite à une vraie expiration.
-    cookies_caches = _charger_cookies_caches(compte)
-    cookies = cookies_caches if cookies_caches is not None else cookies_secret
-
     if round_robin:
         tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
         nb_a_traiter = group_limit or 1
@@ -1645,10 +1725,7 @@ async def executer_scraping(
     session_expiree = False
 
     async with async_playwright() as playwright:
-        navigateur, contexte = await creer_navigateur(playwright, cookies, compte, proxy)
         try:
-            await echauffement(contexte)
-
             for debut_batch in range(0, len(groupes), groups_batch_size):
                 if budget_depasse:
                     break
@@ -1661,6 +1738,7 @@ async def executer_scraping(
                 )
 
                 for i, groupe in enumerate(lot):
+                    index_global = debut_batch + i
                     ecoulees_min = (
                         datetime.now(timezone.utc) - debut_session
                     ).total_seconds() / 60
@@ -1669,12 +1747,29 @@ async def executer_scraping(
                             "Budget de session atteint (%.1f min) - arrêt propre, "
                             "%d groupe(s) restant(s) traités au prochain run.",
                             ecoulees_min,
-                            len(groupes) - (debut_batch + i),
+                            len(groupes) - index_global,
                         )
                         budget_depasse = True
                         break
 
+                    navigateur: Browser | None = None
+                    contexte: BrowserContext | None = None
+                    echec_groupe = False
+                    posts: list[dict[str, Any]] = []
+                    nouveau_repere: str | None = None
                     try:
+                        cookies_caches = _charger_cookies_caches(compte)
+                        cookies = (
+                            cookies_caches
+                            if cookies_caches is not None
+                            else cookies_secret
+                        )
+                        navigateur, contexte = await creer_navigateur(
+                            playwright, cookies, compte, proxy
+                        )
+                        if proxy is not None:
+                            await verifier_proxy_et_region(contexte, compte)
+                        await echauffement(contexte)
                         posts, nouveau_repere = await scraper_groupe(
                             contexte,
                             groupe,
@@ -1683,12 +1778,6 @@ async def executer_scraping(
                             delai_multiplicateur=ajustements.delai_multiplicateur,
                             post_repere=reperes_dernier_post.get(groupe.id),
                         )
-                        # Ne remplace le repère existant QUE si un nouveau post
-                        # inédit a réellement été trouvé ce run - sinon (groupe
-                        # déjà à jour, ou run interrompu tôt) on garde l'ancien
-                        # repère plutôt que de le perdre avec une valeur `None`.
-                        if nouveau_repere:
-                            reperes_dernier_post[groupe.id] = nouveau_repere
                     except SessionExpireeError as exc:
                         logger.critical(
                             "Session Facebook expirée sur le groupe %s. Arrêt du run - "
@@ -1704,8 +1793,7 @@ async def executer_scraping(
                         raise
                     except BlocageDetecteError as exc:
                         logger.critical(
-                            "Blocage anti-bot détecté sur %s (%s) - arrêt COMPLET du run "
-                            "(les autres groupes ne sont pas tentés).",
+                            "Blocage anti-bot détecté sur %s (%s) - arrêt COMPLET du run.",
                             groupe.nom,
                             exc,
                         )
@@ -1720,79 +1808,75 @@ async def executer_scraping(
                             compte,
                         )
                         raise
+                    except (
+                        ProxyIncoherentError,
+                        InterfaceFacebookInattendueError,
+                        StructureFacebookInattendueError,
+                    ):
+                        logger.critical(
+                            "Configuration réseau/navigation invalide pour le compte %s.",
+                            compte or "unique",
+                            exc_info=True,
+                        )
+                        raise
                     except Exception:
                         logger.exception(
                             "Erreur inattendue sur le groupe %s - groupe ignoré.",
                             groupe.nom,
                         )
                         anomalies += 1
-                        continue
+                        echec_groupe = True
+                    finally:
+                        if contexte is not None:
+                            if session_expiree:
+                                invalider_storage_state(compte)
+                            else:
+                                try:
+                                    await sauvegarder_storage_state(contexte, compte)
+                                except Exception:
+                                    logger.exception(
+                                        "Échec de sauvegarde de session avant fermeture."
+                                    )
+                            try:
+                                await contexte.close()
+                            except Exception:
+                                logger.exception("Échec de fermeture du contexte.")
+                        if navigateur is not None:
+                            try:
+                                await navigateur.close()
+                            except Exception:
+                                logger.exception("Échec de fermeture du navigateur.")
+                        logger.info("Navigateur fermé proprement après %s.", groupe.nom)
 
-                    if posts:
-                        fichiers_sauvegardes.append(
-                            sauvegarder_posts_groupe(posts, groupe.id)
+                    if not echec_groupe:
+                        if nouveau_repere:
+                            reperes_dernier_post[groupe.id] = nouveau_repere
+                        if posts:
+                            fichiers_sauvegardes.append(
+                                sauvegarder_posts_groupe(posts, groupe.id)
+                            )
+                        sauvegarder_seen_ids(seen_ids, compte=compte)
+                        sauvegarder_dernier_post_connu(
+                            reperes_dernier_post, compte
                         )
-                    sauvegarder_seen_ids(
-                        seen_ids, compte=compte
-                    )  # sauvegarde après CHAQUE groupe (résilience coupure)
-                    sauvegarder_dernier_post_connu(
-                        reperes_dernier_post, compte
-                    )  # idem : le repère de reprise ne doit jamais se perdre
 
-                    # Pause entre deux groupes du même lot - 10-15 minutes
-                    # (voir config.PAUSE_ENTRE_GROUPES_MIN_S/MAX_S), distincte
-                    # du délai entre étapes de scroll (config.PAGE_DELAY_*,
-                    # en secondes, utilisé PENDANT le scroll d'un même groupe).
-                    if i < len(lot) - 1:
-                        if not session_expiree:
-                            await sauvegarder_storage_state(contexte, compte)
-                        await contexte.close()
-                        await navigateur.close()
-                        logger.info(
-                            "Navigateur fermé proprement entre groupes "
-                            "(simulation déconnexion naturelle)."
-                        )
-                        await asyncio.sleep(
-                            random.uniform(
+                    if index_global < len(groupes) - 1:
+                        if i < len(lot) - 1:
+                            pause = random.uniform(
                                 config.PAUSE_ENTRE_GROUPES_MIN_S,
                                 config.PAUSE_ENTRE_GROUPES_MAX_S,
                             )
-                            * ajustements.delai_multiplicateur
-                        )
-                        cookies_caches = _charger_cookies_caches(compte)
-                        cookies = (
-                            cookies_caches
-                            if cookies_caches is not None
-                            else cookies_secret
-                        )
-                        navigateur, contexte = await creer_navigateur(
-                            playwright, cookies, compte, proxy
-                        )
-                        await echauffement(contexte)
-
-                # Pause plus longue entre deux batches de groupes.
-                if not budget_depasse and debut_batch + groups_batch_size < len(
-                    groupes
-                ):
-                    pause = (
-                        random.uniform(
-                            config.PAUSE_ENTRE_BATCHES_MIN_S,
-                            config.PAUSE_ENTRE_BATCHES_MAX_S,
-                        )
-                        * ajustements.delai_multiplicateur
-                    )
-                    logger.info("Pause inter-batch de %.1fs", pause)
-                    await asyncio.sleep(pause)
+                            type_pause = "inter-groupe"
+                        else:
+                            pause = random.uniform(
+                                config.PAUSE_ENTRE_BATCHES_MIN_S,
+                                config.PAUSE_ENTRE_BATCHES_MAX_S,
+                            )
+                            type_pause = "inter-batch"
+                        pause *= ajustements.delai_multiplicateur
+                        logger.info("Pause %s de %.1fs", type_pause, pause)
+                        await asyncio.sleep(pause)
         finally:
-            if session_expiree:
-                # Cookies connus morts sur CE run - ne pas les mettre en cache
-                # (voir invalider_storage_state), sinon ils masqueraient tout
-                # renouvellement du secret de cookies au run suivant.
-                invalider_storage_state(compte)
-            else:
-                await sauvegarder_storage_state(contexte, compte)
-            await contexte.close()
-            await navigateur.close()
             nouvel_etat_sante = mettre_a_jour_apres_run(
                 etat_sante,
                 anomalies=anomalies,

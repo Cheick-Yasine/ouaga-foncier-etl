@@ -192,6 +192,17 @@ class TestChargerGroupes:
         with pytest.raises(ValueError):
             config.charger_groupes(chemin=chemin)
 
+    @pytest.mark.parametrize("sous_domaine", ["www", "web"])
+    def test_url_facebook_est_normalisee_vers_mobile(self, tmp_path, sous_domaine):
+        chemin = tmp_path / "groups.csv"
+        chemin.write_text(
+            "id,nom,url,actif,compte\n"
+            f'1111,"Groupe A","https://{sous_domaine}.facebook.com/groups/1111",true,1\n',
+            encoding="utf-8",
+        )
+        groupe = config.charger_groupes(chemin=chemin, compte="1")[0]
+        assert groupe.url == "https://m.facebook.com/groups/1111"
+
 
 class TestEtatParCompte:
     """Isolation de l'état persistant (cookies, cooldown, santé, rotation)
@@ -233,9 +244,14 @@ class TestProxyPlaywright:
         monkeypatch.delenv("PROXY_URL", raising=False)
         assert config.proxy_playwright(None) is None
 
-    def test_vide_retourne_none(self, monkeypatch):
+    def test_vide_multicompte_leve_une_erreur(self, monkeypatch):
         monkeypatch.setenv("PROXY_URL_2", "   ")
-        assert config.proxy_playwright("2") is None
+        with pytest.raises(ValueError, match="PROXY_URL_2"):
+            config.proxy_playwright("2")
+
+    def test_vide_reste_optionnel_en_mono_compte(self, monkeypatch):
+        monkeypatch.setenv("PROXY_URL", "   ")
+        assert config.proxy_playwright(None) is None
 
     def test_avec_authentification(self, monkeypatch):
         monkeypatch.setenv("PROXY_URL_1", "http://alice:s3cret@proxy.example.com:8080")
@@ -259,6 +275,43 @@ class TestProxyPlaywright:
         assert proxy["username"] == "user@x"
         assert proxy["password"] == "p@ss"
 
-    def test_url_illisible_retourne_none(self, monkeypatch, caplog):
+    def test_url_illisible_multicompte_leve_une_erreur(self, monkeypatch):
         monkeypatch.setenv("PROXY_URL_3", "ceci-nest-pas-une-url-de-proxy")
-        assert config.proxy_playwright("3") is None
+        with pytest.raises(ValueError, match="PROXY_URL_3"):
+            config.proxy_playwright("3")
+
+    def test_schema_non_supporte_est_refuse(self, monkeypatch):
+        monkeypatch.setenv("PROXY_URL_1", "ftp://proxy.example.com:21")
+        with pytest.raises(ValueError, match="invalide"):
+            config.proxy_playwright("1")
+
+
+class TestProfilMobileEtRegion:
+    def test_profil_est_stable_et_distinct_par_compte(self):
+        profils = [config.choisir_fingerprint_mobile(str(i)) for i in range(1, 6)]
+        assert len({ua for ua, _ in profils}) == 5
+        assert config.choisir_fingerprint_mobile("2") == profils[1]
+        assert all("Android" in ua and "iPhone" not in ua for ua, _ in profils)
+
+    def test_viewport_retourne_est_une_copie(self):
+        _, viewport = config.choisir_fingerprint_mobile("1")
+        viewport["width"] = 1
+        assert config.choisir_fingerprint_mobile("1")[1]["width"] == 360
+
+    def test_region_par_defaut_est_burkina(self, monkeypatch):
+        for nom in ("PROXY_COUNTRY", "BROWSER_LOCALE", "BROWSER_TIMEZONE"):
+            monkeypatch.delenv(nom, raising=False)
+            monkeypatch.delenv(f"{nom}_1", raising=False)
+        region = config.parametres_regionaux("1")
+        assert region.pays == "BF"
+        assert region.locale == "fr-FR"
+        assert region.fuseau_horaire == "Africa/Ouagadougou"
+
+    def test_region_peut_etre_surchargee_par_compte(self, monkeypatch):
+        monkeypatch.setenv("PROXY_COUNTRY_3", "ci")
+        monkeypatch.setenv("BROWSER_LOCALE_3", "fr-CI")
+        monkeypatch.setenv("BROWSER_TIMEZONE_3", "Africa/Abidjan")
+        region = config.parametres_regionaux("3")
+        assert (region.pays, region.locale, region.fuseau_horaire) == (
+            "CI", "fr-CI", "Africa/Abidjan"
+        )

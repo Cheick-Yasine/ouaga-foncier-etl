@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Recharge FB_COOKIES_JSON à partir d'un export "cookies gadget" (extension
-navigateur type Cookie-Editor), sans laisser le pipeline bloqué à attendre.
+"""Recharge FB_COOKIES_JSON depuis une connexion interactive ou un export.
 
 Contexte : quand `SessionExpireeError` est levée pendant un run, le pipeline
 s'arrête, active un cooldown d'1h (config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE)
@@ -19,11 +18,12 @@ prochain run les utilise vraiment" :
    `scraper._charger_cookies_caches` -, donc le laisser en place ferait
    ignorer silencieusement les cookies fraîchement fournis ici. Voir aussi
    `scraper.invalider_storage_state`, qui fait la même purge côté run).
-4. Optionnel (--clear-actions-cache) : supprime aussi le cache GitHub Actions
-   `etat-scraper-*`, qui contient la même chose côté CI, pour ne pas attendre
-   qu'il expire ou soit écrasé naturellement.
+4. La suppression du cache Actions est protégée : ce cache contient aussi
+   `seen_post_ids.json`. Elle exige deux options explicites afin d'éviter de
+   réexporter accidentellement des publications déjà traitées.
 
 Usage :
+    python scripts/maj_cookies.py --interactive --repo owner/repo --compte 1 --set-secret
     python scripts/maj_cookies.py export_cookie_editor.json
     python scripts/maj_cookies.py export_cookie_editor.json --repo owner/repo --set-secret
     python scripts/maj_cookies.py export_cookie_editor.json --repo owner/repo --set-secret --clear-actions-cache
@@ -48,6 +48,70 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 import scraper  # noqa: E402
+
+
+def valider_cookies_captures(cookies: list[dict]) -> str:
+    """Filtre et valide les cookies Facebook capturés par Playwright.
+
+    Le JSON retourné est compact et directement compatible avec le secret
+    ``FB_COOKIES_JSON_<compte>``. Une absence de ``c_user`` ou ``xs`` signifie
+    que la connexion interactive n'est pas terminée : on échoue sans jamais
+    envoyer un secret incomplet à GitHub.
+    """
+    cookies_facebook = [
+        cookie
+        for cookie in cookies
+        if (
+            (domaine := str(cookie.get("domain", "")).lstrip(".").lower())
+            == "facebook.com"
+            or domaine.endswith(".facebook.com")
+        )
+    ]
+    texte = json.dumps(cookies_facebook, ensure_ascii=False, separators=(",", ":"))
+    cookies_normalises = scraper.charger_cookies(texte)
+    noms = {cookie["name"] for cookie in cookies_normalises}
+    manquants = {"c_user", "xs"} - noms
+    if manquants:
+        raise ValueError(
+            "Connexion Facebook non confirmée : cookie(s) requis absent(s) : "
+            + ", ".join(sorted(manquants))
+        )
+    return texte
+
+
+def capturer_session_interactive() -> str:
+    """Ouvre Chromium visiblement et capture la session après validation humaine.
+
+    Le mot de passe et la 2FA sont saisis directement dans Facebook. Le script
+    ne les lit ni ne les enregistre ; il récupère uniquement les cookies une
+    fois que l'utilisateur confirme que la connexion est terminée.
+    """
+    from playwright.sync_api import sync_playwright
+
+    print(
+        "\nChromium va s'ouvrir. Connectez-vous vous-même au BON compte Facebook, "
+        "terminez la 2FA ou toute vérification éventuelle, puis revenez ici.\n"
+        "IMPORTANT : ne cliquez jamais sur « Se déconnecter » après la capture. "
+        "Le script fermera lui-même ce navigateur et le prochain compte "
+        "s'ouvrira dans un contexte vierge."
+    )
+    with sync_playwright() as playwright:
+        navigateur = playwright.chromium.launch(headless=False)
+        contexte = navigateur.new_context(
+            locale="fr-FR",
+            timezone_id="Africa/Ouagadougou",
+        )
+        try:
+            page = contexte.new_page()
+            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+            input(
+                "Appuyez sur Entrée lorsque l'accueil Facebook connecté est visible "
+                "(sans vous déconnecter ensuite)..."
+            )
+            return valider_cookies_captures(contexte.cookies())
+        finally:
+            contexte.close()
+            navigateur.close()
 
 
 def valider_export(chemin: Path) -> str:
@@ -174,7 +238,16 @@ def main(argv: list[str] | None = None) -> int:
     parseur.add_argument(
         "export",
         type=Path,
-        help="Fichier JSON exporté par l'extension (format brut, non modifié).",
+        nargs="?",
+        help="Fichier JSON exporté par l'extension (omis avec --interactive).",
+    )
+    parseur.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Ouvre Chromium visiblement, laisse l'utilisateur se connecter et "
+            "capture automatiquement les cookies sans extension d'export."
+        ),
     )
     parseur.add_argument(
         "--repo",
@@ -188,7 +261,18 @@ def main(argv: list[str] | None = None) -> int:
     parseur.add_argument(
         "--clear-actions-cache",
         action="store_true",
-        help="Supprime aussi le cache GitHub Actions data/state (etat-scraper-*).",
+        help=(
+            "Demande la suppression du cache GitHub Actions. Dangereux : ce "
+            "cache contient aussi l'historique des posts déjà vus."
+        ),
+    )
+    parseur.add_argument(
+        "--force-clear-actions-cache",
+        action="store_true",
+        help=(
+            "Confirme explicitement la perte possible de seen_post_ids ; "
+            "requis avec --clear-actions-cache."
+        ),
     )
     parseur.add_argument(
         "--no-purge-etat-local",
@@ -209,13 +293,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parseur.parse_args(argv)
 
-    if not args.export.exists():
-        parseur.error(f"Fichier introuvable : {args.export}")
+    if args.clear_actions_cache and not args.force_clear_actions_cache:
+        parseur.error(
+            "--clear-actions-cache peut supprimer seen_post_ids.json. "
+            "Ajoutez --force-clear-actions-cache uniquement si cette perte "
+            "d'historique est volontaire."
+        )
 
-    try:
-        cookies_compacts = valider_export(args.export)
-    except (ValueError, json.JSONDecodeError) as exc:
-        parseur.error(f"Export invalide : {exc}")
+    if args.interactive == (args.export is not None):
+        parseur.error("Choisissez exactement une source : --interactive OU un fichier d'export.")
+
+    if args.interactive:
+        if not args.set_secret:
+            parseur.error(
+                "Le mode --interactive exige --set-secret afin de transmettre "
+                "la capture sans afficher les cookies dans le terminal."
+            )
+        if args.set_secret and shutil.which("gh") is None:
+            parseur.error(
+                "GitHub CLI (`gh`) est requis avec --interactive --set-secret. "
+                "Installez-le puis lancez `gh auth login`."
+            )
+        try:
+            cookies_compacts = capturer_session_interactive()
+        except ValueError as exc:
+            parseur.error(str(exc))
+    else:
+        assert args.export is not None
+        if not args.export.exists():
+            parseur.error(f"Fichier introuvable : {args.export}")
+        try:
+            cookies_compacts = valider_export(args.export)
+        except (ValueError, json.JSONDecodeError) as exc:
+            parseur.error(f"Export invalide : {exc}")
 
     maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret, compte=args.compte)
 

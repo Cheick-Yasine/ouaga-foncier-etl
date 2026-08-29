@@ -5,7 +5,7 @@ Scraping de groupes Facebook ciblés → filtrage local → structuration par LL
 ## Description technique
 
 - **Langage** : Python 3.12 (3.12.7 en CI).
-- **Scraping** : Playwright (Chromium, async), session authentifiée via cookies (`FB_COOKIES_JSON`, ou `FB_COOKIES_JSON_1`…`FB_COOKIES_JSON_5` en multi-comptes — voir section "Multi-comptes"), cible `web.facebook.com` (interface "Comet").
+- **Scraping** : Playwright (Chromium, async), session authentifiée via cookies (`FB_COOKIES_JSON`, ou `FB_COOKIES_JSON_1`…`FB_COOKIES_JSON_5` en multi-comptes), cible `m.facebook.com` avec un profil Android stable par compte. Une redirection éventuelle vers l'interface Comet est détectée et journalisée.
 - **Filtrage** : regex locales, gratuites, aucun appel API (`config.py`).
 - **Structuration** : API OpenAI (`gpt-4o-mini`), Structured Outputs (schéma JSON strict) pour extraire les champs (type de bien, quartier, superficie, prix, statut du document, contacts).
 - **Stockage** : PostgreSQL (hébergé sur Neon), upsert par `id` de post — jamais de doublon. Export Excel régénéré à chaque run.
@@ -15,13 +15,13 @@ Scraping de groupes Facebook ciblés → filtrage local → structuration par LL
 
 Le pipeline s'exécute en 4 étapes, orchestrées par `main.py` :
 
-1. **Scraping** (`scraper.py`) — pour chaque groupe actif de `groups.csv` : ouverture de `web.facebook.com/groups/<id>`, extraction des posts "mis en avant" (JSON embarqué dans la page), puis scroll simulé avec interception des réponses réseau GraphQL pour récupérer le fil normal du groupe. S'arrête par groupe quand la fenêtre de dates (`--days-back`) est dépassée ou après plusieurs scrolls sans nouveau post.
+1. **Scraping** (`scraper.py`) — pour chaque groupe actif de `groups.csv` : ouverture de l'URL normalisée vers `m.facebook.com`, extraction des posts "mis en avant" inédits, puis scroll variable avec interception des réponses réseau GraphQL. Le navigateur et son contexte sont sauvegardés puis fermés après chaque groupe, y compris à la frontière entre deux lots.
 2. **Filtrage** (`processor.py`, étape A) — chaque post brut passe par des regex (mots-clés fonciers, exclusion des recherches pures et du spam) pour ne garder que les candidats plausibles, sans coût API.
 3. **Structuration LLM** (`processor.py`, étape B) — chaque candidat est envoyé à l'API OpenAI, qui renvoie une structure validée (Pydantic) ou rejette le post s'il ne s'agit pas d'une vraie annonce. Les champs `quartier_zone` et `statut_document` sont ensuite normalisés (casse) contre une liste connue.
 4. **Persistance** (`processor.py`) — upsert des annonces valides dans PostgreSQL, mise à jour de l'export Excel, détection de dérive de volume (alerte si un run quotidien produit anormalement peu de résultats vs l'historique).
 
 Deux modes d'exécution (`--mode`) :
-- `daily` : dernières 24h (`--days-back 1`), déclenché automatiquement **deux fois par jour, à 00h00 et 12h00 UTC** (GitHub Actions), avec un délai aléatoire de 0 à 30 min avant démarrage sur les déclenchements cron (pas d'horaire parfaitement fixe et prévisible côté Facebook).
+- `daily` : dernières 24h (`--days-back 1`), déclenché deux fois par jour par les crons statiques `00:17` et `12:41` UTC, puis retardé de 0 à 30 minutes. Les minutes du cron ne sont pas aléatoires automatiquement ; elles peuvent seulement être changées manuellement dans le workflow.
 - `backfill` : rattrapage historique, `--days-back` réglable (déclenchement manuel uniquement, `workflow_dispatch`).
 
 Deux stratégies de répartition des groupes au sein d'un run :
@@ -73,15 +73,63 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
     http://hote:port                          # proxy sans authentification
     socks5://utilisateur:motdepasse@hote:port  # Playwright supporte aussi SOCKS5
     ```
-  - **Entièrement optionnel** : absente ou vide, `config.proxy_playwright(compte)` retourne `None` et le run se comporte exactement comme avant (aucun proxy, sortie directe par l'IP du runner). Une valeur mal formée est aussi ignorée (avec un avertissement loggué), plutôt que de faire échouer le run.
+  - En mode multi-comptes, `PROXY_URL_<n>` est obligatoire. Une valeur absente ou invalide arrête clairement le job concerné au lieu de le laisser sortir silencieusement par l'IP GitHub. Le mode mono-compte historique conserve un proxy optionnel.
   - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
   - En CI : créer les secrets `PROXY_URL_1`…`PROXY_URL_5` (Settings → Secrets and variables → Actions) — idéalement un proxy **distinct par compte**, pour que chacun des 5 comptes conserve une IP de sortie cohérente d'un run à l'autre (comme un vrai navigateur qui revient), plutôt que 5 comptes partageant une même IP proxy, qui reconstituerait le même signal de risque à une autre échelle. Le workflow (`daily_scraper.yml`) injecte déjà ces 5 secrets vers le job matriciel correspondant.
+
+Avant Facebook, chaque contexte ouvre `https://ipapi.co/json/` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
+
+- `PROXY_COUNTRY_1`…`PROXY_COUNTRY_5` : code ISO à deux lettres, `BF` par défaut ;
+- `BROWSER_LOCALE_1`…`BROWSER_LOCALE_5` : `fr-FR` par défaut ;
+- `BROWSER_TIMEZONE_1`…`BROWSER_TIMEZONE_5` : `Africa/Ouagadougou` par défaut.
+
+Un échec du proxy, du contrôle géographique ou une différence de pays arrête le compte concerné avant toute visite de groupe. Cette vérification améliore la cohérence de configuration mais ne garantit pas l'absence de contrôle ou de blocage par Meta.
 
   Limite assumée (même réserve que pour les autres mesures de "Stratégie anti-blocage") : un proxy réduit ce risque précis, il ne l'élimine pas — un proxy lui-même partagé/mal réputé peut rester détecté. Ce n'est pas non plus un contournement des CGU de Meta évoquées plus haut, seulement un changement d'infrastructure réseau.
 
 ## Session expirée : recharger les cookies sans bloquer le pipeline
 
-Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret de cookies du compte concerné soit régénéré à la main.
+Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret de cookies du compte concerné soit régénéré.
+
+### Méthode recommandée sous Windows : connexion interactive
+
+Cette méthode n'enregistre jamais le mot de passe ni le code 2FA. Elle ouvre
+Chromium visiblement, vous laisse effectuer vous-même la connexion, capture
+les cookies une fois l'accueil connecté visible, puis les transmet au secret
+GitHub par l'entrée standard de `gh` (ils ne figurent donc pas dans la ligne de
+commande).
+
+Dans PowerShell, une seule fois :
+
+```powershell
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+gh auth login
+```
+
+Puis, pour renouveler par exemple le compte 1 :
+
+```powershell
+python scripts/maj_cookies.py --interactive --repo Cheick-Yasine/ouaga-foncier-etl --compte 1 --set-secret
+```
+
+Connectez-vous au compte demandé dans la fenêtre Chromium et terminez toute
+2FA/vérification manuellement. N'appuyez sur Entrée dans PowerShell qu'une fois
+l'accueil Facebook connecté visible. Répétez la commande avec `--compte 2`,
+`3`, `4` puis `5`, en vérifiant soigneusement le compte ouvert à chaque fois.
+
+> **Important : ne cliquez pas sur « Se déconnecter » après la capture.**
+> Une déconnexion peut révoquer les cookies qui viennent d'être enregistrés.
+> Appuyez simplement sur Entrée : le script capture la session puis ferme
+> Chromium. La commande suivante crée automatiquement un contexte navigateur
+> vierge pour le compte suivant ; aucune session locale du compte précédent
+> n'y est réutilisée.
+
+Cette procédure simplifie la capture, mais ne peut pas renouveler une session
+révoquée sans reconnexion humaine. Si un cooldown vient d'être sauvegardé par
+le dernier run, attendez sa fin avant de relancer le workflow.
+
+### Méthode alternative : export Cookie-Editor
 
 Pour régénérer : ouvrir `web.facebook.com` connecté sur le compte dédié au scraping, exporter les cookies avec une extension type [Cookie-Editor](https://cookie-editor.com/) (format JSON brut, sans les modifier), puis lancer :
 
@@ -97,9 +145,9 @@ Ce script (`scripts/maj_cookies.py`) :
 1. Valide l'export (mêmes règles que `scraper.charger_cookies` — présence de `c_user`/`xs`, tolérance au format brut d'extension `expirationDate`/`sameSite`).
 2. Met à jour le secret GitHub `FB_COOKIES_JSON_<compte>` (ou `FB_COOKIES_JSON` sans `--compte`) via `gh secret set` — ou affiche la commande/le JSON si `gh` n'est pas installé/authentifié, mise à jour manuelle alors possible depuis Settings → Secrets and variables → Actions.
 3. Purge le cooldown et le `storage_state` en cache localement (`data/state/compte_<n>/`, ou `data/state/` sans `--compte`) — **étape nécessaire**, pas juste pratique : `scraper._charger_cookies_caches()` donne priorité au `storage_state` mis en cache sur le secret de cookies à chaque run, et un cookie invalidé côté serveur Facebook n'a pas forcément de date d'expiration dépassée (le test de fraîcheur par date ne le détecte donc pas). Sans cette purge, le run suivant rechargeait silencieusement les cookies morts du cache au lieu des nouveaux, malgré la mise à jour du secret — le pipeline restait bloqué en boucle. (`scraper.invalider_storage_state` applique la même purge côté run : dès qu'une `SessionExpireeError` est détectée, le `storage_state` du run en cours n'est plus mis en cache du tout.)
-4. En option (`--clear-actions-cache`), supprime aussi le cache `actions/cache` côté CI — `etat-scraper-compte-<n>-*` avec `--compte`, `etat-scraper-*` sans.
+4. `--clear-actions-cache` est une opération exceptionnelle : le cache contient aussi `seen_post_ids.json`. Le script refuse désormais cette suppression sans la confirmation supplémentaire `--force-clear-actions-cache`.
 
-Ajouter `--clear-actions-cache` si le run précédent a tourné en CI (sinon le prochain run restaurera le `storage_state` mort depuis le cache GitHub Actions, même après la purge locale). Sans `gh` installé, le script affiche le JSON compact à coller manuellement dans le secret, et il faut alors aussi vider le cache Actions à la main (onglet Actions → Caches).
+Ne supprimez pas le cache Actions pour un renouvellement normal. Le run qui détecte une session expirée invalide déjà son `storage_state` tout en conservant l'historique des publications vues.
 
 ## Pages Facebook
 
@@ -117,7 +165,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
 - Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`), chacun a son propre cache d'état (`etat-scraper-compte-<n>-*`) et son propre artefact (`annonces-foncieres-compte-<n>-*`).
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
-- `data/state/seen_post_ids.json` (déduplication des posts déjà vus) reste lui aussi **global**, volontairement non isolé par compte — un post public déjà vu par un compte n'a pas besoin d'être re-scrapé/re-structuré par un autre.
+- `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
 **Répartition actuelle** (`groups.csv`) : 25 entrées, exactement 5 par compte. Les deux seules entrées `actif=false` (`1412949025757240`, `352566539534344`) sont toutes les deux assignées au **compte 3**, qui ne traite donc que **3 groupes actifs** contre 5 pour les quatre autres comptes. Ce n'est pas un bug (le filtrage `actif`/`compte` fonctionne comme prévu) mais un déséquilibre de charge : à rééquilibrer en réassignant deux groupes vers le compte 3 si l'on veut une répartition réellement homogène.
 
@@ -163,11 +211,11 @@ python main.py --mode daily --skip-llm                               # test scra
 ## Tests
 
 ```bash
-pytest -q                                    # 188 passent, 12 skippés (sans PostgreSQL de test)
-TEST_DATABASE_URL=postgresql://... pytest -q  # 200/200 avec une base de test dédiée
+pytest -q                                    # 215 passent, 12 ignorés sans PostgreSQL de test
+TEST_DATABASE_URL=postgresql://... pytest -q  # exécute aussi les cas PostgreSQL
 ```
 
-**200 tests** au total (logique de filtrage, normalisation, parsing JSON Comet, throttle, CLI, base de données, isolation d'état multi-comptes). 12 d'entre eux exigent un vrai serveur PostgreSQL via `TEST_DATABASE_URL` (base **séparée** — la suite fait des `DROP TABLE`) et sont automatiquement skippés si elle est absente ou injoignable ; la CI les exécute contre un service `postgres:16` éphémère. Le scraping live contre Facebook et les appels API réels ne sont pas couverts par la suite automatisée — à valider manuellement après toute modification de `scraper.py` ou `processor.py`.
+La suite couvre désormais aussi les profils mobiles stables, le contrôle du pays du proxy, les redirections de domaine et la fermeture du navigateur après chaque groupe, y compris en cas d'erreur. Les tests PostgreSQL nécessitent toujours une base séparée ; la CI les exécute contre un service `postgres:16` éphémère. Le scraping live contre Facebook et les appels API réels ne sont pas couverts — ils doivent être validés avec un seul groupe avant un run complet.
 
 ## Limites connues
 
