@@ -63,12 +63,11 @@ INDEX_PROCHAIN_GROUPE_PATH = STATE_DIR / "prochain_groupe_index.json"
 # l'identique (rétrocompatibilité - voir tests/test_scraper_helpers.py qui
 # écrit directement dans ces chemins).
 #
-# `seen_post_ids.json` (déduplication par id de post) reste en revanche
-# GLOBAL et partagé entre comptes, jamais isolé par compte : un même post
-# public est le même post, peu importe quel compte l'a vu, et le dédupliquer
-# par compte ferait retraiter inutilement (coût API OpenAI) un post déjà vu
-# par un autre compte si jamais deux comptes finissaient par voir le même
-# groupe (ex: réattribution manuelle future).
+# `seen_post_ids.json` est également isolé par compte. Le workflow matriciel
+# ne restaure que `data/state/compte_<n>/` : conserver ce fichier à la racine
+# faisait perdre la déduplication entre deux runs et pouvait réexporter les
+# posts épinglés. L'isolation évite aussi les écritures concurrentes des cinq
+# jobs sur un même fichier.
 COMPTES_VALIDES = {"1", "2", "3", "4", "5"}
 
 
@@ -81,6 +80,11 @@ def _repertoire_compte(compte: str) -> Path:
     repertoire = STATE_DIR / f"compte_{compte}"
     repertoire.mkdir(parents=True, exist_ok=True)
     return repertoire
+
+
+def seen_ids_path(compte: str | None = None) -> Path:
+    """Chemin de déduplication persistant, isolé par compte en mode matriciel."""
+    return SEEN_IDS_PATH if compte is None else _repertoire_compte(compte) / "seen_post_ids.json"
 
 
 def dernier_post_connu_path(compte: str | None = None) -> Path:
