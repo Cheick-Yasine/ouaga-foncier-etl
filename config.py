@@ -11,6 +11,7 @@ import csv
 import json
 import logging
 import os
+import random
 import re
 import urllib.parse
 from dataclasses import dataclass
@@ -326,11 +327,19 @@ def charger_groupes(
                     f"Compte '{valeur_compte}' invalide pour le groupe '{ligne['id'].strip()}' "
                     f"dans {chemin} (valeurs valides : {sorted(COMPTES_VALIDES)})."
                 )
+            # Normalise l'URL vers m.facebook.com (mode mobile) si elle pointe
+            # encore vers www/web - cohérent avec le fingerprint mobile.
+            url_brute = ligne["url"].strip()
+            url_mobile = re.sub(
+                r"https?://(www\.|web\.)?facebook\.com",
+                "https://m.facebook.com",
+                url_brute,
+            )
             groupes.append(
                 Groupe(
                     id=ligne["id"].strip(),
                     nom=ligne["nom"].strip(),
-                    url=ligne["url"].strip(),
+                    url=url_mobile,
                     actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
                     compte=valeur_compte,
                 )
@@ -554,7 +563,7 @@ def normaliser_statut_document(valeur: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Paramètres de scraping / anti-détection
+# Paramètres de scraping / anti-détection (MODE MOBILE - 2026-08-29)
 # --------------------------------------------------------------------------- #
 
 # Ces valeurs peuvent être surchargées via les arguments CLI de main.py.
@@ -563,73 +572,82 @@ MAX_DAYS_BACK_BACKFILL_DEFAULT = 7
 GROUPS_BATCH_SIZE_DEFAULT = 5
 
 # --------------------------------------------------------------------------- #
-# HISTORIQUE D'ARCHITECTURE (important pour comprendre le code ci-dessous) :
-#
-# 1. Choix initial : mbasic.facebook.com (HTML léger server-rendered),
-#    jamais vérifié en conditions réelles faute d'accès réseau.
-# 2. Premier run live (2026-08-01) : mbasic a renvoyé l'app React "Comet"
-#    (mêmes marqueurs que le Facebook standard), pas de HTML léger.
-# 3. Deux tentatives de contournement par changement de User-Agent (un UA
-#    2011 puis un UA Android récent) : la seconde a évité Comet mais a
-#    atterri sur une page de "groupes suggérés" générique, jamais le fil du
-#    groupe ciblé.
-# 4. Test décisif : l'utilisateur a ouvert lui-même l'URL dans SON navigateur
-#    réel (aucune automation, aucun UA modifié) et a récupéré le vrai
-#    "View Source" de la page. Verdict sans ambiguïté : mbasic.facebook.com
-#    redirige tout navigateur réel vers web.facebook.com, qui sert l'app
-#    Comet - CE N'EST PAS UN PROBLÈME DE USER-AGENT, c'est que Facebook ne
-#    sert plus de HTML léger du tout aux sessions authentifiées en 2026.
-# 5. MAIS : l'inspection de ce "View Source" réel a révélé que Comet
-#    embarque les données des posts en clair, sous forme de JSON, dans des
-#    balises `<script type="application/json" data-sjs>` (payload Relay/
-#    GraphQL utilisé pour l'hydratation React) - texte du post, horodatage
-#    Unix exact (`creation_time`), id et URL du post, tout y est. Confirmé
-#    sur un échantillon réel (une annonce de parcelle avec son vrai texte,
-#    son vrai lien permanent, son vrai horodatage).
-#
-# Nouvelle stratégie retenue (voir `extraire_stories_depuis_json` dans
-# scraper.py) : au lieu de scroller/paginer un DOM HTML avec des sélecteurs
-# CSS, on parse directement ces blobs JSON - au chargement initial de la
-# page (posts "mis en avant") ET dans les réponses GraphQL déclenchées par
-# le scroll (fil principal, chargé dynamiquement). C'est plus puissant mais
-# aussi plus fragile : la structure interne n'est pas documentée
-# publiquement, n'est stabilisée par aucun contrat, et peut changer sans
-# préavis à la prochaine mise à jour de Facebook. Conçu pour échouer
-# silencieusement poste par poste plutôt que de planter tout le run.
+# MODE MOBILE (2026-08-29) : m.facebook.com + UA mobile + viewport mobile.
+# Les comptes "mobile" ont une meilleure réputation pour le scraping que
+# l'interface Comet desktop (web.facebook.com). On passe entièrement en mobile.
 # --------------------------------------------------------------------------- #
 
-WEB_FACEBOOK_BASE_URL = "https://web.facebook.com"
+WEB_FACEBOOK_BASE_URL = "https://m.facebook.com"
+MOBILE_FACEBOOK_BASE_URL = "https://m.facebook.com"
 
-# Conservé pour référence/historique uniquement - mbasic redirige les
-# navigateurs réels vers web.facebook.com, voir ci-dessus. Plus utilisé par
-# le code de scraping actif.
+# Conservé pour référence/historique uniquement.
 MBASIC_BASE_URL = "https://mbasic.facebook.com"
 
-# User-Agent desktop standard (pas un UA mobile spoofé - les deux tentatives
-# de spoofing UA ont échoué à obtenir autre chose que Comet ou une page
-# générique, voir historique ci-dessus). Puisque Comet est de toute façon
-# inévitable, autant utiliser un UA cohérent avec le reste du fingerprint
-# (viewport desktop) plutôt qu'un mensonge inutile.
-MBASIC_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
+# Rotation de User-Agents mobiles (Android Chrome) - un par session, choisi
+# aléatoirement. Cohérent avec viewport mobile + is_mobile=True.
+MOBILE_USER_AGENTS = [
+    (
+        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.6613.99 Mobile Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/127.0.6533.103 Mobile Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Linux; Android 13; SM-A536B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.6478.186 Mobile Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Linux; Android 14; SM-G991B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.6613.88 Mobile Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) CriOS/128.0.6613.92 Mobile/15E148 Safari/604.1"
+    ),
+]
 
-PAGE_DELAY_MIN_S = 5.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
-PAGE_DELAY_MAX_S = 45.0  # élargi le 2026-08-26 (5-45s) à la demande explicite de l'utilisateur, pour réduire la fréquence de requêtes par groupe
+# Viewports mobiles courants (largeur x hauteur), rotation aléatoire par session.
+MOBILE_VIEWPORTS = [
+    {"width": 390, "height": 844},   # iPhone 12/13/14
+    {"width": 360, "height": 800},   # Android moyen
+    {"width": 412, "height": 915},   # Pixel 7/8
+    {"width": 384, "height": 854},   # Galaxy S21/S22
+    {"width": 360, "height": 780},   # Android compact
+    {"width": 393, "height": 873},   # Pixel 6a
+]
 
-# Pause entre deux groupes consécutifs du même lot (batch) - AUGMENTÉE le
-# 2026-08-15 de 2-5s à 10-15 MINUTES à la demande explicite de l'utilisateur,
-# suite au passage à un run unique toutes les 12h traitant tous les groupes
-# (voir daily_scraper.yml). Ces deux constantes étaient auparavant confondues
-# avec PAGE_DELAY_MIN_S/MAX_S ci-dessus (même valeur réutilisée pour "entre
-# deux scrolls" ET "entre deux groupes") - séparées ici car leurs échelles de
-# temps n'ont plus rien à voir (secondes vs minutes).
+# Ancien UA desktop (conservé pour tests/rétrocompat si besoin).
+MBASIC_USER_AGENT = MOBILE_USER_AGENTS[0]
+
+
+def choisir_fingerprint_mobile() -> tuple[str, dict[str, int]]:
+    """Retourne (user_agent, viewport) aléatoires cohérents pour une session."""
+    return random.choice(MOBILE_USER_AGENTS), random.choice(MOBILE_VIEWPORTS)
+
+
+# Délais entre étapes de scroll (secondes) - plus variables / humains.
+PAGE_DELAY_MIN_S = 4.0
+PAGE_DELAY_MAX_S = 18.0
+
+# Micro-pauses pendant un scroll multi-étapes (secondes).
+SCROLL_MICRO_PAUSE_MIN_S = 0.3
+SCROLL_MICRO_PAUSE_MAX_S = 1.8
+
+# Temps de "lecture / réflexion" après chargement d'un groupe ou d'un batch de posts.
+TEMPS_LECTURE_MIN_S = 8.0
+TEMPS_LECTURE_MAX_S = 35.0
+
+# Pause entre deux groupes consécutifs du même lot (batch).
 PAUSE_ENTRE_GROUPES_MIN_S = 600.0  # 10 minutes
 PAUSE_ENTRE_GROUPES_MAX_S = 900.0  # 15 minutes
 
-# Pause entre deux LOTS (batches) de groupes - AUGMENTÉE le 2026-08-15 de
-# 15-45s à 20-30 MINUTES, même contexte que ci-dessus.
+# Pause entre deux LOTS (batches) de groupes.
 PAUSE_ENTRE_BATCHES_MIN_S = 1200.0  # 20 minutes
 PAUSE_ENTRE_BATCHES_MAX_S = 1800.0  # 30 minutes
 
@@ -642,23 +660,12 @@ MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives s
 # infini dans deux cas limites : (1) le post-repère a été supprimé entre-temps
 # par son auteur et ne sera donc jamais retrouvé, (2) tout premier run sur un
 # groupe (aucun repère encore connu). Fixé à 100 (valeur choisie par
-# l'utilisateur le 2026-08-15) - avant, c'était le mécanisme d'arrêt PRINCIPAL
-# sur un groupe très actif, donc une valeur basse (60) était plus prudente ;
-# maintenant que ce n'est plus qu'un filet de secours, cette valeur ne coûte
-# rien la plupart du temps (on s'arrête bien avant, dès que le repère est
-# retrouvé) tout en couvrant un rattrapage raisonnable si le repère est
-# introuvable.
+# l'utilisateur le 2026-08-15).
 MAX_PAGES_ABSOLU = 100
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
 # les réponses réseau déclenchées par le scroll et y chercher des posts).
-# INCERTITUDE ASSUMÉE : ce pattern (`/api/graphql/`) est celui documenté
-# publiquement par la communauté pour Facebook web, non vérifié en conditions
-# réelles depuis mon environnement (pas d'accès réseau). Si le scroll ne
-# ramène jamais de nouveau post en conditions réelles alors que le compte a
-# clairement plus de contenu, ce pattern est le premier suspect à vérifier
-# (ouvrir les DevTools > Network > filtrer "graphql" pendant un scroll réel).
 GRAPHQL_URL_FRAGMENTS = ["/api/graphql/"]
 
 # Profondeur maximale de parcours récursif d'un blob JSON à la recherche de
@@ -667,10 +674,7 @@ GRAPHQL_URL_FRAGMENTS = ["/api/graphql/"]
 JSON_PROFONDEUR_MAX = 12
 
 # Nombre d'échantillons bruts de réponses GraphQL matchées à conserver pour
-# diagnostic quand un groupe termine son scroll sans avoir trouvé aucun post
-# (voir `_sauvegarder_echantillons_graphql_debug` dans scraper.py) - juste de
-# quoi inspecter manuellement ce que Facebook renvoie réellement, sans saturer
-# le disque sur un run avec des centaines de réponses matchées.
+# diagnostic quand un groupe termine son scroll sans avoir trouvé aucun post.
 NB_ECHANTILLONS_DEBUG_GRAPHQL = 3
 
 # --------------------------------------------------------------------------- #
@@ -690,42 +694,11 @@ NB_ECHANTILLONS_DEBUG_GRAPHQL = 3
 COOLDOWN_HEURES_APRES_BLOCAGE = 24
 COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 1  # probablement juste les cookies à renouveler, pas un blocage actif
 
-# Durée maximale d'un run, tous groupes confondus. Une session de scraping qui
-# tourne des heures d'affilée est un signal comportemental fort ; mieux vaut
-# couper proprement (les groupes restants seront traités au run suivant) que
-# de pousser un run interminable.
-#
-# RÉAJUSTÉ le 2026-08-15 (300 min) suite au passage à un cron fixe 00h/12h
-# traitant TOUS les groupes en un seul run, AVEC des pauses volontairement
-# longues entre eux (10-15 min/groupe, 20-30 min/lot de 5 - voir
-# PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_* ci-dessous). Plafonné à 300
-# (pas plus) à cause d'une limite DURE de GitHub Actions : un job sur un
-# runner hébergé ne peut jamais dépasser 6h (360 min), quelle que soit la
-# valeur de `timeout-minutes` dans le workflow - infranchissable. Les 60
-# minutes de marge restantes (360-300) couvrent le reste du run (checkout,
-# installation des dépendances, jitter anti-empreinte, structuration LLM
-# après le scraping, sauvegarde PostgreSQL, upload) - voir
-# daily_scraper.yml pour le détail de ces étapes.
-#
-# CE PLAFOND EST SERRÉ avec ~13 groupes actifs et ces pauses longues (voir le
-# calcul détaillé dans daily_scraper.yml) : à surveiller impérativement sur
-# les premiers runs réels via le log "Budget de session atteint" dans
-# scraper.py. S'il apparaît régulièrement avant la fin de tous les groupes,
-# il faut réduire le nombre de groupes actifs, ou raccourcir
-# PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*, plutôt que remonter cette
-# valeur au-delà de ~300-320 (la marge de 360 min étant déjà comptée au plus
-# juste).
+# Durée maximale d'un run, tous groupes confondus.
 SESSION_DUREE_MAX_MINUTES = 300
 
 # --------------------------------------------------------------------------- #
-# Throttle adaptatif (AIMD) : ajuste automatiquement délais et volume selon
-# l'historique récent, plutôt que d'appliquer toujours les mêmes réglages.
-# Logique "additive increase / multiplicative decrease" - le même principe que
-# le contrôle de congestion TCP : on ralentit fort et vite au moindre signal
-# de suspicion, on ré-accélère lentement seulement après plusieurs runs propres
-# consécutifs. C'est un throttle défensif auto-régulé, pas une technique
-# d'évasion : il ne cherche jamais à déjouer Facebook, seulement à réduire le
-# volume/rythme de lui-même quand quelque chose semble anormal.
+# Throttle adaptatif (AIMD)
 # --------------------------------------------------------------------------- #
 
 NIVEAU_CONFIANCE_MIN = 0.2
@@ -767,9 +740,6 @@ TYPES_BIEN_VALIDES = ["parcelle", "maison", "villa", "ferme", "autre"]
 # propriétés doivent figurer dans "required" (l'optionnalité se représente
 # par un type nullable `["string", "null"]`, pas par absence de la clé), et
 # "additionalProperties": false est obligatoire à chaque niveau d'objet.
-# Le schéma "métier" ci-dessous respectait déjà ces deux contraintes par
-# hasard (hérité du format Anthropic) - seul "additionalProperties" a été
-# ajouté, et l'enveloppe externe (name/strict/schema) a changé de forme.
 SCHEMA_ANNONCE_PROPRIETES = {
     "est_une_annonce_valide": {
         "type": "boolean",
