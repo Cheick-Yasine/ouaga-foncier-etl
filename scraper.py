@@ -893,25 +893,31 @@ async def _sauvegarder_html_debug(page: Page, groupe_id: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 
 
-def charger_seen_ids() -> dict[str, str]:
-    """Charge {post_id: date_iso_vu} pour dédupliquer entre exécutions."""
-    if not config.SEEN_IDS_PATH.exists():
+def charger_seen_ids(compte: str | None = None) -> dict[str, str]:
+    """Charge {post_id: date_iso_vu} depuis l'état persistant du compte."""
+    chemin = config.seen_ids_path(compte)
+    if not chemin.exists():
         return {}
     try:
-        with config.SEEN_IDS_PATH.open(encoding="utf-8") as f:
+        with chemin.open(encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning(
             "Impossible de lire %s (%s) - repart d'un état vide.",
-            config.SEEN_IDS_PATH,
+            chemin,
             exc,
         )
         return {}
 
 
-def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> None:
-    """Sauvegarde l'état de déduplication, en purgeant les entrées trop anciennes
-    pour éviter une croissance illimitée du fichier au fil des runs quotidiens.
+def sauvegarder_seen_ids(
+    seen: dict[str, str],
+    retention_jours: int = 90,
+    compte: str | None = None,
+) -> None:
+    """Sauvegarde la déduplication dans l'état persistant du compte.
+
+    Les entrées anciennes sont purgées pour éviter une croissance illimitée.
     """
     seuil = datetime.now(timezone.utc) - timedelta(days=retention_jours)
     purge: dict[str, str] = {}
@@ -922,7 +928,9 @@ def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> Non
         except ValueError:
             purge[post_id] = date_str  # date illisible : on garde par précaution
 
-    with config.SEEN_IDS_PATH.open("w", encoding="utf-8") as f:
+    chemin = config.seen_ids_path(compte)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with chemin.open("w", encoding="utf-8") as f:
         json.dump(purge, f, ensure_ascii=False, indent=2)
 
 
@@ -1591,7 +1599,7 @@ async def executer_scraping(
             proxy["server"],
         )
 
-    seen_ids = charger_seen_ids()
+    seen_ids = charger_seen_ids(compte)
     reperes_dernier_post = charger_dernier_post_connu(compte)
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
@@ -1689,7 +1697,7 @@ async def executer_scraping(
                             sauvegarder_posts_groupe(posts, groupe.id)
                         )
                     sauvegarder_seen_ids(
-                        seen_ids
+                        seen_ids, compte=compte
                     )  # sauvegarde après CHAQUE groupe (résilience coupure)
                     sauvegarder_dernier_post_connu(
                         reperes_dernier_post, compte
