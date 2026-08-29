@@ -159,6 +159,12 @@ class TestMajSecretGithub:
 
 
 class TestMainCli:
+    def test_refuse_de_vider_le_cache_sans_confirmation_forcee(self, tmp_path):
+        with pytest.raises(SystemExit):
+            maj_cookies.main(
+                [str(tmp_path / "export.json"), "--clear-actions-cache"]
+            )
+
     def test_fichier_introuvable_sort_en_erreur(self, tmp_path, capsys):
         with pytest.raises(SystemExit):
             maj_cookies.main([str(tmp_path / "absent.json")])

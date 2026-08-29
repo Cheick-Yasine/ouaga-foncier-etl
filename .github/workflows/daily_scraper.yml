@@ -1,29 +1,21 @@
 name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
+  pull_request:
+    branches: [main]
   schedule:
-    # Deux horaires fixes par jour : 00h00 et 12h00 UTC (demande explicite de
-    # l'utilisateur). Chaque job matriciel traite TOUS les groupes actifs DE
-    # SON COMPTE d'affilée, un par un, avec des pauses volontairement longues
-    # entre eux (10-15 min entre deux groupes, 20-30 min entre deux lots de 5
-    # - voir config.PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*). Le
-    # rattrapage complet par groupe est garanti par le mécanisme de
-    # "post-repère" (voir DERNIER_POST_CONNU_PATH dans config.py), pas par
-    # l'espacement des runs - celui-ci ne sert qu'à limiter le rythme
-    # d'activité de chaque session vis-à-vis de Facebook.
-    #
-    # Limite GitHub Actions (6h/360min par job, infranchissable même en
-    # augmentant timeout-minutes) : depuis le passage multi-comptes du
-    # 2026-08-26, un job ne traite plus ~21 groupes mais seulement les ~5 de
-    # son compte, soit 50-75 minutes de pauses inter-groupes, très en deçà de
-    # la limite (contre 140-210 min avec ~13 groupes sur un compte unique -
-    # d'où ce garde-fou à l'origine). À resurveiller (log "Budget de session
-    # atteint" dans scraper.py) si des groupes sont réassignés au point qu'un
-    # compte en concentre nettement plus que les autres.
-    - cron: "0 0 * * *"
-    - cron: "0 12 * * *"
+    # Les expressions cron restent nécessairement statiques. Les minutes 17 et
+    # 41 peuvent être modifiées manuellement ; le véritable décalage aléatoire
+    # est appliqué au démarrage par le step de délai 0-30 min ci-dessous.
+    - cron: "17 0 * * *"
+    - cron: "41 12 * * *"
   workflow_dispatch:
     inputs:
+      compte:
+        description: "Compte à tester (all = les cinq comptes)"
+        type: choice
+        options: [all, "1", "2", "3", "4", "5"]
+        default: all
       mode:
         description: "Mode d'exécution"
         type: choice
@@ -53,29 +45,10 @@ on:
 permissions:
   contents: read
 
-# PAS de `concurrency` global ici (contrairement à la version mono-compte) :
-# la sérialisation se fait maintenant PAR COMPTE, dans le job matriciel
-# ci-dessous (`group: ouaga-foncier-etl-compte-${{ matrix.compte }}`) - deux
-# comptes différents ont des cookies/sessions totalement indépendants et
-# n'ont donc AUCUNE raison de s'attendre l'un l'autre ; seuls deux runs sur
-# LE MÊME compte doivent rester exclusifs entre eux (même logique qu'avant :
-# deux scrapes concurrents sur la même session Facebook multiplieraient le
-# risque de détection anti-bot).
-
 jobs:
-  # Job séparé et bloquant : si la suite de tests échoue (régression sur les
-  # regex, le parseur d'horodatage, le throttle adaptatif, etc.), le job de
-  # scraping ne démarre même pas. Sans ce garde-fou, la première victime d'un
-  # bug serait un run réel contre Facebook - gaspillé, ou pire, faussement
-  # remonté comme un blocage anti-bot.
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Service Postgres éphémère, propre à ce job, entièrement indépendant de la
-    # base maître de production (voir DATABASE_URL plus bas). Sert uniquement
-    # à exécuter les tests de tests/test_processor_db.py contre un vrai serveur
-    # PostgreSQL plutôt que des mocks - conformément à la même logique déjà
-    # appliquée aux autres modules (regex, parseur d'horodatage, throttle...).
     services:
       postgres:
         image: postgres:16
@@ -97,7 +70,6 @@ jobs:
       - name: "Configuration Python"
         uses: actions/setup-python@v5
         with:
-          # Version tranchée à 3.12.7 (confirmée pour la CI et l'exécution)
           python-version: "3.12.7"
           cache: "pip"
           cache-dependency-path: requirements.txt
@@ -111,32 +83,14 @@ jobs:
         run: pytest -q
 
   scrape-and-process:
+    if: github.event_name != 'pull_request'
     needs: tests
     runs-on: ubuntu-latest
-    # MULTI-COMPTES (2026-08-26, voir README.md section "Multi-comptes") : un
-    # job PAR COMPTE Facebook (1 à 5), chacun avec ses propres cookies (secret
-    # FB_COOKIES_JSON_<compte>), son propre état persistant (cache isolé par
-    # compte ci-dessous) et UNIQUEMENT les groupes de groups.csv qui lui sont
-    # assignés (colonne `compte`, ~4-5 groupes/compte au lieu de ~21 sur un
-    # seul compte auparavant). `fail-fast: false` : un compte bloqué/en
-    # cooldown ne doit JAMAIS annuler les 4 autres, qui n'ont rien à voir avec
-    # ce qui a déclenché le blocage sur celui-là.
     strategy:
       fail-fast: false
       matrix:
-        compte: ["1", "2", "3", "4", "5"]
-    # 360 = LE MAXIMUM ABSOLU pour un runner hébergé GitHub (limite dure, non
-    # contournable même avec une valeur plus élevée ici - un job est tué
-    # d'office à 6h). Voir SESSION_DUREE_MAX_MINUTES dans config.py (plafonné
-    # à 300 pour laisser 60 min de marge aux étapes hors scraping) - large
-    # marge désormais avec seulement ~4-5 groupes par compte (contre ~21
-    # auparavant sur le compte unique).
+        compte: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.compte != 'all' && format('["{0}"]', inputs.compte) || '["1","2","3","4","5"]') }}
     timeout-minutes: 360
-    # Sérialisation PAR COMPTE (voir note sur `concurrency` en tête de
-    # fichier) : deux runs concurrents sur LE MÊME compte partageraient la
-    # même session Facebook, ce qui multiplierait le risque de détection.
-    # Deux comptes différents (ex: 1 et 2) n'ont en revanche aucune raison de
-    # s'attendre : sessions, cookies et groupes cibles totalement distincts.
     concurrency:
       group: ouaga-foncier-etl-compte-${{ matrix.compte }}
       cancel-in-progress: false
@@ -147,7 +101,6 @@ jobs:
       - name: "Configuration Python"
         uses: actions/setup-python@v5
         with:
-          # Version tranchée à 3.12.7 (confirmée pour la CI et l'exécution)
           python-version: "3.12.7"
           cache: "pip"
           cache-dependency-path: requirements.txt
@@ -158,20 +111,6 @@ jobs:
       - name: "Installation de Chromium (Playwright)"
         run: playwright install --with-deps chromium
 
-      # État persistant entre deux runs : storage_state (localStorage, pour un
-      # fingerprint de navigateur cohérent d'un jour à l'autre plutôt qu'un
-      # navigateur "neuf" à chaque fois), déduplication des posts déjà vus,
-      # cooldown anti-blocage et score de confiance du throttle adaptatif.
-      # Clé unique par run + restore-keys en préfixe : c'est le pattern
-      # standard pour "toujours restaurer le plus récent, toujours sauvegarder
-      # le nouveau" avec actions/cache (une clé exacte n'est jamais réécrite
-      # une fois créée).
-      # Clé et préfixe de restauration incluant le compte (`compte_${{
-      # matrix.compte }}` correspond au sous-répertoire data/state/compte_N/
-      # créé par config.py) : sans ça, les 5 jobs matriciels restaureraient/
-      # écraseraient TOUS le même cache, mélangeant cookies, cooldown et score
-      # de confiance entre comptes qui n'ont rien à voir les uns avec les
-      # autres.
       - name: "Restauration de l'état persistant (data/state/compte_<n>)"
         uses: actions/cache/restore@v4
         with:
@@ -180,13 +119,9 @@ jobs:
           restore-keys: |
             etat-scraper-compte-${{ matrix.compte }}-
 
-      # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
-      # pour que le run ne démarre jamais à un horaire parfaitement fixe et
-      # prévisible (ex: toujours 00:05:00 pile). Pas de jitter en déclenchement
-      # manuel (l'utilisateur attend un retour rapide).
       - name: "Délai aléatoire avant démarrage (cron uniquement)"
         if: github.event_name == 'schedule'
-        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes
+        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes (jitter permanent)
 
       - name: "Résolution des paramètres d'exécution"
         id: params
@@ -210,38 +145,32 @@ jobs:
 
       - name: "Exécution du pipeline ETL"
         env:
-          # Un secret par compte (FB_COOKIES_JSON_1 .. FB_COOKIES_JSON_5, à
-          # créer dans Settings -> Secrets and variables -> Actions - voir
-          # README.md section "Multi-comptes") - `--compte` ci-dessous
-          # sélectionne lequel main.py lit réellement pour CE job matriciel
-          # (config.nom_secret_cookies). Les 5 sont injectés systématiquement
-          # (variables d'env inertes pour les 4 non utilisées par ce job) car
-          # GitHub Actions n'autorise pas d'indexer `secrets` avec un nom
-          # construit dynamiquement à partir de `matrix.compte`.
           FB_COOKIES_JSON_1: ${{ secrets.FB_COOKIES_JSON_1 }}
           FB_COOKIES_JSON_2: ${{ secrets.FB_COOKIES_JSON_2 }}
           FB_COOKIES_JSON_3: ${{ secrets.FB_COOKIES_JSON_3 }}
           FB_COOKIES_JSON_4: ${{ secrets.FB_COOKIES_JSON_4 }}
           FB_COOKIES_JSON_5: ${{ secrets.FB_COOKIES_JSON_5 }}
-          # Proxy OPTIONNEL par compte (voir README.md, section "Proxy
-          # (réputation IP/ASN)" et config.proxy_playwright) : un secret
-          # absent/vide -> `config.proxy_playwright` retourne None -> le job
-          # tourne exactement comme avant, sans proxy, sur l'IP du runner.
-          # Même contrainte qu'au-dessus pour FB_COOKIES_JSON_<n> : les 5 sont
-          # injectés systématiquement (inertes pour les 4 comptes non
-          # concernés par ce job), GitHub Actions n'autorisant pas d'indexer
-          # `secrets` avec un nom construit dynamiquement.
           PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
           PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
           PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
           PROXY_URL_4: ${{ secrets.PROXY_URL_4 }}
           PROXY_URL_5: ${{ secrets.PROXY_URL_5 }}
+          PROXY_COUNTRY_1: ${{ vars.PROXY_COUNTRY_1 || 'FR' }}
+          PROXY_COUNTRY_2: ${{ vars.PROXY_COUNTRY_2 }}
+          PROXY_COUNTRY_3: ${{ vars.PROXY_COUNTRY_3 }}
+          PROXY_COUNTRY_4: ${{ vars.PROXY_COUNTRY_4 }}
+          PROXY_COUNTRY_5: ${{ vars.PROXY_COUNTRY_5 }}
+          BROWSER_LOCALE_1: ${{ vars.BROWSER_LOCALE_1 || 'fr-FR' }}
+          BROWSER_LOCALE_2: ${{ vars.BROWSER_LOCALE_2 }}
+          BROWSER_LOCALE_3: ${{ vars.BROWSER_LOCALE_3 }}
+          BROWSER_LOCALE_4: ${{ vars.BROWSER_LOCALE_4 }}
+          BROWSER_LOCALE_5: ${{ vars.BROWSER_LOCALE_5 }}
+          BROWSER_TIMEZONE_1: ${{ vars.BROWSER_TIMEZONE_1 || 'Europe/Paris' }}
+          BROWSER_TIMEZONE_2: ${{ vars.BROWSER_TIMEZONE_2 }}
+          BROWSER_TIMEZONE_3: ${{ vars.BROWSER_TIMEZONE_3 }}
+          BROWSER_TIMEZONE_4: ${{ vars.BROWSER_TIMEZONE_4 }}
+          BROWSER_TIMEZONE_5: ${{ vars.BROWSER_TIMEZONE_5 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
-          # README.md, section "Base de données", pour le dimensionnement et
-          # les étapes de configuration du secret. PARTAGÉE entre les 5
-          # comptes (upsert par id de post - source de vérité unique, quel
-          # que soit le compte qui a scrapé un post donné).
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           ARGS=(
@@ -256,32 +185,10 @@ jobs:
           fi
           python main.py "${ARGS[@]}"
 
-      # Installe un pg_dump compatible avec la version serveur de Neon. BUG
-      # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
-      # préinstallé sur ubuntu-latest refusait de dumper le serveur Neon en
-      # PostgreSQL 18.4 ("server version mismatch"), silencieusement avalé
-      # par le `|| true` de l'étape suivante - la sauvegarde SQL ne s'est
-      # donc JAMAIS produite jusqu'ici, sans faire échouer le job. Méthode
-      # d'installation officielle PGDG (dépôt apt.postgresql.org) plutôt
-      # qu'une gestion manuelle de clé/sources.list.
       - name: "Installer pg_dump compatible avec la version PostgreSQL de Neon"
         if: always()
-        # continue-on-error : cette étape est une sauvegarde OPTIONNELLE, pas
-        # le cœur du pipeline (scraping + insertion en base déjà faits avant).
-        # Un échec ici (verrou apt, dépôt PGDG temporairement indisponible,
-        # etc.) ne doit jamais faire échouer tout le run dans l'interface
-        # GitHub - ce qui masquerait à tort un scraping par ailleurs réussi.
         continue-on-error: true
         run: |
-          # Attente du déverrouillage d'apt avant toute tentative - un
-          # processus système en arrière-plan (souvent unattended-upgrades,
-          # lancé automatiquement au démarrage du runner) peut détenir le
-          # verrou /var/lib/apt/lists/lock pendant quelques dizaines de
-          # secondes. ÉCHEC RÉEL CONSTATÉ (2026-08-17) : "Could not get lock
-          # ... held by process ...", faisant échouer tout le run malgré un
-          # scraping/traitement par ailleurs réussi - ce correctif attend
-          # jusqu'à 2 minutes (24 x 5s) que le verrou se libère avant
-          # d'abandonner, au lieu d'échouer immédiatement au premier essai.
           attendre_deverrouillage_apt() {
             for _ in $(seq 1 24); do
               if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
@@ -301,26 +208,8 @@ jobs:
           attendre_deverrouillage_apt
           sudo apt-get install -y postgresql-client-18
 
-      # Sauvegarde ponctuelle de la base maître dans l'artefact du run, en plus
-      # de la base PostgreSQL elle-même (qui reste la source de vérité). Utile
-      # pour retrouver un état antérieur sans dépendre de la politique de
-      # sauvegarde de l'hébergeur Postgres choisi.
-      #
-      # ÉCHEC CONFIRMÉ du premier essai (run 30714569155, 2026-08-01) : après
-      # installation de postgresql-client-18 ci-dessus, l'appel nu à `pg_dump`
-      # utilisait TOUJOURS le binaire 16.14 ("server version mismatch"
-      # identique). Cause : sur ce runner, `/usr/bin/pg_dump` n'est pas géré
-      # par le système d'alternatives de postgresql-common (seul `psql` l'est,
-      # confirmé dans les logs de l'étape précédente - "using .../18/.../
-      # psql.1.gz ... in auto mode", rien d'équivalent pour pg_dump). On
-      # appelle donc directement le binaire versionné installé par le paquet
-      # `postgresql-client-18` (chemin standard Debian/Ubuntu), avec repli
-      # explicite (+ avertissement visible) sur `pg_dump` générique si ce
-      # chemin venait à changer.
       - name: "Sauvegarde SQL de la base maître (pg_dump)"
         if: always()
-        # Même logique que l'étape précédente : sauvegarde optionnelle, ne
-        # doit jamais faire échouer tout le run.
         continue-on-error: true
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -334,13 +223,9 @@ jobs:
           "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
 
       - name: "Upload de l'artefact (dump base maître, Excel, CSV du run, logs)"
-        if: always()  # même en cas d'échec partiel, on récupère les données déjà collectées
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Nom incluant le compte : `github.run_id` est PARTAGÉ par les 5
-          # jobs de la matrice (c'est le même run de workflow) - sans le
-          # suffixe compte, les 5 uploads entreraient en collision sur un nom
-          # d'artefact identique et 4 des 5 échoueraient.
           name: "annonces-foncieres-compte-${{ matrix.compte }}-${{ github.run_id }}"
           path: |
             data/processed/annonces_backup.sql
@@ -354,7 +239,7 @@ jobs:
           if-no-files-found: warn
 
       - name: "Sauvegarde de l'état persistant pour le prochain run"
-        if: always()  # même si le run a été coupé par un cooldown/blocage, l'état doit être conservé
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: data/state/compte_${{ matrix.compte }}

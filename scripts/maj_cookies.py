@@ -18,9 +18,9 @@ prochain run les utilise vraiment" :
    `scraper._charger_cookies_caches` -, donc le laisser en place ferait
    ignorer silencieusement les cookies fraîchement fournis ici. Voir aussi
    `scraper.invalider_storage_state`, qui fait la même purge côté run).
-4. Optionnel (--clear-actions-cache) : supprime aussi le cache GitHub Actions
-   `etat-scraper-*`, qui contient la même chose côté CI, pour ne pas attendre
-   qu'il expire ou soit écrasé naturellement.
+4. La suppression du cache Actions est protégée : ce cache contient aussi
+   `seen_post_ids.json`. Elle exige deux options explicites afin d'éviter de
+   réexporter accidentellement des publications déjà traitées.
 
 Usage :
     python scripts/maj_cookies.py --interactive --repo owner/repo --compte 1 --set-secret
@@ -261,7 +261,18 @@ def main(argv: list[str] | None = None) -> int:
     parseur.add_argument(
         "--clear-actions-cache",
         action="store_true",
-        help="Supprime aussi le cache GitHub Actions data/state (etat-scraper-*).",
+        help=(
+            "Demande la suppression du cache GitHub Actions. Dangereux : ce "
+            "cache contient aussi l'historique des posts déjà vus."
+        ),
+    )
+    parseur.add_argument(
+        "--force-clear-actions-cache",
+        action="store_true",
+        help=(
+            "Confirme explicitement la perte possible de seen_post_ids ; "
+            "requis avec --clear-actions-cache."
+        ),
     )
     parseur.add_argument(
         "--no-purge-etat-local",
@@ -281,6 +292,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parseur.parse_args(argv)
+
+    if args.clear_actions_cache and not args.force_clear_actions_cache:
+        parseur.error(
+            "--clear-actions-cache peut supprimer seen_post_ids.json. "
+            "Ajoutez --force-clear-actions-cache uniquement si cette perte "
+            "d'historique est volontaire."
+        )
 
     if args.interactive == (args.export is not None):
         parseur.error("Choisissez exactement une source : --interactive OU un fichier d'export.")
