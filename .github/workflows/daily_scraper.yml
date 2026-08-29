@@ -11,6 +11,11 @@ on:
     - cron: "41 12 * * *"
   workflow_dispatch:
     inputs:
+      compte:
+        description: "Compte à tester (all = les cinq comptes)"
+        type: choice
+        options: [all, "1", "2", "3", "4", "5"]
+        default: all
       mode:
         description: "Mode d'exécution"
         type: choice
@@ -84,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compte: ["1", "2", "3", "4", "5"]
+        compte: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.compte != 'all' && format('["{0}"]', inputs.compte) || '["1","2","3","4","5"]') }}
     timeout-minutes: 360
     concurrency:
       group: ouaga-foncier-etl-compte-${{ matrix.compte }}

@@ -24,6 +24,8 @@ Deux modes d'exécution (`--mode`) :
 - `daily` : dernières 24h (`--days-back 1`), déclenché deux fois par jour par les crons statiques `00:17` et `12:41` UTC, puis retardé de 0 à 30 minutes. Les minutes du cron ne sont pas aléatoires automatiquement ; elles peuvent seulement être changées manuellement dans le workflow.
 - `backfill` : rattrapage historique, `--days-back` réglable (déclenchement manuel uniquement, `workflow_dispatch`).
 
+Le déclenchement manuel propose aussi `compte=all|1|2|3|4|5`. Pour un premier test réel, choisir un seul compte, `group_limit=1` et `days_back=1` ; les quatre autres jobs ne sont alors pas créés.
+
 Deux stratégies de répartition des groupes au sein d'un run :
 - **Par défaut** : tous les groupes actifs (du compte concerné) sont traités d'affilée dans la même session, avec des pauses longues entre eux (voir "Stratégie anti-blocage").
 - **`--round-robin --groups-per-run N`** : seuls N groupes sont traités à ce run, en rotation (index persistant, isolé par compte). Pensé pour un cron fréquent : l'espacement entre deux passages sur un même groupe vient alors de l'espacement entre les runs, pas d'une pause interne. Exposé aussi en déclenchement manuel (`round_robin`, `groups_per_run`).
