@@ -90,7 +90,10 @@ def capturer_session_interactive() -> str:
 
     print(
         "\nChromium va s'ouvrir. Connectez-vous vous-même au BON compte Facebook, "
-        "terminez la 2FA ou toute vérification éventuelle, puis revenez ici."
+        "terminez la 2FA ou toute vérification éventuelle, puis revenez ici.\n"
+        "IMPORTANT : ne cliquez jamais sur « Se déconnecter » après la capture. "
+        "Le script fermera lui-même ce navigateur et le prochain compte "
+        "s'ouvrira dans un contexte vierge."
     )
     with sync_playwright() as playwright:
         navigateur = playwright.chromium.launch(headless=False)
@@ -101,7 +104,10 @@ def capturer_session_interactive() -> str:
         try:
             page = contexte.new_page()
             page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
-            input("Appuyez sur Entrée uniquement lorsque l'accueil Facebook connecté est visible...")
+            input(
+                "Appuyez sur Entrée lorsque l'accueil Facebook connecté est visible "
+                "(sans vous déconnecter ensuite)..."
+            )
             return valider_cookies_captures(contexte.cookies())
         finally:
             contexte.close()
