@@ -41,6 +41,23 @@ def _export_valide() -> str:
     ])
 
 
+class TestCaptureInteractive:
+    def test_valide_et_filtre_les_cookies_facebook(self):
+        cookies = json.loads(_export_valide()) + [
+            {"name": "autre", "value": "secret", "domain": ".example.com"}
+        ]
+
+        resultat = json.loads(maj_cookies.valider_cookies_captures(cookies))
+
+        assert {cookie["name"] for cookie in resultat} == {"c_user", "xs"}
+
+    def test_refuse_une_connexion_non_terminee(self):
+        with pytest.raises(ValueError, match="c_user"):
+            maj_cookies.valider_cookies_captures(
+                [{"name": "xs", "value": "v", "domain": ".facebook.com"}]
+            )
+
+
 class TestValiderExport:
     def test_export_valide_retourne_le_json_brut_recompacte(self, tmp_path):
         brut = _export_valide()
@@ -185,3 +202,36 @@ class TestMainCli:
         maj_cookies.main([str(chemin), "--no-purge-etat-local"])
 
         assert config.COOLDOWN_PATH.exists()
+
+    def test_mode_interactif_capture_et_cible_le_bon_compte(
+        self, repertoires_isoles, monkeypatch
+    ):
+        appels = []
+        monkeypatch.setattr(maj_cookies, "capturer_session_interactive", _export_valide)
+        monkeypatch.setattr(maj_cookies.shutil, "which", lambda _: "/usr/bin/gh")
+        monkeypatch.setattr(
+            maj_cookies,
+            "maj_secret_github",
+            lambda repo, cookies, appliquer, compte=None: appels.append(
+                (repo, json.loads(cookies), appliquer, compte)
+            ),
+        )
+
+        code = maj_cookies.main([
+            "--interactive", "--repo", "owner/repo", "--compte", "4", "--set-secret"
+        ])
+
+        assert code == 0
+        assert appels[0][0] == "owner/repo"
+        assert appels[0][2:] == (True, "4")
+
+    def test_exige_une_source_unique(self):
+        with pytest.raises(SystemExit):
+            maj_cookies.main([])
+        with pytest.raises(SystemExit):
+            maj_cookies.main(["export.json", "--interactive"])
+
+    def test_mode_interactif_exige_set_secret(self, monkeypatch):
+        monkeypatch.setattr(maj_cookies.shutil, "which", lambda _: "/usr/bin/gh")
+        with pytest.raises(SystemExit):
+            maj_cookies.main(["--interactive"])

@@ -81,7 +81,47 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
 
 ## Session expirée : recharger les cookies sans bloquer le pipeline
 
-Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret de cookies du compte concerné soit régénéré à la main.
+Quand Facebook invalide la session (`SessionExpireeError`), le run s'arrête et un cooldown d'1h se déclenche (`config.COOLDOWN_HEURES_APRES_SESSION_EXPIREE`) en attendant que le secret de cookies du compte concerné soit régénéré.
+
+### Méthode recommandée sous Windows : connexion interactive
+
+Cette méthode n'enregistre jamais le mot de passe ni le code 2FA. Elle ouvre
+Chromium visiblement, vous laisse effectuer vous-même la connexion, capture
+les cookies une fois l'accueil connecté visible, puis les transmet au secret
+GitHub par l'entrée standard de `gh` (ils ne figurent donc pas dans la ligne de
+commande).
+
+Dans PowerShell, une seule fois :
+
+```powershell
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+gh auth login
+```
+
+Puis, pour renouveler par exemple le compte 1 :
+
+```powershell
+python scripts/maj_cookies.py --interactive --repo Cheick-Yasine/ouaga-foncier-etl --compte 1 --set-secret
+```
+
+Connectez-vous au compte demandé dans la fenêtre Chromium et terminez toute
+2FA/vérification manuellement. N'appuyez sur Entrée dans PowerShell qu'une fois
+l'accueil Facebook connecté visible. Répétez la commande avec `--compte 2`,
+`3`, `4` puis `5`, en vérifiant soigneusement le compte ouvert à chaque fois.
+
+> **Important : ne cliquez pas sur « Se déconnecter » après la capture.**
+> Une déconnexion peut révoquer les cookies qui viennent d'être enregistrés.
+> Appuyez simplement sur Entrée : le script capture la session puis ferme
+> Chromium. La commande suivante crée automatiquement un contexte navigateur
+> vierge pour le compte suivant ; aucune session locale du compte précédent
+> n'y est réutilisée.
+
+Cette procédure simplifie la capture, mais ne peut pas renouveler une session
+révoquée sans reconnexion humaine. Si un cooldown vient d'être sauvegardé par
+le dernier run, attendez sa fin avant de relancer le workflow.
+
+### Méthode alternative : export Cookie-Editor
 
 Pour régénérer : ouvrir `web.facebook.com` connecté sur le compte dédié au scraping, exporter les cookies avec une extension type [Cookie-Editor](https://cookie-editor.com/) (format JSON brut, sans les modifier), puis lancer :
 
@@ -117,7 +157,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
 - Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`), chacun a son propre cache d'état (`etat-scraper-compte-<n>-*`) et son propre artefact (`annonces-foncieres-compte-<n>-*`).
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
-- `data/state/seen_post_ids.json` (déduplication des posts déjà vus) reste lui aussi **global**, volontairement non isolé par compte — un post public déjà vu par un compte n'a pas besoin d'être re-scrapé/re-structuré par un autre.
+- `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
 **Répartition actuelle** (`groups.csv`) : 25 entrées, exactement 5 par compte. Les deux seules entrées `actif=false` (`1412949025757240`, `352566539534344`) sont toutes les deux assignées au **compte 3**, qui ne traite donc que **3 groupes actifs** contre 5 pour les quatre autres comptes. Ce n'est pas un bug (le filtrage `actif`/`compte` fonctionne comme prévu) mais un déséquilibre de charge : à rééquilibrer en réassignant deux groupes vers le compte 3 si l'on veut une répartition réellement homogène.
 
