@@ -110,6 +110,13 @@ Connectez-vous au compte demandé dans la fenêtre Chromium et terminez toute
 l'accueil Facebook connecté visible. Répétez la commande avec `--compte 2`,
 `3`, `4` puis `5`, en vérifiant soigneusement le compte ouvert à chaque fois.
 
+> **Important : ne cliquez pas sur « Se déconnecter » après la capture.**
+> Une déconnexion peut révoquer les cookies qui viennent d'être enregistrés.
+> Appuyez simplement sur Entrée : le script capture la session puis ferme
+> Chromium. La commande suivante crée automatiquement un contexte navigateur
+> vierge pour le compte suivant ; aucune session locale du compte précédent
+> n'y est réutilisée.
+
 Cette procédure simplifie la capture, mais ne peut pas renouveler une session
 révoquée sans reconnexion humaine. Si un cooldown vient d'être sauvegardé par
 le dernier run, attendez sa fin avant de relancer le workflow.
