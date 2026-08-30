@@ -75,9 +75,9 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
     http://hote:port                          # proxy sans authentification
     socks5://utilisateur:motdepasse@hote:port  # Playwright supporte aussi SOCKS5
     ```
-  - En mode multi-comptes, `PROXY_URL_<n>` est obligatoire. Une valeur absente ou invalide arrête clairement le job concerné au lieu de le laisser sortir silencieusement par l'IP GitHub. Le mode mono-compte historique conserve un proxy optionnel.
+  - En mode `proxy`, `PROXY_URL_<n>` est obligatoire. En mode `direct`, réservé au runner auto-hébergé, le workflow injecte `ALLOW_DIRECT_CONNECTION=true` et laisse volontairement les URL de proxy vides.
   - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
-  - En CI : créer les secrets `PROXY_URL_1`…`PROXY_URL_5` (Settings → Secrets and variables → Actions) — idéalement un proxy **distinct par compte**, pour que chacun des 5 comptes conserve une IP de sortie cohérente d'un run à l'autre (comme un vrai navigateur qui revient), plutôt que 5 comptes partageant une même IP proxy, qui reconstituerait le même signal de risque à une autre échelle. Le workflow (`daily_scraper.yml`) injecte déjà ces 5 secrets vers le job matriciel correspondant.
+  - En CI : les secrets `PROXY_URL_1`…`PROXY_URL_5` ne sont utilisés que si l'entrée manuelle `network_mode=proxy` est choisie. Le cron du runner auto-hébergé utilise `network_mode=direct`.
 
 Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
 
@@ -165,7 +165,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - `groups.csv` a une colonne `compte` en plus (`id,nom,url,actif,confidentialite,membres,compte`). Colonne **optionnelle** : un `groups.csv` sans cette colonne reste valide, tous les groupes sont alors traités comme appartenant au compte `"1"` (rétrocompatibilité avec l'ancien fonctionnement mono-compte).
 - `main.py` accepte `--compte {1,2,3,4,5}` : restreint le run au secret `FB_COOKIES_JSON_<compte>`, à un état persistant isolé (`data/state/compte_<n>/`), et aux groupes de `groups.csv` assignés à ce compte. Omis (comportement historique) : secret `FB_COOKIES_JSON` unique, état global, tous les groupes actifs confondus.
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
-- Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`), chacun a son propre cache d'état (`etat-scraper-compte-<n>-*`) et son propre artefact (`annonces-foncieres-compte-<n>-*`).
+- Le workflow `.github/workflows/daily_scraper.yml` crée **5 jobs indépendants** (matrice `compte: ["1".."5"]`). Avec un seul runner auto-hébergé, ils s'exécutent l'un après l'autre ; chacun conserve son cache et son artefact propres.
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
 - `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
@@ -190,6 +190,24 @@ ouaga-foncier-etl/
 ├── scripts/maj_cookies.py  # recharge FB_COOKIES_JSON(_n) depuis un export Cookie-Editor (voir ci-dessus)
 └── tests/           # une suite par module, API OpenAI et navigateur entièrement mockés
 ```
+
+## Runner GitHub Actions auto-hébergé (Windows)
+
+Le job de tests reste sur `ubuntu-latest`. Seul le scraping utilise le PC
+Windows, avec les labels `self-hosted`, `Windows`, `X64` et
+`ouaga-foncier`. En mode `direct`, aucune variable `PROXY_URL_<n>` n'est
+transmise : la connexion Internet résidentielle du PC est utilisée.
+
+Dans GitHub : **Settings → Actions → Runners → New self-hosted runner**,
+choisir **Windows / x64**, puis exécuter dans PowerShell les commandes
+personnalisées affichées par GitHub. Pendant la configuration, ajouter le label
+`ouaga-foncier`. Installer le runner comme service permet aux crons de
+fonctionner sans ouvrir PowerShell, mais le PC doit rester allumé et connecté.
+
+Sur le PC, Python 3.12 doit être disponible. Le workflow installe ensuite les
+dépendances et Chromium automatiquement. Pour un premier essai manuel :
+`compte=1`, `network_mode=direct`, `days_back=1`, `group_limit=1`,
+`batch_size=1`.
 
 ## Installation
 
