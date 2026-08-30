@@ -79,7 +79,7 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
   - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
   - En CI : créer les secrets `PROXY_URL_1`…`PROXY_URL_5` (Settings → Secrets and variables → Actions) — idéalement un proxy **distinct par compte**, pour que chacun des 5 comptes conserve une IP de sortie cohérente d'un run à l'autre (comme un vrai navigateur qui revient), plutôt que 5 comptes partageant une même IP proxy, qui reconstituerait le même signal de risque à une autre échelle. Le workflow (`daily_scraper.yml`) injecte déjà ces 5 secrets vers le job matriciel correspondant.
 
-Avant Facebook, chaque contexte ouvre `https://ipapi.co/json/` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
+Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
 
 - `PROXY_COUNTRY_1`…`PROXY_COUNTRY_5` : code ISO à deux lettres, `BF` par défaut ;
 - `BROWSER_LOCALE_1`…`BROWSER_LOCALE_5` : `fr-FR` par défaut ;
