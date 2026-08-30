@@ -437,7 +437,7 @@ async def verifier_proxy_et_region(
     contexte: BrowserContext,
     compte: str | None,
 ) -> None:
-    """Vérifie la sortie réseau du contexte avant toute visite à Facebook."""
+    """Vérifie le pays de sortie, avec ou sans proxy, avant Facebook."""
     region = config.parametres_regionaux(compte)
     page = await contexte.new_page()
     try:
@@ -449,7 +449,7 @@ async def verifier_proxy_et_region(
         if reponse is None or not reponse.ok:
             statut = reponse.status if reponse is not None else "aucune réponse"
             raise ProxyIncoherentError(
-                f"Vérification du proxy impossible ({statut})."
+                f"Vérification de la sortie réseau impossible ({statut})."
             )
         try:
             donnees = json.loads(await page.locator("body").inner_text())
@@ -463,11 +463,11 @@ async def verifier_proxy_et_region(
         pays_observe = str(donnees.get("country_code") or pays or "").upper()
         if pays_observe != region.pays:
             raise ProxyIncoherentError(
-                f"Pays du proxy incohérent : attendu={region.pays}, "
+                f"Pays de sortie incohérent : attendu={region.pays}, "
                 f"observé={pays_observe or 'inconnu'}."
             )
         logger.info(
-            "Proxy vérifié pour le compte %s : pays=%s, locale=%s, fuseau=%s.",
+            "Sortie réseau vérifiée pour le compte %s : pays=%s, locale=%s, fuseau=%s.",
             compte or "unique",
             pays_observe,
             region.locale,
@@ -477,7 +477,7 @@ async def verifier_proxy_et_region(
         raise
     except Exception as exc:
         raise ProxyIncoherentError(
-            f"Proxy inutilisable ou contrôle géographique indisponible : {exc}"
+            f"Sortie réseau inutilisable ou contrôle géographique indisponible : {exc}"
         ) from exc
     finally:
         await page.close()
@@ -1838,6 +1838,10 @@ async def executer_scraping(
             config.nom_secret_proxy(compte),
             proxy["server"],
         )
+    else:
+        logger.info(
+            "Connexion directe explicitement autorisée : utilisation du réseau du runner."
+        )
 
     seen_ids = charger_seen_ids(compte)
     reperes_dernier_post = charger_dernier_post_connu(compte)
@@ -1891,8 +1895,7 @@ async def executer_scraping(
                         navigateur, contexte = await creer_navigateur(
                             playwright, cookies, compte, proxy
                         )
-                        if proxy is not None:
-                            await verifier_proxy_et_region(contexte, compte)
+                        await verifier_proxy_et_region(contexte, compte)
                         await echauffement(contexte)
                         posts, nouveau_repere = await scraper_groupe(
                             contexte,
