@@ -59,11 +59,13 @@ sans préavis) - à surveiller sur les prochains runs quotidiens.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
 import re
 import urllib.parse
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -919,6 +921,120 @@ def _parser_horodatage_relatif(
     return None
 
 
+def _nettoyer_texte_weblite(texte: str) -> str:
+    """Normalise un texte rendu par l'interface mobile WebLite."""
+    sans_glyphes = "".join(
+        caractere
+        for caractere in texte
+        if unicodedata.category(caractere) not in {"Cc", "Cf", "Co"}
+    )
+    return " ".join(sans_glyphes.replace("’", "'").split())
+
+
+def _construire_post_weblite(
+    textes: list[str],
+    auteur: str,
+    groupe_id: str,
+    groupe_nom: str,
+    maintenant: datetime,
+) -> dict[str, Any] | None:
+    """Construit un post depuis les fragments textuels d'une carte WebLite.
+
+    WebLite ne livre ni nœud Story JSON ni identifiant de publication dans le
+    DOM. L'identifiant synthétique est donc un hash stable du groupe, de
+    l'auteur et du texte. Il sert uniquement à la déduplication interne.
+    """
+    auteur = _nettoyer_texte_weblite(auteur)
+    fragments = [_nettoyer_texte_weblite(texte) for texte in textes]
+    fragments = [texte for texte in fragments if texte]
+
+    dates: list[tuple[int, datetime]] = []
+    for index, texte in enumerate(fragments):
+        date = _parser_horodatage_relatif(texte, maintenant)
+        if date is not None:
+            dates.append((index, date))
+
+    debut_message = dates[-1][0] + 1 if dates else 0
+    bruits_exacts = {
+        auteur.casefold(),
+        "écrivez un commentaire public...",
+        "ecrivez un commentaire public...",
+        "voir plus",
+    }
+    candidats = []
+    for texte in fragments[debut_message:]:
+        texte_normalise = texte.casefold()
+        if (
+            len(texte) < 10
+            or texte_normalise in bruits_exacts
+            or texte_normalise.startswith("écrivez un commentaire")
+            or texte_normalise.startswith("ecrivez un commentaire")
+            or _parser_horodatage_relatif(texte, maintenant) is not None
+        ):
+            continue
+        candidats.append(texte)
+
+    if not candidats:
+        return None
+
+    texte = max(candidats, key=len)
+    texte = re.sub(r"\s*\.\.\.\s*Voir plus\s*$", "", texte, flags=re.IGNORECASE).strip()
+    if len(texte) < 10:
+        return None
+
+    signature = "\0".join((groupe_id, auteur.casefold(), texte.casefold()))
+    post_id = "weblite:" + hashlib.sha256(signature.encode("utf-8")).hexdigest()
+    date_publication = dates[-1][1] if dates else None
+    return {
+        "id": post_id,
+        "groupe_id": groupe_id,
+        "groupe_nom": groupe_nom,
+        "url": None,
+        "texte": texte,
+        "date_publication": (
+            date_publication.isoformat() if date_publication is not None else None
+        ),
+        "date_incertaine": date_publication is None,
+        "scrape_le": maintenant.isoformat(),
+    }
+
+
+async def _extraire_posts_weblite_dom(
+    page: Page, groupe: "config.Groupe"
+) -> list[dict[str, Any]]:
+    """Extrait les cartes de fil rendues dans le DOM mobile WebLite."""
+    cartes = page.locator("[data-tracking-duration-id]")
+    posts: list[dict[str, Any]] = []
+    maintenant = datetime.now(timezone.utc)
+
+    for index in range(await cartes.count()):
+        carte = cartes.nth(index)
+        # Best-effort : WebLite tronque souvent le texte derrière « Voir plus ».
+        boutons = carte.get_by_text("Voir plus", exact=True)
+        for bouton_index in range(await boutons.count()):
+            try:
+                await boutons.nth(bouton_index).click(timeout=1_500)
+            except Exception:
+                pass
+
+        fragments = await carte.locator("div.native-text.rslh").all_inner_texts()
+        liens_auteur = carte.locator('[role="link"]')
+        auteur = ""
+        if await liens_auteur.count():
+            try:
+                auteur = await liens_auteur.first.inner_text()
+            except Exception:
+                auteur = ""
+
+        post = _construire_post_weblite(
+            fragments, auteur, groupe.id, groupe.nom, maintenant
+        )
+        if post is not None:
+            posts.append(post)
+
+    return posts
+
+
 def _sauvegarder_echantillons_graphql_debug(
     echantillons: list[dict[str, Any]], groupe_id: str
 ) -> Path | None:
@@ -1346,6 +1462,7 @@ async def scraper_groupe(
     repere_trouve = False
     compteur_reponses_vues = 0
     compteur_reponses_matchees = 0
+    posts_dom_observes: set[str] = set()
     # Échantillons bruts (URL + corps tronqué) des réponses GraphQL matchées,
     # gardés même si aucun post n'y est trouvé - sert de diagnostic best-effort
     # (voir `_sauvegarder_echantillons_graphql_debug`) sans jamais peser sur la
@@ -1483,7 +1600,9 @@ async def scraper_groupe(
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
 
-            nouveaux_bruts = posts_captures[debut_capture:]
+            posts_dom = await _extraire_posts_weblite_dom(page, groupe)
+            posts_dom_observes.update(post["id"] for post in posts_dom)
+            nouveaux_bruts = posts_captures[debut_capture:] + posts_dom
 
             # Détection du post-repère AVANT filtrage par seen_ids : le
             # repère provient forcément d'un run précédent, donc il est déjà
@@ -1521,9 +1640,9 @@ async def scraper_groupe(
 
             logger.info(
                 "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
-                "| posts capturés cumulés=%d",
+                "| weblite_dom=%d | posts capturés cumulés=%d",
                 groupe.nom, etapes_scroll, compteur_reponses_vues,
-                compteur_reponses_matchees, len(posts_captures),
+                compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
             )
 
             # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
@@ -1571,10 +1690,14 @@ async def scraper_groupe(
 
         if nb_posts_trouves_via_scroll == 0 and echantillons_graphql_bruts:
             _sauvegarder_echantillons_graphql_debug(echantillons_graphql_bruts, groupe.id)
-        if not posts_initiaux and compteur_reponses_matchees == 0:
+        if (
+            not posts_initiaux
+            and compteur_reponses_matchees == 0
+            and not posts_dom_observes
+        ):
             raise StructureFacebookInattendueError(
-                f"Aucun JSON initial ni réponse GraphQL reconnue pour {groupe.nom}; "
-                "le mode mobile ou la structure Facebook a probablement changé."
+                f"Aucun JSON initial, réponse GraphQL ou post WebLite reconnu "
+                f"pour {groupe.nom}; la structure Facebook a probablement changé."
             )
 
     except PlaywrightTimeoutError as exc:
