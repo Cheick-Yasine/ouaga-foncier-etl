@@ -46,7 +46,7 @@ Schéma créé automatiquement au premier run (`processor.SCHEMA_SQL`, `CREATE T
 Points à connaître :
 - La base et l'export `data/processed/annonces.xlsx` sont **partagés par les 5 comptes** : l'upsert se fait par `id` de post, peu importe quel compte a scrapé le post.
 - Aucun repli silencieux sur une base locale : si `DATABASE_URL` est absente ou le serveur injoignable, le run échoue bruyamment (`psycopg.OperationalError`) plutôt que d'écrire dans le vide.
-- Le workflow tente en fin de run un `pg_dump` de la base dans l'artefact (sauvegarde optionnelle, `continue-on-error`) — voir les commentaires de `.github/workflows/daily_scraper.yml` sur le mismatch de version `pg_dump`/Neon rencontré en réel.
+- Sur le runner auto-hébergé, aucun dump PostgreSQL ni export contenant des annonces n'est envoyé comme artefact GitHub. La base Neon reste la source de vérité et les fichiers de travail restent sur le PC.
 - Les mots de passe sont masqués (`main._masquer_dsn`) avant tout affichage dans les logs ou le résumé GitHub Actions.
 - **`TEST_DATABASE_URL`** (tests uniquement) doit pointer sur une base **séparée** : la suite fait des `DROP TABLE` entre les tests. Absente → les tests concernés sont automatiquement skippés (voir "Tests").
 
@@ -165,7 +165,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - `groups.csv` a une colonne `compte` en plus (`id,nom,url,actif,confidentialite,membres,compte`). Colonne **optionnelle** : un `groups.csv` sans cette colonne reste valide, tous les groupes sont alors traités comme appartenant au compte `"1"` (rétrocompatibilité avec l'ancien fonctionnement mono-compte).
 - `main.py` accepte `--compte {1,2,3,4,5}` : restreint le run au secret `FB_COOKIES_JSON_<compte>`, à un état persistant isolé (`data/state/compte_<n>/`), et aux groupes de `groups.csv` assignés à ce compte. Omis (comportement historique) : secret `FB_COOKIES_JSON` unique, état global, tous les groupes actifs confondus.
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
-- Le workflow `.github/workflows/daily_scraper.yml` crée **5 jobs indépendants** (matrice `compte: ["1".."5"]`). Avec un seul runner auto-hébergé, ils s'exécutent l'un après l'autre ; chacun conserve son cache et son artefact propres.
+- Le workflow `.github/workflows/daily_scraper.yml` crée **5 jobs indépendants** (matrice `compte: ["1".."5"]`). Avec un seul runner auto-hébergé, ils s'exécutent l'un après l'autre ; leur état reste dans `data/state/compte_<n>/` sur le PC.
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
 - `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
@@ -205,7 +205,10 @@ personnalisées affichées par GitHub. Pendant la configuration, ajouter le labe
 fonctionner sans ouvrir PowerShell, mais le PC doit rester allumé et connecté.
 
 Sur le PC, Python 3.12 doit être disponible. Le workflow installe ensuite les
-dépendances et Chromium automatiquement. Pour un premier essai manuel :
+dépendances et Chromium automatiquement. Le checkout est volontairement lancé
+avec `clean: false` afin de conserver `data/state/compte_<n>/` entre les
+runs. Les cookies de session, les exports et le dump PostgreSQL ne sont pas
+envoyés dans les caches ou artefacts GitHub. Pour un premier essai manuel :
 `compte=1`, `network_mode=direct`, `days_back=1`, `group_limit=1`,
 `batch_size=1`.
 
