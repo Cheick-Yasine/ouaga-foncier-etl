@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -58,6 +59,57 @@ async def test_verification_proxy_refuse_un_autre_pays(monkeypatch):
         await scraper.verifier_proxy_et_region(contexte, "1")
 
     page.close.assert_awaited_once()
+
+
+def test_construction_post_weblite_depuis_fragments_dom():
+    maintenant = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+    fragments = [
+        "Gouverneur Kologo",
+        "\u200e\u200e4 min\u200e\ue001",
+        "🇧🇫 Location TENGANOGO #LOYER : 75milles ... Voir plus",
+        "Écrivez un commentaire public...",
+    ]
+
+    post = scraper._construire_post_weblite(
+        fragments,
+        "Gouverneur Kologo",
+        "589699498704633",
+        "Groupe immobilier",
+        maintenant,
+    )
+
+    assert post is not None
+    assert post["texte"] == "🇧🇫 Location TENGANOGO #LOYER : 75milles"
+    assert post["date_publication"] == (
+        maintenant - timedelta(minutes=4)
+    ).isoformat()
+    assert post["date_incertaine"] is False
+    assert post["id"].startswith("weblite:")
+
+    meme_post_plus_tard = scraper._construire_post_weblite(
+        fragments,
+        "Gouverneur Kologo",
+        "589699498704633",
+        "Groupe immobilier",
+        maintenant + timedelta(minutes=1),
+    )
+    assert meme_post_plus_tard is not None
+    assert meme_post_plus_tard["id"] == post["id"]
+
+
+def test_construction_post_weblite_ignore_carte_sans_texte():
+    maintenant = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+
+    assert (
+        scraper._construire_post_weblite(
+            ["Harouna Sana", "À l'instant", "Écrivez un commentaire public..."],
+            "Harouna Sana",
+            "589699498704633",
+            "Groupe immobilier",
+            maintenant,
+        )
+        is None
+    )
 
 
 def test_validation_du_domaine_facebook():
