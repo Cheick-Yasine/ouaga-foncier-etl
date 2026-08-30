@@ -455,9 +455,10 @@ async def verifier_proxy_et_region(
             raise ProxyIncoherentError(
                 "Le service de géolocalisation du proxy a renvoyé une réponse illisible."
             ) from exc
-        pays_observe = str(
-            donnees.get("country_code") or donnees.get("country") or ""
-        ).upper()
+        pays = donnees.get("country")
+        if isinstance(pays, dict):
+            pays = pays.get("code") or pays.get("country_code")
+        pays_observe = str(donnees.get("country_code") or pays or "").upper()
         if pays_observe != region.pays:
             raise ProxyIncoherentError(
                 f"Pays du proxy incohérent : attendu={region.pays}, "
