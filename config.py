@@ -698,7 +698,7 @@ def choisir_fingerprint_mobile(
     return str(profil["user_agent"]), dict(profil["viewport"])
 
 
-PROXY_GEO_CHECK_URL = "https://ipapi.co/json/"
+PROXY_GEO_CHECK_URL = "https://ip.decodo.com/json"
 PROXY_GEO_CHECK_TIMEOUT_MS = 20_000
 
 
