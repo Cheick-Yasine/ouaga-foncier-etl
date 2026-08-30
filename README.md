@@ -79,7 +79,7 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
   - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
   - En CI : les secrets `PROXY_URL_1`…`PROXY_URL_5` ne sont utilisés que si l'entrée manuelle `network_mode=proxy` est choisie. Le cron du runner auto-hébergé utilise `network_mode=direct`.
 
-Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
+Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` et compare le pays observé au pays attendu, avec ou sans proxy. En mode direct, le workflow impose `BF` et `Africa/Ouagadougou`. Les variables suivantes restent configurables en mode proxy :
 
 - `PROXY_COUNTRY_1`…`PROXY_COUNTRY_5` : code ISO à deux lettres, `BF` par défaut ;
 - `BROWSER_LOCALE_1`…`BROWSER_LOCALE_5` : `fr-FR` par défaut ;
@@ -167,7 +167,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
 - Le workflow `.github/workflows/daily_scraper.yml` crée **5 jobs indépendants** (matrice `compte: ["1".."5"]`). Avec un seul runner auto-hébergé, ils s'exécutent l'un après l'autre ; leur état reste dans `data/state/compte_<n>/` sur le PC.
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
-- `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
+- `data/state/compte_<n>/seen_post_ids.json` conserve localement sur le PC la déduplication des posts déjà vus pour chaque compte.
 
 **Répartition actuelle** (`groups.csv`) : 25 entrées, exactement 5 par compte. Les deux seules entrées `actif=false` (`1412949025757240`, `352566539534344`) sont toutes les deux assignées au **compte 3**, qui ne traite donc que **3 groupes actifs** contre 5 pour les quatre autres comptes. Ce n'est pas un bug (le filtrage `actif`/`compte` fonctionne comme prévu) mais un déséquilibre de charge : à rééquilibrer en réassignant deux groupes vers le compte 3 si l'on veut une répartition réellement homogène.
 
