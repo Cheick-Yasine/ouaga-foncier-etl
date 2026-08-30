@@ -20,7 +20,7 @@ class _PageGeo:
     def locator(self, _selecteur: str):
         return SimpleNamespace(
             inner_text=AsyncMock(
-                return_value=json.dumps({"ip": "192.0.2.10", "country_code": self._pays})
+                return_value=json.dumps({"proxy": {"ip": "192.0.2.10"}, "country": {"code": self._pays}})
             )
         )
 
