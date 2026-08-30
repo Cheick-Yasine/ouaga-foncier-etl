@@ -4,9 +4,8 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Les expressions cron restent nécessairement statiques. Les minutes 17 et
-    # 41 peuvent être modifiées manuellement ; le véritable décalage aléatoire
-    # est appliqué au démarrage par le step de délai 0-30 min ci-dessous.
+    # Le scraping s'exécute sur le PC auto-hébergé. Un délai aléatoire de
+    # 0 à 30 minutes est ajouté au démarrage de chaque cron.
     - cron: "17 0 * * *"
     - cron: "41 12 * * *"
   workflow_dispatch:
@@ -22,23 +21,28 @@ on:
         options: [daily, backfill]
         default: daily
       days_back:
-        description: "Nombre de jours à remonter (surtout pertinent en mode backfill)"
+        description: "Nombre de jours à remonter"
         type: string
         default: "7"
+      network_mode:
+        description: "Sortie réseau du runner auto-hébergé"
+        type: choice
+        options: [direct, proxy]
+        default: direct
       round_robin:
-        description: "Round-robin (1-2 groupes/run) plutôt que tous les groupes d'un coup"
+        description: "Round-robin (1-2 groupes/run)"
         type: boolean
         default: false
       groups_per_run:
-        description: "Nombre de groupes traités ce run (utilisé si round_robin=true)"
+        description: "Nombre de groupes si round_robin=true"
         type: string
         default: "1"
       group_limit:
-        description: "Nombre max de groupes traités sur ce run (ignoré si round_robin=true ; 0 = tous)"
+        description: "Nombre max de groupes (0 = tous)"
         type: string
         default: "0"
       batch_size:
-        description: "Taille des lots de groupes entre deux pauses longues anti-détection"
+        description: "Taille des lots de groupes"
         type: string
         default: "5"
 
@@ -85,7 +89,7 @@ jobs:
   scrape-and-process:
     if: github.event_name != 'pull_request'
     needs: tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64, ouaga-foncier]
     strategy:
       fail-fast: false
       matrix:
@@ -95,8 +99,10 @@ jobs:
       group: ouaga-foncier-etl-compte-${{ matrix.compte }}
       cancel-in-progress: false
     steps:
-      - name: "Checkout du dépôt"
+      - name: "Checkout du dépôt sans supprimer l'état local"
         uses: actions/checkout@v4
+        with:
+          clean: false
 
       - name: "Configuration Python"
         uses: actions/setup-python@v5
@@ -106,141 +112,95 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: "Installation des dépendances Python"
-        run: pip install -r requirements.txt
+        shell: pwsh
+        run: python -m pip install -r requirements.txt
 
       - name: "Installation de Chromium (Playwright)"
-        run: playwright install --with-deps chromium
-
-      - name: "Restauration de l'état persistant (data/state/compte_<n>)"
-        uses: actions/cache/restore@v4
-        with:
-          path: data/state/compte_${{ matrix.compte }}
-          key: etat-scraper-compte-${{ matrix.compte }}-${{ github.run_id }}
-          restore-keys: |
-            etat-scraper-compte-${{ matrix.compte }}-
+        shell: pwsh
+        run: python -m playwright install chromium
 
       - name: "Délai aléatoire avant démarrage (cron uniquement)"
         if: github.event_name == 'schedule'
-        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes (jitter permanent)
+        shell: pwsh
+        run: |
+          $delai = Get-Random -Minimum 0 -Maximum 1801
+          Write-Host "Délai aléatoire : $delai seconde(s)."
+          Start-Sleep -Seconds $delai
 
       - name: "Résolution des paramètres d'exécution"
         id: params
-        shell: bash
+        shell: pwsh
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "mode=daily" >> "$GITHUB_OUTPUT"
-            echo "days_back=1" >> "$GITHUB_OUTPUT"
-            echo "round_robin=false" >> "$GITHUB_OUTPUT"
-            echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
-            echo "group_limit=0" >> "$GITHUB_OUTPUT"
-            echo "batch_size=5" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
-            echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
-            echo "round_robin=${{ github.event.inputs.round_robin }}" >> "$GITHUB_OUTPUT"
-            echo "groups_per_run=${{ github.event.inputs.groups_per_run }}" >> "$GITHUB_OUTPUT"
-            echo "group_limit=${{ github.event.inputs.group_limit }}" >> "$GITHUB_OUTPUT"
-            echo "batch_size=${{ github.event.inputs.batch_size }}" >> "$GITHUB_OUTPUT"
-          fi
+          if ("${{ github.event_name }}" -eq "schedule") {
+            "mode=daily" >> $env:GITHUB_OUTPUT
+            "days_back=1" >> $env:GITHUB_OUTPUT
+            "network_mode=direct" >> $env:GITHUB_OUTPUT
+            "round_robin=false" >> $env:GITHUB_OUTPUT
+            "groups_per_run=1" >> $env:GITHUB_OUTPUT
+            "group_limit=0" >> $env:GITHUB_OUTPUT
+            "batch_size=5" >> $env:GITHUB_OUTPUT
+          } else {
+            "mode=${{ github.event.inputs.mode }}" >> $env:GITHUB_OUTPUT
+            "days_back=${{ github.event.inputs.days_back }}" >> $env:GITHUB_OUTPUT
+            "network_mode=${{ github.event.inputs.network_mode }}" >> $env:GITHUB_OUTPUT
+            "round_robin=${{ github.event.inputs.round_robin }}" >> $env:GITHUB_OUTPUT
+            "groups_per_run=${{ github.event.inputs.groups_per_run }}" >> $env:GITHUB_OUTPUT
+            "group_limit=${{ github.event.inputs.group_limit }}" >> $env:GITHUB_OUTPUT
+            "batch_size=${{ github.event.inputs.batch_size }}" >> $env:GITHUB_OUTPUT
+          }
 
       - name: "Exécution du pipeline ETL"
+        shell: pwsh
         env:
           FB_COOKIES_JSON_1: ${{ secrets.FB_COOKIES_JSON_1 }}
           FB_COOKIES_JSON_2: ${{ secrets.FB_COOKIES_JSON_2 }}
           FB_COOKIES_JSON_3: ${{ secrets.FB_COOKIES_JSON_3 }}
           FB_COOKIES_JSON_4: ${{ secrets.FB_COOKIES_JSON_4 }}
           FB_COOKIES_JSON_5: ${{ secrets.FB_COOKIES_JSON_5 }}
-          PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
-          PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
-          PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
-          PROXY_URL_4: ${{ secrets.PROXY_URL_4 }}
-          PROXY_URL_5: ${{ secrets.PROXY_URL_5 }}
-          PROXY_COUNTRY_1: ${{ vars.PROXY_COUNTRY_1 || 'FR' }}
-          PROXY_COUNTRY_2: ${{ vars.PROXY_COUNTRY_2 }}
-          PROXY_COUNTRY_3: ${{ vars.PROXY_COUNTRY_3 }}
-          PROXY_COUNTRY_4: ${{ vars.PROXY_COUNTRY_4 }}
-          PROXY_COUNTRY_5: ${{ vars.PROXY_COUNTRY_5 }}
-          BROWSER_LOCALE_1: ${{ vars.BROWSER_LOCALE_1 || 'fr-FR' }}
-          BROWSER_LOCALE_2: ${{ vars.BROWSER_LOCALE_2 }}
-          BROWSER_LOCALE_3: ${{ vars.BROWSER_LOCALE_3 }}
-          BROWSER_LOCALE_4: ${{ vars.BROWSER_LOCALE_4 }}
-          BROWSER_LOCALE_5: ${{ vars.BROWSER_LOCALE_5 }}
-          BROWSER_TIMEZONE_1: ${{ vars.BROWSER_TIMEZONE_1 || 'Europe/Paris' }}
-          BROWSER_TIMEZONE_2: ${{ vars.BROWSER_TIMEZONE_2 }}
-          BROWSER_TIMEZONE_3: ${{ vars.BROWSER_TIMEZONE_3 }}
-          BROWSER_TIMEZONE_4: ${{ vars.BROWSER_TIMEZONE_4 }}
-          BROWSER_TIMEZONE_5: ${{ vars.BROWSER_TIMEZONE_5 }}
+          ALLOW_DIRECT_CONNECTION: ${{ steps.params.outputs.network_mode == 'direct' && 'true' || 'false' }}
+          PROXY_URL_1: ${{ steps.params.outputs.network_mode == 'proxy' && secrets.PROXY_URL_1 || '' }}
+          PROXY_URL_2: ${{ steps.params.outputs.network_mode == 'proxy' && secrets.PROXY_URL_2 || '' }}
+          PROXY_URL_3: ${{ steps.params.outputs.network_mode == 'proxy' && secrets.PROXY_URL_3 || '' }}
+          PROXY_URL_4: ${{ steps.params.outputs.network_mode == 'proxy' && secrets.PROXY_URL_4 || '' }}
+          PROXY_URL_5: ${{ steps.params.outputs.network_mode == 'proxy' && secrets.PROXY_URL_5 || '' }}
+          PROXY_COUNTRY_1: ${{ steps.params.outputs.network_mode == 'direct' && 'BF' || vars.PROXY_COUNTRY_1 || 'BF' }}
+          PROXY_COUNTRY_2: ${{ steps.params.outputs.network_mode == 'direct' && 'BF' || vars.PROXY_COUNTRY_2 || 'BF' }}
+          PROXY_COUNTRY_3: ${{ steps.params.outputs.network_mode == 'direct' && 'BF' || vars.PROXY_COUNTRY_3 || 'BF' }}
+          PROXY_COUNTRY_4: ${{ steps.params.outputs.network_mode == 'direct' && 'BF' || vars.PROXY_COUNTRY_4 || 'BF' }}
+          PROXY_COUNTRY_5: ${{ steps.params.outputs.network_mode == 'direct' && 'BF' || vars.PROXY_COUNTRY_5 || 'BF' }}
+          BROWSER_LOCALE_1: ${{ steps.params.outputs.network_mode == 'direct' && 'fr-FR' || vars.BROWSER_LOCALE_1 || 'fr-FR' }}
+          BROWSER_LOCALE_2: ${{ steps.params.outputs.network_mode == 'direct' && 'fr-FR' || vars.BROWSER_LOCALE_2 || 'fr-FR' }}
+          BROWSER_LOCALE_3: ${{ steps.params.outputs.network_mode == 'direct' && 'fr-FR' || vars.BROWSER_LOCALE_3 || 'fr-FR' }}
+          BROWSER_LOCALE_4: ${{ steps.params.outputs.network_mode == 'direct' && 'fr-FR' || vars.BROWSER_LOCALE_4 || 'fr-FR' }}
+          BROWSER_LOCALE_5: ${{ steps.params.outputs.network_mode == 'direct' && 'fr-FR' || vars.BROWSER_LOCALE_5 || 'fr-FR' }}
+          BROWSER_TIMEZONE_1: ${{ steps.params.outputs.network_mode == 'direct' && 'Africa/Ouagadougou' || vars.BROWSER_TIMEZONE_1 || 'Africa/Ouagadougou' }}
+          BROWSER_TIMEZONE_2: ${{ steps.params.outputs.network_mode == 'direct' && 'Africa/Ouagadougou' || vars.BROWSER_TIMEZONE_2 || 'Africa/Ouagadougou' }}
+          BROWSER_TIMEZONE_3: ${{ steps.params.outputs.network_mode == 'direct' && 'Africa/Ouagadougou' || vars.BROWSER_TIMEZONE_3 || 'Africa/Ouagadougou' }}
+          BROWSER_TIMEZONE_4: ${{ steps.params.outputs.network_mode == 'direct' && 'Africa/Ouagadougou' || vars.BROWSER_TIMEZONE_4 || 'Africa/Ouagadougou' }}
+          BROWSER_TIMEZONE_5: ${{ steps.params.outputs.network_mode == 'direct' && 'Africa/Ouagadougou' || vars.BROWSER_TIMEZONE_5 || 'Africa/Ouagadougou' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          ARGS=(
-            --compte "${{ matrix.compte }}"
-            --mode "${{ steps.params.outputs.mode }}"
-            --days-back "${{ steps.params.outputs.days_back }}"
-            --group-limit "${{ steps.params.outputs.group_limit }}"
-            --batch-size "${{ steps.params.outputs.batch_size }}"
+          $argumentsPipeline = @(
+            "--compte", "${{ matrix.compte }}",
+            "--mode", "${{ steps.params.outputs.mode }}",
+            "--days-back", "${{ steps.params.outputs.days_back }}",
+            "--group-limit", "${{ steps.params.outputs.group_limit }}",
+            "--batch-size", "${{ steps.params.outputs.batch_size }}"
           )
-          if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
-            ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
-          fi
-          python main.py "${ARGS[@]}"
-
-      - name: "Installer pg_dump compatible avec la version PostgreSQL de Neon"
-        if: always()
-        continue-on-error: true
-        run: |
-          attendre_deverrouillage_apt() {
-            for _ in $(seq 1 24); do
-              if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
-                echo "Verrou apt détenu par un autre processus, attente 5s..."
-                sleep 5
-              else
-                return 0
-              fi
-            done
-            echo "::warning::Verrou apt toujours détenu après 2 min d'attente - tentative quand même."
+          if ("${{ steps.params.outputs.round_robin }}" -eq "true") {
+            $argumentsPipeline += @(
+              "--round-robin",
+              "--groups-per-run", "${{ steps.params.outputs.groups_per_run }}"
+            )
           }
+          python main.py @argumentsPipeline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          attendre_deverrouillage_apt
-          sudo apt-get install -y postgresql-common
-          attendre_deverrouillage_apt
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          attendre_deverrouillage_apt
-          sudo apt-get install -y postgresql-client-18
-
-      - name: "Sauvegarde SQL de la base maître (pg_dump)"
+      - name: "Emplacement des résultats locaux"
         if: always()
-        continue-on-error: true
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: pwsh
         run: |
-          PG_DUMP_BIN="/usr/lib/postgresql/18/bin/pg_dump"
-          if [ ! -x "$PG_DUMP_BIN" ]; then
-            echo "::warning::$PG_DUMP_BIN introuvable, repli sur 'pg_dump' générique (risque de mismatch de version serveur)"
-            PG_DUMP_BIN="pg_dump"
-          fi
-          "$PG_DUMP_BIN" --version || true
-          "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
-
-      - name: "Upload de l'artefact (dump base maître, Excel, CSV du run, logs)"
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: "annonces-foncieres-compte-${{ matrix.compte }}-${{ github.run_id }}"
-          path: |
-            data/processed/annonces_backup.sql
-            data/processed/annonces.xlsx
-            data/processed/annonces_*.csv
-            data/processed/rejetes_*.json
-            data/logs/*.log
-            data/logs/debug_page_vide_*.html
-            data/logs/debug_scroll_vide_*.json
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: "Sauvegarde de l'état persistant pour le prochain run"
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data/state/compte_${{ matrix.compte }}
-          key: etat-scraper-compte-${{ matrix.compte }}-${{ github.run_id }}
+          Write-Host "État local : $env:GITHUB_WORKSPACE\data\state\compte_${{ matrix.compte }}"
+          Write-Host "Résultats locaux : $env:GITHUB_WORKSPACE\data\processed"
+          Write-Host "Logs locaux : $env:GITHUB_WORKSPACE\data\logs"
