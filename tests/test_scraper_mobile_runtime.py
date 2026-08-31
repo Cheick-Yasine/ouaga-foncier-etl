@@ -97,6 +97,62 @@ def test_construction_post_weblite_depuis_fragments_dom():
     assert meme_post_plus_tard["id"] == post["id"]
 
 
+
+
+def test_republication_utilise_la_date_du_groupe_pas_la_date_originale():
+    maintenant = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    post = scraper._construire_post_weblite(
+        [
+            "Agence Exemple",
+            "2 h",
+            "Nouvelle republication d'une annonce immobilière à Ouagadougou",
+            "Publication d'origine",
+            "12 août",
+            "Ancienne annonce partagée avec davantage de détails sur la parcelle",
+        ],
+        "Agence Exemple",
+        "589699498704633",
+        "Groupe immobilier",
+        maintenant,
+    )
+
+    assert post is not None
+    assert post["date_publication"] == (
+        maintenant - timedelta(hours=2)
+    ).isoformat()
+    assert post["date_publication_originale"] == datetime(
+        2026, 8, 12, 12, 0, tzinfo=timezone.utc
+    ).isoformat()
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "/groups/589699498704633/posts/123456789012345/",
+        "/groups/589699498704633/permalink/123456789012345/",
+        "/groups/589699498704633/?multi_permalinks=123456789012345",
+    ],
+)
+def test_extrait_id_reel_depuis_permalien_weblite(href):
+    identifiant, url = scraper._extraire_identifiant_url_post_weblite(
+        [href], "589699498704633"
+    )
+
+    assert identifiant == "123456789012345"
+    assert url.startswith("https://m.facebook.com/")
+
+
+def test_lot_hors_fenetre_exige_que_tous_les_posts_soient_anciens():
+    limite = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    ancien = {"date_publication": "2026-08-20T00:00:00+00:00"}
+    recent = {"date_publication": "2026-08-31T00:00:00+00:00"}
+    inconnu = {"date_publication": None}
+
+    assert scraper._lot_entierement_hors_fenetre([ancien, ancien], limite) is True
+    assert scraper._lot_entierement_hors_fenetre([ancien, recent], limite) is False
+    assert scraper._lot_entierement_hors_fenetre([ancien, inconnu], limite) is False
+
+
 def test_construction_post_weblite_ignore_carte_sans_texte():
     maintenant = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
 
