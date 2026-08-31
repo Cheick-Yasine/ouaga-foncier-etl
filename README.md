@@ -213,7 +213,7 @@ python main.py --mode daily --skip-llm                               # test scra
 ## Tests
 
 ```bash
-pytest -q                                    # 215 passent, 12 ignorés sans PostgreSQL de test
+pytest -q                                    # 220 passent, 12 ignorés sans PostgreSQL de test
 TEST_DATABASE_URL=postgresql://... pytest -q  # exécute aussi les cas PostgreSQL
 ```
 
