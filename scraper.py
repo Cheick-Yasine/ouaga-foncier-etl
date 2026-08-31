@@ -1390,6 +1390,33 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
 # --------------------------------------------------------------------------- #
 
 
+async def _actualiser_fil_avant_scroll(
+    page: Page,
+    groupe: "config.Groupe",
+) -> None:
+    """Recharge le groupe au sommet du fil et revalide la session.
+
+    L'ouverture initiale peut afficher un état du fil mis en cache. Une seule
+    actualisation contrôlée est donc effectuée avant toute extraction et tout
+    scroll. Le contrôle de domaine et la détection de checkpoint sont répétés,
+    car Facebook peut rediriger la page pendant le rechargement.
+    """
+    logger.info(
+        "Actualisation du fil de %s avant l'extraction et le premier scroll.",
+        groupe.nom,
+    )
+    await page.reload(wait_until="domcontentloaded")
+    interface = _verifier_domaine_facebook(page.url)
+    if interface != "mobile":
+        logger.warning(
+            "Après actualisation, Facebook a redirigé %s vers l'interface %s (%s).",
+            groupe.nom,
+            interface,
+            page.url,
+        )
+    await detecter_blocage_ou_session_expiree(page)
+
+
 async def scraper_groupe(
     context: BrowserContext,
     groupe: "config.Groupe",
@@ -1537,6 +1564,12 @@ async def scraper_groupe(
         await detecter_blocage_ou_session_expiree(page)
         await asyncio.sleep(
             random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
+            * delai_multiplicateur
+        )
+
+        await _actualiser_fil_avant_scroll(page, groupe)
+        await asyncio.sleep(
+            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
             * delai_multiplicateur
         )
 
