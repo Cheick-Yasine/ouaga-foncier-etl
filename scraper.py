@@ -931,12 +931,44 @@ def _nettoyer_texte_weblite(texte: str) -> str:
     return " ".join(sans_glyphes.replace("’", "'").split())
 
 
+def _extraire_identifiant_url_post_weblite(
+    hrefs: list[str],
+    groupe_id: str,
+) -> tuple[str | None, str | None]:
+    """Extrait l'id du post de groupe depuis un permalien WebLite."""
+    for href in hrefs:
+        if not href:
+            continue
+        url = urllib.parse.urljoin("https://m.facebook.com", href)
+        analyse = urllib.parse.urlsplit(url)
+        chemin = urllib.parse.unquote(analyse.path)
+        match = re.search(
+            r"/groups/[^/]+/(?:posts|permalink)/(\d+)",
+            chemin,
+            flags=re.IGNORECASE,
+        )
+        identifiant = match.group(1) if match else None
+        if identifiant is None:
+            requete = urllib.parse.parse_qs(analyse.query)
+            for cle in ("story_fbid", "fbid", "multi_permalinks"):
+                valeur = (requete.get(cle) or [""])[0]
+                match_requete = re.search(r"\d+", valeur)
+                if match_requete:
+                    identifiant = match_requete.group(0)
+                    break
+        if identifiant:
+            return identifiant, url
+    return None, None
+
+
 def _construire_post_weblite(
     textes: list[str],
     auteur: str,
     groupe_id: str,
     groupe_nom: str,
     maintenant: datetime,
+    post_id_reel: str | None = None,
+    url_post: str | None = None,
 ) -> dict[str, Any] | None:
     """Construit un post depuis les fragments textuels d'une carte WebLite.
 
@@ -954,7 +986,10 @@ def _construire_post_weblite(
         if date is not None:
             dates.append((index, date))
 
-    debut_message = dates[-1][0] + 1 if dates else 0
+    # Dans une republication, le premier horodatage appartient à
+    # l'apparition dans le groupe ; les suivants appartiennent au contenu
+    # original partagé. Seul le premier pilote la fenêtre temporelle.
+    debut_message = dates[0][0] + 1 if dates else 0
     bruits_exacts = {
         auteur.casefold(),
         "écrivez un commentaire public...",
@@ -983,16 +1018,22 @@ def _construire_post_weblite(
         return None
 
     signature = "\0".join((groupe_id, auteur.casefold(), texte.casefold()))
-    post_id = "weblite:" + hashlib.sha256(signature.encode("utf-8")).hexdigest()
-    date_publication = dates[-1][1] if dates else None
+    post_id = post_id_reel or (
+        "weblite:" + hashlib.sha256(signature.encode("utf-8")).hexdigest()
+    )
+    date_publication = dates[0][1] if dates else None
+    date_originale = dates[1][1] if len(dates) > 1 else None
     return {
         "id": post_id,
         "groupe_id": groupe_id,
         "groupe_nom": groupe_nom,
-        "url": None,
+        "url": url_post,
         "texte": texte,
         "date_publication": (
             date_publication.isoformat() if date_publication is not None else None
+        ),
+        "date_publication_originale": (
+            date_originale.isoformat() if date_originale is not None else None
         ),
         "date_incertaine": date_publication is None,
         "scrape_le": maintenant.isoformat(),
@@ -1020,14 +1061,32 @@ async def _extraire_posts_weblite_dom(
         fragments = await carte.locator("div.native-text.rslh").all_inner_texts()
         liens_auteur = carte.locator('[role="link"]')
         auteur = ""
-        if await liens_auteur.count():
+        hrefs: list[str] = []
+        nombre_liens = await liens_auteur.count()
+        if nombre_liens:
             try:
                 auteur = await liens_auteur.first.inner_text()
             except Exception:
                 auteur = ""
+        for lien_index in range(nombre_liens):
+            try:
+                href = await liens_auteur.nth(lien_index).get_attribute("href")
+            except Exception:
+                href = None
+            if href:
+                hrefs.append(href)
+        post_id_reel, url_post = _extraire_identifiant_url_post_weblite(
+            hrefs, groupe.id
+        )
 
         post = _construire_post_weblite(
-            fragments, auteur, groupe.id, groupe.nom, maintenant
+            fragments,
+            auteur,
+            groupe.id,
+            groupe.nom,
+            maintenant,
+            post_id_reel=post_id_reel,
+            url_post=url_post,
         )
         if post is not None:
             posts.append(post)
@@ -1496,6 +1555,26 @@ async def _actualiser_fil_avant_scroll(
     await detecter_blocage_ou_session_expiree(page)
 
 
+def _lot_entierement_hors_fenetre(
+    posts: list[dict[str, Any]],
+    date_limite: datetime,
+) -> bool:
+    """Vrai seulement si chaque post possède une date groupe connue et ancienne."""
+    if not posts:
+        return False
+    for post in posts:
+        valeur = post.get("date_publication")
+        if not valeur:
+            return False
+        try:
+            date_post = datetime.fromisoformat(valeur)
+        except (TypeError, ValueError):
+            return False
+        if date_post >= date_limite:
+            return False
+    return True
+
+
 async def scraper_groupe(
     context: BrowserContext,
     groupe: "config.Groupe",
@@ -1557,6 +1636,12 @@ async def scraper_groupe(
             adaptatif a perdu confiance suite à des runs récents suspects).
     """
     date_limite = datetime.now(timezone.utc) - timedelta(days=max_days_back)
+    if post_repere and post_repere.startswith("weblite:"):
+        logger.info(
+            "Groupe %s : ancien post-repère synthétique ignoré ; attente d'un permalien réel.",
+            groupe.nom,
+        )
+        post_repere = None
     page = await context.new_page()
     nouveaux_posts: list[dict[str, Any]] = []
     posts_captures: list[dict[str, Any]] = []
@@ -1565,6 +1650,7 @@ async def scraper_groupe(
     # Défini tôt (avant le try) pour être toujours retournable, y compris si
     # une exception interrompt le scraping avant la fin normale de la fonction.
     nouveau_repere: str | None = None
+    date_nouveau_repere: datetime | None = None
     repere_trouve = False
     compteur_reponses_vues = 0
     compteur_reponses_matchees = 0
@@ -1697,6 +1783,7 @@ async def scraper_groupe(
         )
 
         etapes_sans_nouveau = 0
+        etapes_hors_fenetre = 0
         etapes_scroll = 0
 
         while etapes_scroll < config.MAX_PAGES_ABSOLU:
@@ -1716,6 +1803,34 @@ async def scraper_groupe(
             posts_dom = await _extraire_posts_weblite_dom(page, groupe)
             posts_dom_observes.update(post["id"] for post in posts_dom)
             nouveaux_bruts = posts_captures[debut_capture:] + posts_dom
+
+            # Le repère doit provenir d'un véritable id/permalien Facebook,
+            # jamais du hash auteur+texte qui confond deux republications.
+            for candidat_repere in nouveaux_bruts:
+                identifiant = str(candidat_repere.get("id") or "")
+                if not identifiant or identifiant.startswith("weblite:"):
+                    continue
+                valeur_date = candidat_repere.get("date_publication")
+                try:
+                    date_candidat = (
+                        datetime.fromisoformat(valeur_date)
+                        if valeur_date
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    date_candidat = None
+                if (
+                    nouveau_repere is None
+                    or (
+                        date_candidat is not None
+                        and (
+                            date_nouveau_repere is None
+                            or date_candidat > date_nouveau_repere
+                        )
+                    )
+                ):
+                    nouveau_repere = identifiant
+                    date_nouveau_repere = date_candidat
 
             # Détection du post-repère AVANT filtrage par seen_ids : le
             # repère provient forcément d'un run précédent, donc il est déjà
@@ -1743,11 +1858,8 @@ async def scraper_groupe(
                     seen_ids[p["id"]] = p["scrape_le"]
                 nouveaux_posts.extend(posts_inedits)
                 nb_posts_trouves_via_scroll += len(posts_inedits)
-                # Le premier post inédit rencontré est le plus proche du haut
-                # du fil sur ce run, donc le candidat le plus fiable comme
-                # "post le plus récent" - servira de repère au prochain passage.
-                if nouveau_repere is None:
-                    nouveau_repere = posts_inedits[0]["id"]
+                # Le repère est choisi plus haut uniquement parmi les ids
+                # Facebook réels et selon la date d'apparition dans le groupe.
             else:
                 etapes_sans_nouveau += 1
 
@@ -1763,20 +1875,33 @@ async def scraper_groupe(
             if repere_trouve:
                 break
 
-            # Critère d'arrêt "hors fenêtre temporelle" : uniquement sur posts datés.
-            posts_dates_connues = [p for p in posts_inedits if p["date_publication"]]
-            if posts_dates_connues:
-                plus_ancien = min(
-                    datetime.fromisoformat(p["date_publication"])
-                    for p in posts_dates_connues
+            # Une republication récente peut contenir une seconde date très
+            # ancienne (celle du post original). La fonction utilise seulement
+            # la date d'apparition dans le groupe et exige plusieurs lots
+            # consécutifs entièrement anciens avant d'arrêter.
+            if _lot_entierement_hors_fenetre(posts_inedits, date_limite):
+                etapes_hors_fenetre += 1
+                logger.info(
+                    "Groupe %s : lot entièrement hors fenêtre (%d/%d).",
+                    groupe.nom,
+                    etapes_hors_fenetre,
+                    config.NB_ETAPES_HORS_FENETRE_AVANT_ARRET,
                 )
-                if plus_ancien < date_limite:
-                    logger.info(
-                        "Groupe %s : posts hors fenêtre de %d jour(s) atteints, arrêt du scroll.",
-                        groupe.nom,
-                        max_days_back,
-                    )
-                    break
+            elif posts_inedits:
+                etapes_hors_fenetre = 0
+
+            if (
+                etapes_hors_fenetre
+                >= config.NB_ETAPES_HORS_FENETRE_AVANT_ARRET
+            ):
+                logger.info(
+                    "Groupe %s : %d lots consécutifs entièrement hors fenêtre "
+                    "de %d jour(s), arrêt du scroll.",
+                    groupe.nom,
+                    etapes_hors_fenetre,
+                    max_days_back,
+                )
+                break
 
             if etapes_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
                 logger.info(
