@@ -1390,6 +1390,85 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
 # --------------------------------------------------------------------------- #
 
 
+async def _cliquer_premier_libelle_visible(
+    page: Page,
+    libelles: tuple[str, ...],
+) -> str | None:
+    """Clique le premier élément visible correspondant exactement à un libellé."""
+    for libelle in libelles:
+        elements = page.get_by_text(libelle, exact=True)
+        try:
+            nombre = await elements.count()
+        except Exception:
+            continue
+        for index in range(nombre):
+            element = elements.nth(index)
+            try:
+                if await element.is_visible():
+                    await element.click(timeout=3_000)
+                    return libelle
+            except Exception:
+                continue
+    return None
+
+
+async def _selectionner_activite_recente(
+    page: Page,
+    groupe: "config.Groupe",
+) -> bool:
+    """Sélectionne le tri « Activité récente » avant l'actualisation du fil.
+
+    Facebook expose ce tri sous plusieurs libellés selon l'interface et la
+    langue. L'opération reste best-effort : les Pages et certaines variantes
+    mobiles n'ont pas ce menu, ce qui ne doit pas faire échouer tout le run.
+    """
+    declencheur = await _cliquer_premier_libelle_visible(
+        page,
+        (
+            "Trier",
+            "Sort",
+            "Plus pertinentes",
+            "Publications pertinentes",
+            "Posts pertinents",
+            "Most relevant",
+            "Activité récente",
+            "Recent activity",
+        ),
+    )
+    if declencheur is None:
+        logger.warning(
+            "Groupe %s : menu de tri introuvable ; ordre Facebook actuel conservé.",
+            groupe.nom,
+        )
+        return False
+
+    await asyncio.sleep(0.5)
+    choix = await _cliquer_premier_libelle_visible(
+        page,
+        (
+            "Activité récente",
+            "Activité la plus récente",
+            "Recent activity",
+        ),
+    )
+    if choix is None:
+        logger.warning(
+            "Groupe %s : option « Activité récente » introuvable après ouverture du tri.",
+            groupe.nom,
+        )
+        return False
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=5_000)
+    except PlaywrightTimeoutError:
+        pass
+    logger.info(
+        "Groupe %s : tri « Activité récente » sélectionné avant actualisation.",
+        groupe.nom,
+    )
+    return True
+
+
 async def _actualiser_fil_avant_scroll(
     page: Page,
     groupe: "config.Groupe",
@@ -1562,6 +1641,7 @@ async def scraper_groupe(
                 page.url,
             )
         await detecter_blocage_ou_session_expiree(page)
+        await _selectionner_activite_recente(page, groupe)
         await asyncio.sleep(
             random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
             * delai_multiplicateur
