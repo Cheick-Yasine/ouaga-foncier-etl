@@ -119,6 +119,24 @@ def test_validation_du_domaine_facebook():
         scraper._verifier_domaine_facebook("https://example.com/login")
 
 
+@pytest.mark.asyncio
+async def test_actualise_le_fil_et_revalide_la_session(monkeypatch):
+    page = SimpleNamespace(
+        url="https://m.facebook.com/groups/1",
+        reload=AsyncMock(),
+    )
+    groupe = config.Groupe(
+        "1", "Groupe 1", "https://m.facebook.com/groups/1", True, "1"
+    )
+    verifier_session = AsyncMock()
+    monkeypatch.setattr(scraper, "detecter_blocage_ou_session_expiree", verifier_session)
+
+    await scraper._actualiser_fil_avant_scroll(page, groupe)
+
+    page.reload.assert_awaited_once_with(wait_until="domcontentloaded")
+    verifier_session.assert_awaited_once_with(page)
+
+
 class _GestionnairePlaywright:
     async def __aenter__(self):
         return SimpleNamespace()
