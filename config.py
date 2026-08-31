@@ -723,6 +723,10 @@ PAUSE_ENTRE_BATCHES_MIN_S = 1200.0  # 20 minutes
 PAUSE_ENTRE_BATCHES_MAX_S = 1800.0  # 30 minutes
 
 MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
+# Un seul post ancien peut être un contenu original inclus dans une
+# republication récente. Il faut donc plusieurs lots consécutifs dont TOUTES
+# les dates d'apparition dans le groupe sont anciennes avant d'arrêter.
+NB_ETAPES_HORS_FENETRE_AVANT_ARRET = 2
 
 # FILET DE SÉCURITÉ uniquement depuis l'introduction du repère de reprise
 # (DERNIER_POST_CONNU_PATH, voir plus haut) : l'arrêt "normal" du scroll se
