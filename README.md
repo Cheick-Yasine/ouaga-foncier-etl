@@ -46,7 +46,7 @@ Schéma créé automatiquement au premier run (`processor.SCHEMA_SQL`, `CREATE T
 Points à connaître :
 - La base et l'export `data/processed/annonces.xlsx` sont **partagés par les 5 comptes** : l'upsert se fait par `id` de post, peu importe quel compte a scrapé le post.
 - Aucun repli silencieux sur une base locale : si `DATABASE_URL` est absente ou le serveur injoignable, le run échoue bruyamment (`psycopg.OperationalError`) plutôt que d'écrire dans le vide.
-- Le workflow tente en fin de run un `pg_dump` de la base dans l'artefact (sauvegarde optionnelle, `continue-on-error`) — voir les commentaires de `.github/workflows/daily_scraper.yml` sur le mismatch de version `pg_dump`/Neon rencontré en réel.
+- Le workflow n'envoie plus le dump PostgreSQL, les exports d'annonces ni les logs comme artefacts GitHub. La base Neon reste la source de vérité.
 - Les mots de passe sont masqués (`main._masquer_dsn`) avant tout affichage dans les logs ou le résumé GitHub Actions.
 - **`TEST_DATABASE_URL`** (tests uniquement) doit pointer sur une base **séparée** : la suite fait des `DROP TABLE` entre les tests. Absente → les tests concernés sont automatiquement skippés (voir "Tests").
 
@@ -146,10 +146,10 @@ python scripts/maj_cookies.py export_cookie_editor.json --repo <owner>/<repo> --
 Ce script (`scripts/maj_cookies.py`) :
 1. Valide l'export (mêmes règles que `scraper.charger_cookies` — présence de `c_user`/`xs`, tolérance au format brut d'extension `expirationDate`/`sameSite`).
 2. Met à jour le secret GitHub `FB_COOKIES_JSON_<compte>` (ou `FB_COOKIES_JSON` sans `--compte`) via `gh secret set` — ou affiche la commande/le JSON si `gh` n'est pas installé/authentifié, mise à jour manuelle alors possible depuis Settings → Secrets and variables → Actions.
-3. Purge le cooldown et le `storage_state` en cache localement (`data/state/compte_<n>/`, ou `data/state/` sans `--compte`) — **étape nécessaire**, pas juste pratique : `scraper._charger_cookies_caches()` donne priorité au `storage_state` mis en cache sur le secret de cookies à chaque run, et un cookie invalidé côté serveur Facebook n'a pas forcément de date d'expiration dépassée (le test de fraîcheur par date ne le détecte donc pas). Sans cette purge, le run suivant rechargeait silencieusement les cookies morts du cache au lieu des nouveaux, malgré la mise à jour du secret — le pipeline restait bloqué en boucle. (`scraper.invalider_storage_state` applique la même purge côté run : dès qu'une `SessionExpireeError` est détectée, le `storage_state` du run en cours n'est plus mis en cache du tout.)
-4. `--clear-actions-cache` est une opération exceptionnelle : le cache contient aussi `seen_post_ids.json`. Le script refuse désormais cette suppression sans la confirmation supplémentaire `--force-clear-actions-cache`.
+3. Purge localement le cooldown et le `storage_state` du compte afin que les nouveaux cookies soient utilisés immédiatement.
+4. `--clear-actions-cache` reste exceptionnel, car il supprime aussi l'historique de déduplication.
 
-Ne supprimez pas le cache Actions pour un renouvellement normal. Le run qui détecte une session expirée invalide déjà son `storage_state` tout en conservant l'historique des publications vues.
+Le workflow GitHub ne place plus `storage_state.json` dans Actions Cache : chaque nouveau job repart du secret `FB_COOKIES_JSON_<n>`. Seuls les identifiants de posts vus, le cooldown, la santé et l'index de rotation sont conservés dans un cache distinct.
 
 ## Pages Facebook
 
@@ -165,7 +165,7 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - `groups.csv` a une colonne `compte` en plus (`id,nom,url,actif,confidentialite,membres,compte`). Colonne **optionnelle** : un `groups.csv` sans cette colonne reste valide, tous les groupes sont alors traités comme appartenant au compte `"1"` (rétrocompatibilité avec l'ancien fonctionnement mono-compte).
 - `main.py` accepte `--compte {1,2,3,4,5}` : restreint le run au secret `FB_COOKIES_JSON_<compte>`, à un état persistant isolé (`data/state/compte_<n>/`), et aux groupes de `groups.csv` assignés à ce compte. Omis (comportement historique) : secret `FB_COOKIES_JSON` unique, état global, tous les groupes actifs confondus.
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
-- Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`), chacun a son propre cache d'état (`etat-scraper-compte-<n>-*`) et son propre artefact (`annonces-foncieres-compte-<n>-*`).
+- Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`). Chaque compte conserve seulement son état non sensible dans un cache distinct.
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
 - `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
