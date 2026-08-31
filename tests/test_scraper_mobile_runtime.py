@@ -137,6 +137,66 @@ async def test_actualise_le_fil_et_revalide_la_session(monkeypatch):
     verifier_session.assert_awaited_once_with(page)
 
 
+
+
+def _locator_libelle(noeud=None):
+    nombre = 1 if noeud is not None else 0
+    return SimpleNamespace(
+        count=AsyncMock(return_value=nombre),
+        nth=Mock(return_value=noeud),
+    )
+
+
+@pytest.mark.asyncio
+async def test_selectionne_activite_recente_avant_actualisation(monkeypatch):
+    declencheur = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        click=AsyncMock(),
+    )
+    option_recente = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        click=AsyncMock(),
+    )
+
+    def localiser(libelle, exact=True):
+        assert exact is True
+        if libelle == "Plus pertinentes":
+            return _locator_libelle(declencheur)
+        if libelle == "Activité récente":
+            return _locator_libelle(option_recente)
+        return _locator_libelle()
+
+    page = SimpleNamespace(
+        get_by_text=Mock(side_effect=localiser),
+        wait_for_load_state=AsyncMock(),
+    )
+    groupe = config.Groupe(
+        "1", "Groupe 1", "https://m.facebook.com/groups/1", True, "1"
+    )
+    monkeypatch.setattr(scraper.asyncio, "sleep", AsyncMock())
+
+    resultat = await scraper._selectionner_activite_recente(page, groupe)
+
+    assert resultat is True
+    declencheur.click.assert_awaited_once_with(timeout=3_000)
+    option_recente.click.assert_awaited_once_with(timeout=3_000)
+    page.wait_for_load_state.assert_awaited_once_with(
+        "domcontentloaded", timeout=5_000
+    )
+
+
+@pytest.mark.asyncio
+async def test_tri_absent_ne_fait_pas_echouer_une_page():
+    page = SimpleNamespace(
+        get_by_text=Mock(return_value=_locator_libelle()),
+    )
+    groupe = config.Groupe(
+        "page", "Page sans tri", "https://m.facebook.com/page", True, "4"
+    )
+
+    assert await scraper._selectionner_activite_recente(page, groupe) is False
+
+
 class _GestionnairePlaywright:
     async def __aenter__(self):
         return SimpleNamespace()
