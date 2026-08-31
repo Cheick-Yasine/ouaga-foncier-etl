@@ -158,17 +158,12 @@ def proxy_playwright(
         http://hote:port                          (proxy sans authentification)
         socks5://utilisateur:motdepasse@hote:port  (Playwright supporte aussi SOCKS5)
 
-    En mode multi-comptes, le proxy reste obligatoire par défaut. Une
-    connexion directe doit être autorisée explicitement avec
-    ALLOW_DIRECT_CONNECTION=true. Le workflow auto-hébergé utilise ce drapeau
-    uniquement en mode réseau « direct », afin qu'une omission accidentelle de
-    secret proxy ne fasse pas basculer silencieusement un runner hébergé.
+    En mode multi-comptes, le proxy est obligatoire par défaut afin qu'un
+    secret absent ou mal formé ne fasse jamais basculer silencieusement le job
+    sur l'IP du runner GitHub. Le mode mono-compte historique reste optionnel.
     """
     if obligatoire is None:
-        connexion_directe = os.environ.get(
-            "ALLOW_DIRECT_CONNECTION", ""
-        ).strip().lower() in {"1", "true", "vrai", "yes", "oui"}
-        obligatoire = compte is not None and not connexion_directe
+        obligatoire = compte is not None
 
     nom_variable = nom_secret_proxy(compte)
     valeur = os.environ.get(nom_variable, "").strip()

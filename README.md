@@ -46,7 +46,7 @@ Schéma créé automatiquement au premier run (`processor.SCHEMA_SQL`, `CREATE T
 Points à connaître :
 - La base et l'export `data/processed/annonces.xlsx` sont **partagés par les 5 comptes** : l'upsert se fait par `id` de post, peu importe quel compte a scrapé le post.
 - Aucun repli silencieux sur une base locale : si `DATABASE_URL` est absente ou le serveur injoignable, le run échoue bruyamment (`psycopg.OperationalError`) plutôt que d'écrire dans le vide.
-- Sur le runner auto-hébergé, aucun dump PostgreSQL ni export contenant des annonces n'est envoyé comme artefact GitHub. La base Neon reste la source de vérité et les fichiers de travail restent sur le PC.
+- Le workflow n'envoie plus le dump PostgreSQL, les exports d'annonces ni les logs comme artefacts GitHub. La base Neon reste la source de vérité.
 - Les mots de passe sont masqués (`main._masquer_dsn`) avant tout affichage dans les logs ou le résumé GitHub Actions.
 - **`TEST_DATABASE_URL`** (tests uniquement) doit pointer sur une base **séparée** : la suite fait des `DROP TABLE` entre les tests. Absente → les tests concernés sont automatiquement skippés (voir "Tests").
 
@@ -75,11 +75,11 @@ Un proxy (résidentiel ou mobile de préférence — un proxy datacenter n'appor
     http://hote:port                          # proxy sans authentification
     socks5://utilisateur:motdepasse@hote:port  # Playwright supporte aussi SOCKS5
     ```
-  - En mode `proxy`, `PROXY_URL_<n>` est obligatoire. En mode `direct`, réservé au runner auto-hébergé, le workflow injecte `ALLOW_DIRECT_CONNECTION=true` et laisse volontairement les URL de proxy vides.
+  - En mode multi-comptes, `PROXY_URL_<n>` est obligatoire. Une valeur absente ou invalide arrête clairement le job concerné au lieu de le laisser sortir silencieusement par l'IP GitHub. Le mode mono-compte historique conserve un proxy optionnel.
   - En local : ajouter `PROXY_URL` (ou `PROXY_URL_1`…`PROXY_URL_5`) à `.env`.
-  - En CI : les secrets `PROXY_URL_1`…`PROXY_URL_5` ne sont utilisés que si l'entrée manuelle `network_mode=proxy` est choisie. Le cron du runner auto-hébergé utilise `network_mode=direct`.
+  - En CI : créer les secrets `PROXY_URL_1`…`PROXY_URL_5` (Settings → Secrets and variables → Actions) — idéalement un proxy **distinct par compte**, pour que chacun des 5 comptes conserve une IP de sortie cohérente d'un run à l'autre (comme un vrai navigateur qui revient), plutôt que 5 comptes partageant une même IP proxy, qui reconstituerait le même signal de risque à une autre échelle. Le workflow (`daily_scraper.yml`) injecte déjà ces 5 secrets vers le job matriciel correspondant.
 
-Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` et compare le pays observé au pays attendu, avec ou sans proxy. En mode direct, le workflow impose `BF` et `Africa/Ouagadougou`. Les variables suivantes restent configurables en mode proxy :
+Avant Facebook, chaque contexte ouvre `https://ip.decodo.com/json` par le même proxy et compare le pays observé au pays attendu. Les variables GitHub Actions suivantes sont configurables par compte :
 
 - `PROXY_COUNTRY_1`…`PROXY_COUNTRY_5` : code ISO à deux lettres, `BF` par défaut ;
 - `BROWSER_LOCALE_1`…`BROWSER_LOCALE_5` : `fr-FR` par défaut ;
@@ -146,10 +146,10 @@ python scripts/maj_cookies.py export_cookie_editor.json --repo <owner>/<repo> --
 Ce script (`scripts/maj_cookies.py`) :
 1. Valide l'export (mêmes règles que `scraper.charger_cookies` — présence de `c_user`/`xs`, tolérance au format brut d'extension `expirationDate`/`sameSite`).
 2. Met à jour le secret GitHub `FB_COOKIES_JSON_<compte>` (ou `FB_COOKIES_JSON` sans `--compte`) via `gh secret set` — ou affiche la commande/le JSON si `gh` n'est pas installé/authentifié, mise à jour manuelle alors possible depuis Settings → Secrets and variables → Actions.
-3. Purge le cooldown et le `storage_state` en cache localement (`data/state/compte_<n>/`, ou `data/state/` sans `--compte`) — **étape nécessaire**, pas juste pratique : `scraper._charger_cookies_caches()` donne priorité au `storage_state` mis en cache sur le secret de cookies à chaque run, et un cookie invalidé côté serveur Facebook n'a pas forcément de date d'expiration dépassée (le test de fraîcheur par date ne le détecte donc pas). Sans cette purge, le run suivant rechargeait silencieusement les cookies morts du cache au lieu des nouveaux, malgré la mise à jour du secret — le pipeline restait bloqué en boucle. (`scraper.invalider_storage_state` applique la même purge côté run : dès qu'une `SessionExpireeError` est détectée, le `storage_state` du run en cours n'est plus mis en cache du tout.)
-4. `--clear-actions-cache` est une opération exceptionnelle : le cache contient aussi `seen_post_ids.json`. Le script refuse désormais cette suppression sans la confirmation supplémentaire `--force-clear-actions-cache`.
+3. Purge localement le cooldown et le `storage_state` du compte afin que les nouveaux cookies soient utilisés immédiatement.
+4. `--clear-actions-cache` reste exceptionnel, car il supprime aussi l'historique de déduplication.
 
-Ne supprimez pas le cache Actions pour un renouvellement normal. Le run qui détecte une session expirée invalide déjà son `storage_state` tout en conservant l'historique des publications vues.
+Le workflow GitHub ne place plus `storage_state.json` dans Actions Cache : chaque nouveau job repart du secret `FB_COOKIES_JSON_<n>`. Seuls les identifiants de posts vus, le cooldown, la santé et l'index de rotation sont conservés dans un cache distinct.
 
 ## Pages Facebook
 
@@ -165,9 +165,9 @@ Depuis le 2026-08-26, les groupes de `groups.csv` sont répartis entre **5 compt
 - `groups.csv` a une colonne `compte` en plus (`id,nom,url,actif,confidentialite,membres,compte`). Colonne **optionnelle** : un `groups.csv` sans cette colonne reste valide, tous les groupes sont alors traités comme appartenant au compte `"1"` (rétrocompatibilité avec l'ancien fonctionnement mono-compte).
 - `main.py` accepte `--compte {1,2,3,4,5}` : restreint le run au secret `FB_COOKIES_JSON_<compte>`, à un état persistant isolé (`data/state/compte_<n>/`), et aux groupes de `groups.csv` assignés à ce compte. Omis (comportement historique) : secret `FB_COOKIES_JSON` unique, état global, tous les groupes actifs confondus.
 - **5 secrets GitHub distincts** à créer (Settings → Secrets and variables → Actions) : `FB_COOKIES_JSON_1` … `FB_COOKIES_JSON_5`, un export Cookie-Editor par compte dédié (voir section précédente pour la procédure d'export/régénération, identique par compte).
-- Le workflow `.github/workflows/daily_scraper.yml` crée **5 jobs indépendants** (matrice `compte: ["1".."5"]`). Avec un seul runner auto-hébergé, ils s'exécutent l'un après l'autre ; leur état reste dans `data/state/compte_<n>/` sur le PC.
+- Le workflow `.github/workflows/daily_scraper.yml` lance **5 jobs indépendants en parallèle** (matrice `compte: ["1".."5"]`) : un blocage/cooldown sur l'un ne bloque pas les autres (`fail-fast: false`). Chaque compte conserve seulement son état non sensible dans un cache distinct.
 - La base PostgreSQL (`DATABASE_URL`) et `data/processed/annonces.xlsx` restent **partagés** entre les 5 comptes : upsert par `id` de post, peu importe quel compte a scrapé quel post — c'est toujours la même annonce.
-- `data/state/compte_<n>/seen_post_ids.json` conserve localement sur le PC la déduplication des posts déjà vus pour chaque compte.
+- `data/state/compte_<n>/seen_post_ids.json` conserve la déduplication des posts déjà vus pour chaque compte et est restauré par le cache matriciel correspondant.
 
 **Répartition actuelle** (`groups.csv`) : 25 entrées, exactement 5 par compte. Les deux seules entrées `actif=false` (`1412949025757240`, `352566539534344`) sont toutes les deux assignées au **compte 3**, qui ne traite donc que **3 groupes actifs** contre 5 pour les quatre autres comptes. Ce n'est pas un bug (le filtrage `actif`/`compte` fonctionne comme prévu) mais un déséquilibre de charge : à rééquilibrer en réassignant deux groupes vers le compte 3 si l'on veut une répartition réellement homogène.
 
@@ -190,27 +190,6 @@ ouaga-foncier-etl/
 ├── scripts/maj_cookies.py  # recharge FB_COOKIES_JSON(_n) depuis un export Cookie-Editor (voir ci-dessus)
 └── tests/           # une suite par module, API OpenAI et navigateur entièrement mockés
 ```
-
-## Runner GitHub Actions auto-hébergé (Windows)
-
-Le job de tests reste sur `ubuntu-latest`. Seul le scraping utilise le PC
-Windows, avec les labels `self-hosted`, `Windows`, `X64` et
-`ouaga-foncier`. En mode `direct`, aucune variable `PROXY_URL_<n>` n'est
-transmise : la connexion Internet résidentielle du PC est utilisée.
-
-Dans GitHub : **Settings → Actions → Runners → New self-hosted runner**,
-choisir **Windows / x64**, puis exécuter dans PowerShell les commandes
-personnalisées affichées par GitHub. Pendant la configuration, ajouter le label
-`ouaga-foncier`. Installer le runner comme service permet aux crons de
-fonctionner sans ouvrir PowerShell, mais le PC doit rester allumé et connecté.
-
-Sur le PC, Python 3.12 doit être disponible. Le workflow installe ensuite les
-dépendances et Chromium automatiquement. Le checkout est volontairement lancé
-avec `clean: false` afin de conserver `data/state/compte_<n>/` entre les
-runs. Les cookies de session, les exports et le dump PostgreSQL ne sont pas
-envoyés dans les caches ou artefacts GitHub. Pour un premier essai manuel :
-`compte=1`, `network_mode=direct`, `days_back=1`, `group_limit=1`,
-`batch_size=1`.
 
 ## Installation
 

@@ -245,16 +245,9 @@ class TestProxyPlaywright:
         assert config.proxy_playwright(None) is None
 
     def test_vide_multicompte_leve_une_erreur(self, monkeypatch):
-        monkeypatch.delenv("ALLOW_DIRECT_CONNECTION", raising=False)
         monkeypatch.setenv("PROXY_URL_2", "   ")
         with pytest.raises(ValueError, match="PROXY_URL_2"):
             config.proxy_playwright("2")
-
-    @pytest.mark.parametrize("valeur", ["1", "true", "vrai", "yes", "oui", " TRUE "])
-    def test_connexion_directe_explicitement_autorisee(self, monkeypatch, valeur):
-        monkeypatch.setenv("ALLOW_DIRECT_CONNECTION", valeur)
-        monkeypatch.setenv("PROXY_URL_2", "   ")
-        assert config.proxy_playwright("2") is None
 
     def test_vide_reste_optionnel_en_mono_compte(self, monkeypatch):
         monkeypatch.setenv("PROXY_URL", "   ")
