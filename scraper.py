@@ -1,20 +1,5 @@
 """Scraping Facebook (Playwright async) - mode quotidien et rattrapage (backfill).
 
-AVERTISSEMENT - À LIRE AVANT TOUTE EXÉCUTION
----------------------------------------------
-Ce module automatise la navigation sur des groupes Facebook avec une session
-authentifiée (cookies exportés depuis un compte réel). Cela contrevient aux
-Conditions d'Utilisation de Meta, qui interdisent explicitement la collecte
-automatisée de données ("scraping"). Risques concrets et non hypothétiques :
-  - bannissement/désactivation du compte Facebook utilisé pour les cookies ;
-  - blocage de l'IP/du fingerprint utilisé par le runner GitHub Actions ;
-  - exposition légale selon la juridiction (CGU contractuelles + réglementation
-    locale sur les données personnelles, puisque les posts contiennent des
-    numéros de téléphone de tiers).
-Ce projet étant présenté comme académique, il est de la responsabilité de
-l'utilisateur de : (1) utiliser un compte dédié, pas un compte personnel
-principal, (2) ne pas redistribuer les données personnelles collectées,
-(3) vérifier la réglementation applicable avant tout usage en production.
 
 CHOIX D'ARCHITECTURE : entrée mobile, extraction JSON Comet compatible
 -----------------------------------------------------------------------
