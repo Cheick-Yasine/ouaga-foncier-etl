@@ -2115,6 +2115,8 @@ async def executer_scraping(
                     posts: list[dict[str, Any]] = []
                     nouveau_repere: str | None = None
                     seen_avant_groupe = dict(seen_ids)
+                    # Le backfill relit la période, même si les anciens bruts ont disparu.
+                    seen_pour_groupe = {} if mode == "backfill" else seen_ids
                     try:
                         cookies_caches = _charger_cookies_caches(compte)
                         cookies = (
@@ -2132,9 +2134,9 @@ async def executer_scraping(
                             contexte,
                             groupe,
                             days_back,
-                            seen_ids,
+                            seen_pour_groupe,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
-                            post_repere=reperes_dernier_post.get(groupe.id),
+                            post_repere=None if mode == "backfill" else reperes_dernier_post.get(groupe.id),
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
@@ -2215,6 +2217,7 @@ async def executer_scraping(
                             fichiers_sauvegardes.append(
                                 sauvegarder_posts_groupe(posts, groupe.id)
                             )
+                        seen_ids.update(seen_pour_groupe)
                         sauvegarder_seen_ids(seen_ids, compte=compte)
                         sauvegarder_dernier_post_connu(
                             reperes_dernier_post, compte

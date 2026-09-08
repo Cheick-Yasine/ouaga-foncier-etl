@@ -58,7 +58,7 @@ def pending_files(db, root):
     return [p for p in sorted((root / 'raw').glob('*.json')) if p.name not in done]
 
 
-def execute_account(account, base, collect_timeout, process_timeout, process_only=False):
+def execute_account(account, base, collect_timeout, process_timeout, process_only=False, backfill_days=None):
     root = base / f'compte_{account}'
     root.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, OUAGA_DATA_DIR=str(root))
@@ -81,9 +81,13 @@ def execute_account(account, base, collect_timeout, process_timeout, process_onl
                 days = max(2, math.ceil(elapsed) + 1)
                 gap_exceeded = days > 14
                 days = min(days, 14)
-            code = None if process_only else run_child(['--compte', account, '--collect-only', '--days-back', str(days)], env, collect_timeout)
+            mode = 'backfill' if backfill_days is not None else 'daily'
+            if backfill_days is not None:
+                days = backfill_days
+                gap_exceeded = False
+            code = None if process_only else run_child(['--compte', account, '--collect-only', '--mode', mode, '--days-back', str(days)], env, collect_timeout)
             for path in pending_files(db, root):
-                result = run_child(['--compte', account, '--process-file', str(path)], env, process_timeout)
+                result = run_child(['--compte', account, '--mode', mode, '--process-file', str(path)], env, process_timeout)
                 if result:
                     # Pas de boucle infinie payante : reprise au prochain passage.
                     break
@@ -98,7 +102,7 @@ def execute_account(account, base, collect_timeout, process_timeout, process_onl
             finished = now()
             db.execute('UPDATE runs SET finished=?, collect_code=?, pending=?, status=? WHERE id=?', (finished, code, pending, status, ident))
             db.commit()
-            summary = dict(compte=account, fin=finished, collecte_code=code, fichiers_en_attente=pending, statut=status, jours_recherches=days)
+            summary = dict(compte=account, fin=finished, collecte_code=code, fichiers_en_attente=pending, statut=status, jours_recherches=days, mode=mode)
             atomic_json(root / 'status.json', summary)
             print(json.dumps(summary, ensure_ascii=False), flush=True)
             return int(code not in (0, None) or pending > 0 or gap_exceeded)
@@ -115,15 +119,18 @@ def main(argv=None):
     parser.add_argument('--collect-timeout', type=int, default=7200)
     parser.add_argument('--process-timeout', type=int, default=1800)
     parser.add_argument('--process-only', action='store_true')
+    parser.add_argument('--backfill-days', type=int, help='Rattrapage de 1 à 14 jours, sans arrêt aux anciens repères.')
     args = parser.parse_args(argv)
     if min(args.collect_timeout, args.process_timeout) <= 0:
         parser.error('Les durées doivent être positives.')
+    if args.backfill_days is not None and not 1 <= args.backfill_days <= 14:
+        parser.error('--backfill-days doit être compris entre 1 et 14.')
     base = args.data_dir.expanduser().resolve()
     accounts = list('12345') if args.compte == 'all' else [args.compte]
     failed = 0
     for account in accounts:
         try:
-            failed |= execute_account(account, base, args.collect_timeout, args.process_timeout, args.process_only)
+            failed |= execute_account(account, base, args.collect_timeout, args.process_timeout, args.process_only, args.backfill_days)
         except Exception as exc:
             print(f'Compte {account} : superviseur interrompu ({type(exc).__name__}). Vérifier le journal local.', file=sys.stderr)
             failed = 1

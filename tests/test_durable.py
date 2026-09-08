@@ -119,3 +119,14 @@ def test_backup_restores_journal_and_excludes_sessions(tmp_path):
     db = daily.journal(tmp_path / 'restore/compte_1/journal.sqlite3')
     assert db.execute('SELECT path FROM processed').fetchone()[0] == 'one.json'
     db.close()
+
+
+def test_backfill_passes_window_and_mode_to_children(tmp_path, monkeypatch):
+    root = tmp_path / 'compte_1' / 'raw'
+    root.mkdir(parents=True)
+    (root / 'one.json').write_text('[]')
+    calls = []
+    monkeypatch.setattr(daily, 'run_child', lambda args, *a: calls.append(args) or 0)
+    assert daily.execute_account('1', tmp_path, 10, 10, backfill_days=8) == 0
+    assert calls[0][calls[0].index('--days-back') + 1] == '8'
+    assert all(args[args.index('--mode') + 1] == 'backfill' for args in calls)

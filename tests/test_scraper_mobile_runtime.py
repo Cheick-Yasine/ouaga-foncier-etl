@@ -263,9 +263,11 @@ class _GestionnairePlaywright:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("erreur_second_groupe", [False, True])
+@pytest.mark.parametrize("mode", ["daily", "backfill"])
 async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     monkeypatch,
     erreur_second_groupe,
+    mode,
 ):
     groupes = [
         config.Groupe("1", "Groupe 1", "https://m.facebook.com/groups/1", True, "1"),
@@ -287,8 +289,9 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     monkeypatch.setattr(config, "proxy_playwright", lambda compte: {"server": "http://proxy:80"})
     monkeypatch.setattr(scraper, "verifier_cooldown", lambda compte: None)
     monkeypatch.setattr(scraper, "charger_sante", lambda compte: {"niveau_confiance": 1.0})
-    monkeypatch.setattr(scraper, "charger_seen_ids", lambda compte: {})
-    monkeypatch.setattr(scraper, "charger_dernier_post_connu", lambda compte: {})
+    historique = {"ancien": "2026-09-02T12:00:00+00:00"}
+    monkeypatch.setattr(scraper, "charger_seen_ids", lambda compte: historique)
+    monkeypatch.setattr(scraper, "charger_dernier_post_connu", lambda compte: {"1": "ancien", "2": "ancien"})
     monkeypatch.setattr(scraper, "_charger_cookies_caches", lambda compte: None)
     monkeypatch.setattr(scraper, "async_playwright", lambda: _GestionnairePlaywright())
     monkeypatch.setattr(
@@ -317,7 +320,7 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     monkeypatch.setattr(scraper.asyncio, "sleep", AsyncMock())
 
     call = scraper.executer_scraping(
-        mode="daily", days_back=1, group_limit=None, groups_batch_size=1, compte="1"
+        mode=mode, days_back=8, group_limit=None, groups_batch_size=1, compte="1"
     )
     if erreur_second_groupe:
         with pytest.raises(RuntimeError, match="Collecte partielle"):
@@ -326,6 +329,11 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
         await call
     scraper.verifier_proxy_et_region.assert_not_awaited()
     assert all(c.args[3] is None for c in scraper.creer_navigateur.await_args_list)
+
+    assert "ancien" in historique
+    for c in scraper.scraper_groupe.await_args_list:
+        assert c.kwargs["post_repere"] == (None if mode == "backfill" else "ancien")
+        assert ("ancien" in c.args[3]) == (mode == "daily")
 
     assert scraper.creer_navigateur.await_count == 2
     for contexte in contextes:
