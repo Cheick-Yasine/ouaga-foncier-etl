@@ -233,57 +233,11 @@ class TestEtatParCompte:
         assert config.nom_secret_cookies("3") == "FB_COOKIES_JSON_3"
 
 class TestProxyPlaywright:
-    """Parsing de l'URL de proxy optionnelle (voir config.proxy_playwright,
-    section README "Proxy (réputation IP/ASN)")."""
-
-    def test_nom_secret_proxy(self):
-        assert config.nom_secret_proxy(None) == "PROXY_URL"
-        assert config.nom_secret_proxy("3") == "PROXY_URL_3"
-
-    def test_absent_retourne_none(self, monkeypatch):
-        monkeypatch.delenv("PROXY_URL", raising=False)
-        assert config.proxy_playwright(None) is None
-
-    def test_vide_multicompte_leve_une_erreur(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL_2", "   ")
-        with pytest.raises(ValueError, match="PROXY_URL_2"):
-            config.proxy_playwright("2")
-
-    def test_vide_reste_optionnel_en_mono_compte(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL", "   ")
-        assert config.proxy_playwright(None) is None
-
-    def test_avec_authentification(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL_1", "http://alice:s3cret@proxy.example.com:8080")
-        assert config.proxy_playwright("1") == {
-            "server": "http://proxy.example.com:8080",
-            "username": "alice",
-            "password": "s3cret",
-        }
-
-    def test_sans_authentification(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL_4", "http://proxy.example.com:3128")
-        assert config.proxy_playwright("4") == {
-            "server": "http://proxy.example.com:3128",
-        }
-
-    def test_identifiants_encodes_url_sont_decodes(self, monkeypatch):
-        monkeypatch.setenv(
-            "PROXY_URL_5", "http://user%40x:p%40ss@proxy.example.com:8080"
-        )
-        proxy = config.proxy_playwright("5")
-        assert proxy["username"] == "user@x"
-        assert proxy["password"] == "p@ss"
-
-    def test_url_illisible_multicompte_leve_une_erreur(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL_3", "ceci-nest-pas-une-url-de-proxy")
-        with pytest.raises(ValueError, match="PROXY_URL_3"):
-            config.proxy_playwright("3")
-
-    def test_schema_non_supporte_est_refuse(self, monkeypatch):
-        monkeypatch.setenv("PROXY_URL_1", "ftp://proxy.example.com:21")
-        with pytest.raises(ValueError, match="invalide"):
-            config.proxy_playwright("1")
+    def test_anciens_secrets_ignores_pour_tous_les_comptes(self, monkeypatch):
+        monkeypatch.setenv("PROXY_URL", "http://ancien:secret@invalid:80")
+        for compte in [None, "1", "2", "3", "4", "5"]:
+            monkeypatch.setenv(f"PROXY_URL_{compte}", "invalide")
+            assert config.proxy_playwright(compte) is None
 
 
 class TestProfilMobileEtRegion:

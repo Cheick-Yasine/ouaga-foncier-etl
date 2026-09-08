@@ -316,13 +316,16 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     monkeypatch.setattr(scraper, "sauvegarder_sante", Mock())
     monkeypatch.setattr(scraper.asyncio, "sleep", AsyncMock())
 
-    await scraper.executer_scraping(
-        mode="daily",
-        days_back=1,
-        group_limit=None,
-        groups_batch_size=1,
-        compte="1",
+    call = scraper.executer_scraping(
+        mode="daily", days_back=1, group_limit=None, groups_batch_size=1, compte="1"
     )
+    if erreur_second_groupe:
+        with pytest.raises(RuntimeError, match="Collecte partielle"):
+            await call
+    else:
+        await call
+    scraper.verifier_proxy_et_region.assert_not_awaited()
+    assert all(c.args[3] is None for c in scraper.creer_navigateur.await_args_list)
 
     assert scraper.creer_navigateur.await_count == 2
     for contexte in contextes:

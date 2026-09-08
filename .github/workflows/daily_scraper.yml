@@ -3,12 +3,6 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 on:
   pull_request:
     branches: [main]
-  schedule:
-    # Les expressions cron restent nécessairement statiques. Les minutes 17 et
-    # 41 peuvent être modifiées manuellement ; le véritable décalage aléatoire
-    # est appliqué au démarrage par le step de délai 0-30 min ci-dessous.
-    - cron: "17 0 * * *"
-    - cron: "41 12 * * *"
   workflow_dispatch:
     inputs:
       compte:
@@ -16,31 +10,6 @@ on:
         type: choice
         options: [all, "1", "2", "3", "4", "5"]
         default: all
-      mode:
-        description: "Mode d'exécution"
-        type: choice
-        options: [daily, backfill]
-        default: daily
-      days_back:
-        description: "Nombre de jours à remonter (surtout pertinent en mode backfill)"
-        type: string
-        default: "7"
-      round_robin:
-        description: "Round-robin (1-2 groupes/run) plutôt que tous les groupes d'un coup"
-        type: boolean
-        default: false
-      groups_per_run:
-        description: "Nombre de groupes traités ce run (utilisé si round_robin=true)"
-        type: string
-        default: "1"
-      group_limit:
-        description: "Nombre max de groupes traités sur ce run (ignoré si round_robin=true ; 0 = tous)"
-        type: string
-        default: "0"
-      batch_size:
-        description: "Taille des lots de groupes entre deux pauses longues anti-détection"
-        type: string
-        default: "5"
 
 permissions:
   contents: read
@@ -83,121 +52,21 @@ jobs:
         run: pytest -q
 
   scrape-and-process:
-    if: github.event_name != 'pull_request'
+    # Collecte locale planifiée par le système ; GitHub sert au lancement manuel.
+    # Activer la variable seulement après installation du runner persistant.
+    if: github.event_name == 'workflow_dispatch' && vars.OUAGA_LOCAL_RUNNER_READY == 'true'
     needs: tests
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        compte: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.compte != 'all' && format('["{0}"]', inputs.compte) || '["1","2","3","4","5"]') }}
+    runs-on: [self-hosted, linux, ouaga-etl]
     timeout-minutes: 360
     concurrency:
-      group: ouaga-foncier-etl-compte-${{ matrix.compte }}
+      group: ouaga-etl-local
       cancel-in-progress: false
     steps:
-      - name: "Checkout du dépôt"
-        uses: actions/checkout@v4
-
-      - name: "Configuration Python"
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12.7"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
-
-      - name: "Installation des dépendances Python"
-        run: pip install -r requirements.txt
-
-      - name: "Installation de Chromium (Playwright)"
-        run: playwright install --with-deps chromium
-
-      - name: "Restauration de l'état non sensible"
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            data/state/compte_${{ matrix.compte }}/seen_post_ids.json
-            data/state/compte_${{ matrix.compte }}/dernier_post_connu.json
-            data/state/compte_${{ matrix.compte }}/cooldown_until.json
-            data/state/compte_${{ matrix.compte }}/sante_scraper.json
-            data/state/compte_${{ matrix.compte }}/prochain_groupe_index.json
-          key: etat-sans-session-compte-${{ matrix.compte }}-${{ github.run_id }}
-          restore-keys: |
-            etat-sans-session-compte-${{ matrix.compte }}-
-
-      - name: "Délai aléatoire avant démarrage (cron uniquement)"
-        if: github.event_name == 'schedule'
-        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes (jitter permanent)
-
-      - name: "Résolution des paramètres d'exécution"
-        id: params
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "mode=daily" >> "$GITHUB_OUTPUT"
-            echo "days_back=1" >> "$GITHUB_OUTPUT"
-            echo "round_robin=false" >> "$GITHUB_OUTPUT"
-            echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
-            echo "group_limit=0" >> "$GITHUB_OUTPUT"
-            echo "batch_size=5" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
-            echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
-            echo "round_robin=${{ github.event.inputs.round_robin }}" >> "$GITHUB_OUTPUT"
-            echo "groups_per_run=${{ github.event.inputs.groups_per_run }}" >> "$GITHUB_OUTPUT"
-            echo "group_limit=${{ github.event.inputs.group_limit }}" >> "$GITHUB_OUTPUT"
-            echo "batch_size=${{ github.event.inputs.batch_size }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: "Exécution du pipeline ETL"
+      - uses: actions/checkout@v4
+      - name: Collecte et reprise sur le stockage local
         env:
-          FB_COOKIES_JSON_1: ${{ secrets.FB_COOKIES_JSON_1 }}
-          FB_COOKIES_JSON_2: ${{ secrets.FB_COOKIES_JSON_2 }}
-          FB_COOKIES_JSON_3: ${{ secrets.FB_COOKIES_JSON_3 }}
-          FB_COOKIES_JSON_4: ${{ secrets.FB_COOKIES_JSON_4 }}
-          FB_COOKIES_JSON_5: ${{ secrets.FB_COOKIES_JSON_5 }}
-          PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
-          PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
-          PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
-          PROXY_URL_4: ${{ secrets.PROXY_URL_4 }}
-          PROXY_URL_5: ${{ secrets.PROXY_URL_5 }}
-          PROXY_COUNTRY_1: ${{ vars.PROXY_COUNTRY_1 || 'FR' }}
-          PROXY_COUNTRY_2: ${{ vars.PROXY_COUNTRY_2 }}
-          PROXY_COUNTRY_3: ${{ vars.PROXY_COUNTRY_3 }}
-          PROXY_COUNTRY_4: ${{ vars.PROXY_COUNTRY_4 }}
-          PROXY_COUNTRY_5: ${{ vars.PROXY_COUNTRY_5 }}
-          BROWSER_LOCALE_1: ${{ vars.BROWSER_LOCALE_1 || 'fr-FR' }}
-          BROWSER_LOCALE_2: ${{ vars.BROWSER_LOCALE_2 }}
-          BROWSER_LOCALE_3: ${{ vars.BROWSER_LOCALE_3 }}
-          BROWSER_LOCALE_4: ${{ vars.BROWSER_LOCALE_4 }}
-          BROWSER_LOCALE_5: ${{ vars.BROWSER_LOCALE_5 }}
-          BROWSER_TIMEZONE_1: ${{ vars.BROWSER_TIMEZONE_1 || 'Europe/Paris' }}
-          BROWSER_TIMEZONE_2: ${{ vars.BROWSER_TIMEZONE_2 }}
-          BROWSER_TIMEZONE_3: ${{ vars.BROWSER_TIMEZONE_3 }}
-          BROWSER_TIMEZONE_4: ${{ vars.BROWSER_TIMEZONE_4 }}
-          BROWSER_TIMEZONE_5: ${{ vars.BROWSER_TIMEZONE_5 }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          COMPTE: ${{ inputs.compte }}
+          OUAGA_PERSISTENT_DIR: ${{ vars.OUAGA_PERSISTENT_DIR }}
         run: |
-          ARGS=(
-            --compte "${{ matrix.compte }}"
-            --mode "${{ steps.params.outputs.mode }}"
-            --days-back "${{ steps.params.outputs.days_back }}"
-            --group-limit "${{ steps.params.outputs.group_limit }}"
-            --batch-size "${{ steps.params.outputs.batch_size }}"
-          )
-          if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
-            ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
-          fi
-          python main.py "${ARGS[@]}"
-
-      - name: "Sauvegarde de l'état non sensible"
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            data/state/compte_${{ matrix.compte }}/seen_post_ids.json
-            data/state/compte_${{ matrix.compte }}/dernier_post_connu.json
-            data/state/compte_${{ matrix.compte }}/cooldown_until.json
-            data/state/compte_${{ matrix.compte }}/sante_scraper.json
-            data/state/compte_${{ matrix.compte }}/prochain_groupe_index.json
-          key: etat-sans-session-compte-${{ matrix.compte }}-${{ github.run_id }}
+          test -n "$OUAGA_PERSISTENT_DIR"
+          "$OUAGA_PERSISTENT_DIR/venv/bin/python" scripts/daily.py --compte "$COMPTE"
