@@ -43,6 +43,8 @@ sans préavis) - à surveiller sur les prochains runs quotidiens.
 
 from __future__ import annotations
 
+from progress_public import emit as emit_progress
+
 import asyncio
 import hashlib
 import json
@@ -1433,6 +1435,7 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
     if os.environ.get("OUAGA_ARCHIVE_NEON") == "1":
         from archive_neon import archive_raw
         archive_raw(chemin)
+        emit_progress("archived", groupe_id, archived=len(posts))
     logger.info("Groupe %s : %d posts sauvegardés -> %s", groupe_id, len(posts), chemin)
     return chemin
 
@@ -1710,6 +1713,7 @@ async def scraper_groupe(
 
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
+        emit_progress("open", groupe.id)
         await page.goto(url_groupe, wait_until="domcontentloaded")
         interface = _verifier_domaine_facebook(page.url)
         if interface != "mobile":
@@ -1862,6 +1866,11 @@ async def scraper_groupe(
                 groupe.nom, etapes_scroll, compteur_reponses_vues,
                 compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
             )
+
+            emit_progress("scroll", groupe.id, scroll=etapes_scroll,
+                          network=compteur_reponses_vues, graphql=compteur_reponses_matchees,
+                          dom=len(posts_dom_observes), captured=len(posts_captures),
+                          selected=len(nouveaux_posts))
 
             # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
             # retrouvé -> on a la certitude d'avoir tout rattrapé sur ce groupe.

@@ -4,7 +4,33 @@ from pathlib import Path
 import json
 import subprocess
 import sys
+import threading
+import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from progress_public import render
+
+
+def follow_progress(path, stop, account):
+    groups = {}
+    last = time.monotonic()
+    with path.open(encoding='utf-8') as source:
+        while True:
+            finished = stop.is_set()
+            for line in source:
+                try:
+                    message = render(json.loads(line), groups)
+                except (ValueError, TypeError, AttributeError):
+                    message = None
+                if message:
+                    print(f'Compte {account} | {message}', flush=True)
+                    last = time.monotonic()
+            if finished:
+                break
+            if time.monotonic() - last >= 60:
+                print(f'Compte {account} | processus actif ; aucun nouvel événement de collecte depuis 60 s (cela ne confirme pas une extraction).', flush=True)
+                last = time.monotonic()
+            stop.wait(1)
 
 
 def main():
@@ -25,11 +51,23 @@ def main():
     os.environ['OUAGA_ARCHIVE_NEON'] = '1'
     base = Path(os.environ['OUAGA_PERSISTENT_DIR'])
     base.mkdir(parents=True, exist_ok=True)
-    # Les logs détaillés restent éphémères : pas de texte d'annonce sur GitHub.
-    with (base / f'compte-{account}.log').open('w', encoding='utf-8') as log:
-        result = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'daily.py'),
-                                 '--compte', account, '--backfill-days', str(days),
-                                 '--collect-timeout', '10800'], stdout=log, stderr=log).returncode
+    progress_path = base / f'compte-{account}-progress.jsonl'
+    progress_path.write_text('', encoding='utf-8')
+    os.environ['OUAGA_PROGRESS_FILE'] = str(progress_path)
+    os.environ['PYTHONUNBUFFERED'] = '1'
+    stop = threading.Event()
+    follower = threading.Thread(target=follow_progress, args=(progress_path, stop, account), daemon=True)
+    print(f'Compte {account} | démarrage du rattrapage sur {days} jours ; progression en direct activée.', flush=True)
+    follower.start()
+    try:
+        # Les détails restent privés ; seuls les événements numériques sont affichés.
+        with (base / f'compte-{account}.log').open('w', encoding='utf-8') as log:
+            result = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'daily.py'),
+                                     '--compte', account, '--backfill-days', str(days),
+                                     '--collect-timeout', '10800'], stdout=log, stderr=log).returncode
+    finally:
+        stop.set()
+        follower.join()
     status_path = base / f'compte_{account}' / 'status.json'
     if status_path.exists():
         status = json.loads(status_path.read_text(encoding='utf-8'))
