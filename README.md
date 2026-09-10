@@ -1,3 +1,10 @@
+> **Mise à jour du 8 septembre 2026 — exploitation persistante sans proxy**
+>
+> Lire d'abord [le guide de mise en service et de soutenance](docs/EXPLOITATION_SIX_MOIS.md).
+> Il remplace les anciennes instructions de proxy, de cron GitHub et les promesses anti-blocage ci-dessous.
+> Les données et sessions restent sur la machine locale ; GitHub exécute les tests.
+> Les anciennes sections sont conservées comme historique, pas comme consignes de déploiement.
+
 # Pipeline ETL — Annonces foncières Ouagadougou
 
 Scraping de groupes Facebook ciblés → filtrage local → structuration par LLM → base PostgreSQL + export Excel. Projet académique.

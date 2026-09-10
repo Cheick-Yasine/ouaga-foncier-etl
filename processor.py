@@ -22,7 +22,7 @@ from typing import Any
 import psycopg
 from openpyxl import Workbook
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from openai import APIConnectionError, APIStatusError, RateLimitError
 from pydantic import BaseModel, ValidationError, field_validator
 
@@ -145,7 +145,7 @@ def _construire_client(api_key: str | None = None) -> AsyncOpenAI:
     cle = (api_key or os.environ.get(config.ENV_OPENAI_KEY, "")).strip()
     if not cle:
         raise ValueError(f"Variable d'environnement {config.ENV_OPENAI_KEY} absente.")
-    return AsyncOpenAI(api_key=cle)
+    return AsyncOpenAI(api_key=cle, http_client=DefaultAsyncHttpxClient(trust_env=False))
 
 
 async def structurer_annonce(
@@ -574,8 +574,7 @@ def charger_posts_bruts(fichiers: list[Path]) -> list[dict[str, Any]]:
             with fichier.open(encoding="utf-8") as f:
                 posts = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
-            logger.error("Fichier brut illisible, ignoré : %s (%s)", fichier, exc)
-            continue
+            raise ValueError(f"Fichier brut illisible : {fichier.name}") from exc
         for p in posts:
             tous_posts[p["id"]] = p  # la dernière occurrence gagne
     return list(tous_posts.values())
@@ -610,14 +609,16 @@ async def executer_traitement(
     candidats, rejetes_niveau1 = filtrer_candidats(posts)
     valides, rejetes_niveau2 = await structurer_lot(candidats, api_key=api_key)
 
-    horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if any(p.get("motif_rejet") == "echec_api_ou_validation" for p in rejetes_niveau2):
+        raise RuntimeError("Traitement LLM incomplet : fichier brut conservé pour reprise.")
+
+    horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
     alerte = detecter_derive(len(valides), mode=mode)
     if alerte:
         logger.warning(alerte)
-    enregistrer_run(mode, len(posts), len(candidats), len(valides))
-
     upsert_annonces(valides)
+    enregistrer_run(mode, len(posts), len(candidats), len(valides))
     chemin_xlsx = exporter_xlsx_depuis_db()
 
     chemin_csv_run = config.PROCESSED_DIR / f"annonces_{horodatage}.csv"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import pytest
 import json
 
 import processor
@@ -76,9 +77,9 @@ class TestChargerPostsBruts:
         assert len(posts) == 1
         assert posts[0]["texte"] == "nouvelle version"  # le dernier fichier gagne
 
-    def test_fichier_illisible_est_ignore_sans_planter(self, tmp_path, caplog):
+    def test_fichier_illisible_signale_pour_reprise(self, tmp_path, caplog):
         f_corrompu = tmp_path / "corrompu.json"
         f_corrompu.write_text("{ceci n'est pas du json valide", encoding="utf-8")
 
-        posts = processor.charger_posts_bruts([f_corrompu])
-        assert posts == []
+        with pytest.raises(ValueError, match="Fichier brut illisible"):
+            processor.charger_posts_bruts([f_corrompu])

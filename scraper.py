@@ -43,6 +43,8 @@ sans préavis) - à surveiller sur les prochains runs quotidiens.
 
 from __future__ import annotations
 
+from progress_public import emit as emit_progress
+
 import asyncio
 import hashlib
 import json
@@ -304,6 +306,8 @@ def _charger_cookies_caches(compte: str | None = None) -> list[dict[str, Any]] |
     # traiter comme "expiré", contrairement à une date passée classique).
     maintenant = datetime.now(timezone.utc).timestamp()
     for c in cookies:
+        if c.get("name") not in {"c_user", "xs"}:
+            continue
         expiration = c.get("expires")
         if expiration is not None and expiration != -1 and expiration < maintenant:
             logger.info(
@@ -319,7 +323,8 @@ def _charger_cookies_caches(compte: str | None = None) -> list[dict[str, Any]] |
         "potentiellement déjà renouvelée par Facebook depuis FB_COOKIES_JSON).",
         len(cookies),
     )
-    return cookies
+    return [c for c in cookies if c.get("expires", -1) in (None, -1)
+            or c.get("expires", -1) >= maintenant]
 
 
 async def sauvegarder_storage_state(
@@ -336,7 +341,8 @@ async def sauvegarder_storage_state(
     try:
         chemin = config.storage_state_path(compte)
         chemin.parent.mkdir(parents=True, exist_ok=True)
-        await contexte.storage_state(path=str(chemin))
+        from durable import atomic_json
+        atomic_json(chemin, await contexte.storage_state(), private=True)
     except Exception:
         logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
 
@@ -396,7 +402,7 @@ async def creer_navigateur(
     navigateur = await playwright.chromium.launch(
         headless=True,
         args=["--disable-blink-features=AutomationControlled"],
-        proxy=proxy,
+        proxy=None,
     )
     contexte = await navigateur.new_context(
         viewport=viewport,
@@ -1199,8 +1205,8 @@ def sauvegarder_seen_ids(
 
     chemin = config.seen_ids_path(compte)
     chemin.parent.mkdir(parents=True, exist_ok=True)
-    with chemin.open("w", encoding="utf-8") as f:
-        json.dump(purge, f, ensure_ascii=False, indent=2)
+    from durable import atomic_json
+    atomic_json(chemin, purge)
 
 
 def charger_dernier_post_connu(compte: str | None = None) -> dict[str, str]:
@@ -1421,10 +1427,15 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
     Objectif explicite du cahier des charges : ne pas perdre les données déjà
     scrapées en cas de coupure sur un groupe suivant.
     """
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     chemin = config.RAW_DIR / f"{timestamp}_{groupe_id}.json"
-    with chemin.open("w", encoding="utf-8") as f:
-        json.dump(posts, f, ensure_ascii=False, indent=2)
+    from durable import atomic_json
+    atomic_json(chemin, posts)
+    import os
+    if os.environ.get("OUAGA_ARCHIVE_NEON") == "1":
+        from archive_neon import archive_raw
+        archive_raw(chemin)
+        emit_progress("archived", groupe_id, archived=len(posts))
     logger.info("Groupe %s : %d posts sauvegardés -> %s", groupe_id, len(posts), chemin)
     return chemin
 
@@ -1702,6 +1713,7 @@ async def scraper_groupe(
 
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
+        emit_progress("open", groupe.id)
         await page.goto(url_groupe, wait_until="domcontentloaded")
         interface = _verifier_domaine_facebook(page.url)
         if interface != "mobile":
@@ -1855,6 +1867,11 @@ async def scraper_groupe(
                 compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
             )
 
+            emit_progress("scroll", groupe.id, scroll=etapes_scroll,
+                          network=compteur_reponses_vues, graphql=compteur_reponses_matchees,
+                          dom=len(posts_dom_observes), captured=len(posts_captures),
+                          selected=len(nouveaux_posts))
+
             # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
             # retrouvé -> on a la certitude d'avoir tout rattrapé sur ce groupe.
             if repere_trouve:
@@ -2007,9 +2024,10 @@ async def executer_scraping(
 
     nom_secret = config.nom_secret_cookies(compte)
     cookies_json = os.environ.get(nom_secret)
-    if not cookies_json:
+    cookies_persistants = _charger_cookies_caches(compte)
+    if not cookies_json and not cookies_persistants:
         raise ValueError(f"Variable d'environnement {nom_secret} absente.")
-    cookies_secret = charger_cookies(cookies_json)
+    cookies_secret = cookies_persistants or charger_cookies(cookies_json)
 
     if round_robin:
         tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
@@ -2022,18 +2040,23 @@ async def executer_scraping(
             for i in range(nb_a_traiter)
         ]
         nouvel_index = (index_depart + nb_a_traiter) % total
-        config.sauvegarder_index_prochain_groupe(nouvel_index, compte)
         logger.info(
             "Round-robin : %d/%d groupe(s) traité(s) ce run (index %d -> %d) : %s",
             nb_a_traiter, total, index_depart, nouvel_index,
             ", ".join(g.nom for g in groupes),
         )
     else:
-        groupes = config.charger_groupes(limite=group_limit, compte=compte)
+        tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
+        total = len(tous_les_groupes_actifs)
+        index_depart = config.charger_index_prochain_groupe(compte) % total
+        groupes = tous_les_groupes_actifs[index_depart:] + tous_les_groupes_actifs[:index_depart]
+        if group_limit:
+            groupes = groupes[:group_limit]
 
     etat_sante = charger_sante(compte)
     ajustements = calculer_ajustements(etat_sante)
-    if ajustements.ratio_groupes < 1.0:
+    collecte_reduite = ajustements.ratio_groupes < 1.0
+    if collecte_reduite:
         nb_avant = len(groupes)
         groupes = groupes[: max(1, round(nb_avant * ajustements.ratio_groupes))]
         logger.warning(
@@ -2054,7 +2077,7 @@ async def executer_scraping(
         groups_batch_size,
     )
 
-    proxy = config.proxy_playwright(compte)
+    proxy = None  # connexion directe demandée pour tous les comptes
     if proxy is not None:
         logger.info(
             "Proxy configuré pour ce run (%s) : sortie via %s.",
@@ -2104,6 +2127,9 @@ async def executer_scraping(
                     echec_groupe = False
                     posts: list[dict[str, Any]] = []
                     nouveau_repere: str | None = None
+                    seen_avant_groupe = dict(seen_ids)
+                    # Le backfill relit la période, même si les anciens bruts ont disparu.
+                    seen_pour_groupe = {} if mode == "backfill" else seen_ids
                     try:
                         cookies_caches = _charger_cookies_caches(compte)
                         cookies = (
@@ -2121,9 +2147,9 @@ async def executer_scraping(
                             contexte,
                             groupe,
                             days_back,
-                            seen_ids,
+                            seen_pour_groupe,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
-                            post_repere=reperes_dernier_post.get(groupe.id),
+                            post_repere=None if mode == "backfill" else reperes_dernier_post.get(groupe.id),
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
@@ -2172,6 +2198,8 @@ async def executer_scraping(
                             groupe.nom,
                         )
                         anomalies += 1
+                        seen_ids.clear()
+                        seen_ids.update(seen_avant_groupe)
                         echec_groupe = True
                     finally:
                         if contexte is not None:
@@ -2202,10 +2230,26 @@ async def executer_scraping(
                             fichiers_sauvegardes.append(
                                 sauvegarder_posts_groupe(posts, groupe.id)
                             )
+                        seen_ids.update(seen_pour_groupe)
                         sauvegarder_seen_ids(seen_ids, compte=compte)
                         sauvegarder_dernier_post_connu(
                             reperes_dernier_post, compte
                         )
+
+                    # Avancer seulement après traitement effectif, y compris erreur locale.
+                    # Le prochain run ne repart pas toujours des premiers groupes.
+                    config.sauvegarder_index_prochain_groupe(
+                        (index_depart + index_global + 1) % total, compte
+                    )
+                    from durable import atomic_json
+                    suivi = config.sante_path(compte).parent / "groupes.json"
+                    historique_groupes = json.loads(suivi.read_text()) if suivi.exists() else {}
+                    historique_groupes[groupe.id] = {
+                        "fin": datetime.now(timezone.utc).isoformat(),
+                        "statut": "erreur" if echec_groupe else "termine",
+                        "nouveaux_posts": len(posts),
+                    }
+                    atomic_json(suivi, historique_groupes)
 
                     if index_global < len(groupes) - 1:
                         if i < len(lot) - 1:
@@ -2241,6 +2285,8 @@ async def executer_scraping(
                     nouvel_etat_sante.get("niveau_confiance", 1.0),
                 )
 
+    if anomalies or budget_depasse or collecte_reduite:
+        raise RuntimeError("Collecte partielle : fichiers sauvegardés conservés, groupes restants à reprendre.")
     return fichiers_sauvegardes
 
 
