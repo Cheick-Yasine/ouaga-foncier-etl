@@ -1429,6 +1429,10 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
     chemin = config.RAW_DIR / f"{timestamp}_{groupe_id}.json"
     from durable import atomic_json
     atomic_json(chemin, posts)
+    import os
+    if os.environ.get("OUAGA_ARCHIVE_NEON") == "1":
+        from archive_neon import archive_raw
+        archive_raw(chemin)
     logger.info("Groupe %s : %d posts sauvegardés -> %s", groupe_id, len(posts), chemin)
     return chemin
 

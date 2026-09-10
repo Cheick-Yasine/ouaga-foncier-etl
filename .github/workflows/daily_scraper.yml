@@ -1,6 +1,9 @@
 name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
+  push:
+    branches: [fix/collecte-durable-sans-proxy]
+    paths: [.github/workflows/daily_scraper.yml]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -10,6 +13,10 @@ on:
         type: choice
         options: [all, "1", "2", "3", "4", "5"]
         default: all
+      days_back:
+        description: "Jours à rattraper (1 à 14)"
+        type: string
+        default: "10"
 
 permissions:
   contents: read
@@ -52,21 +59,35 @@ jobs:
         run: pytest -q
 
   scrape-and-process:
-    # Collecte locale planifiée par le système ; GitHub sert au lancement manuel.
-    # Activer la variable seulement après installation du runner persistant.
-    if: github.event_name == 'workflow_dispatch' && vars.OUAGA_LOCAL_RUNNER_READY == 'true'
+    # Rattrapage ponctuel hébergé chez GitHub, indépendant du PC.
+    if: github.event_name != 'pull_request'
     needs: tests
-    runs-on: [self-hosted, linux, ouaga-etl]
+    runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        compte: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.compte != 'all' && format('["{0}"]', inputs.compte) || '["1","2","3","4","5"]') }}
     concurrency:
-      group: ouaga-etl-local
+      group: ouaga-foncier-etl-compte-${{ matrix.compte }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - name: Collecte et reprise sur le stockage local
-        env:
-          COMPTE: ${{ inputs.compte }}
-          OUAGA_PERSISTENT_DIR: ${{ vars.OUAGA_PERSISTENT_DIR }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.7"
+          cache: pip
+      - name: Dépendances
         run: |
-          test -n "$OUAGA_PERSISTENT_DIR"
-          "$OUAGA_PERSISTENT_DIR/venv/bin/python" scripts/daily.py --compte "$COMPTE"
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Rattrapage et traitement
+        timeout-minutes: 340
+        env:
+          COMPTE: ${{ matrix.compte }}
+          DAYS_BACK: ${{ inputs.days_back || '10' }}
+          COOKIES_COMPTE: ${{ secrets[format('FB_COOKIES_JSON_{0}', matrix.compte)] }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OUAGA_PERSISTENT_DIR: ${{ runner.temp }}/ouaga-backfill
+        run: python scripts/github_backfill.py
