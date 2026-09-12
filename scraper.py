@@ -2138,6 +2138,21 @@ async def executer_scraping(
                             compte,
                         )
                         raise
+                    except ProxyIncoherentError as exc:
+                        logger.critical(
+                            "Proxy invalide/indisponible pour le compte %s sur le "
+                            "groupe %s - arrêt du run, cooldown de %dh activé : %s",
+                            compte or "unique",
+                            groupe.nom,
+                            config.COOLDOWN_HEURES_APRES_PROXY,
+                            exc,
+                        )
+                        activer_cooldown(
+                            config.COOLDOWN_HEURES_APRES_PROXY,
+                            f"proxy invalide/indisponible sur {groupe.nom}: {exc}",
+                            compte,
+                        )
+                        raise
                     except BlocageDetecteError as exc:
                         logger.critical(
                             "Blocage anti-bot détecté sur %s (%s) - arrêt COMPLET du run.",
