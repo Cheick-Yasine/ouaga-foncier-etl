@@ -233,6 +233,13 @@ def main(argv: list[str] | None = None) -> int:
     except scraper.SessionExpireeError as exc:
         logger.critical("Session Facebook expirée : %s", exc)
         return 2
+    except scraper.ProxyIncoherentError as exc:
+        logger.critical(
+            "Proxy invalide/indisponible - run arrêté, cooldown de %dh activé : %s",
+            config.COOLDOWN_HEURES_APRES_PROXY,
+            exc,
+        )
+        return 4
     except scraper.BlocageDetecteError as exc:
         logger.critical(
             "Blocage anti-bot détecté - run arrêté, cooldown de %dh activé : %s",
