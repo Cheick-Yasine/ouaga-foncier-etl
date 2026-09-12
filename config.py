@@ -768,6 +768,10 @@ NB_ECHANTILLONS_DEBUG_GRAPHQL = 3
 # signal le plus voyant possible pour un système anti-bot.
 COOLDOWN_HEURES_APRES_BLOCAGE = 24
 COOLDOWN_HEURES_APRES_SESSION_EXPIREE = 1  # probablement juste les cookies à renouveler, pas un blocage actif
+COOLDOWN_HEURES_APRES_PROXY = 12  # proxy cassé/quota épuisé = intervention
+# humaine nécessaire, pas un aléa réseau qui se résorbe tout seul en 1h comme
+# une session expirée. 12h saute exactement le prochain run planifié (cron
+# deux fois par jour) plutôt que de retenter en boucle une cause déjà connue.
 
 # Durée maximale d'un run, tous groupes confondus.
 SESSION_DUREE_MAX_MINUTES = 300
