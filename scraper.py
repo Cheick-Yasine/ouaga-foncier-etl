@@ -1579,6 +1579,7 @@ async def scraper_groupe(
     delai_multiplicateur: float = 1.0,
     post_repere: str | None = None,
     rattrapage: bool = False,
+    recherche: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne (les nouveaux posts non vus, le nouveau
@@ -1718,27 +1719,43 @@ async def scraper_groupe(
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
         emit_progress("open", groupe.id)
-        await page.goto(url_groupe, wait_until="domcontentloaded")
-        interface = _verifier_domaine_facebook(page.url)
-        if interface != "mobile":
-            logger.warning(
-                "Facebook a redirigé %s vers l'interface %s (%s).",
-                groupe.nom,
-                interface,
-                page.url,
+        if recherche:
+            from group_search import configure_search
+            logger.info('Groupe %s | recherche="%s" | préparation du tri récent', groupe.nom, recherche)
+            # Navigation directe vers la recherche ; aucun fil général n’est ouvert.
+            try:
+                await configure_search(page, groupe, recherche)
+            except (ValueError, PlaywrightTimeoutError) as exc:
+                diagnostic = config.LOG_DIR / f"recherche_{groupe.id}_{recherche}.html"
+                diagnostic.write_text(await page.content(), encoding="utf-8")
+                logger.error('Recherche non configurée. Diagnostic local : %s', diagnostic)
+                raise StructureFacebookInattendueError(str(exc)) from exc
+            await asyncio.sleep(config.PAGE_DELAY_MIN_S)
+            if taches_en_cours:
+                await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
+            logger.info('Groupe %s | recherche="%s" | filtre Publications récentes confirmé', groupe.nom, recherche)
+        else:
+            await page.goto(url_groupe, wait_until="domcontentloaded")
+            interface = _verifier_domaine_facebook(page.url)
+            if interface != "mobile":
+                logger.warning(
+                    "Facebook a redirigé %s vers l'interface %s (%s).",
+                    groupe.nom,
+                    interface,
+                    page.url,
+                )
+            await detecter_blocage_ou_session_expiree(page)
+            await _selectionner_activite_recente(page, groupe)
+            await asyncio.sleep(
+                random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
+                * delai_multiplicateur
             )
-        await detecter_blocage_ou_session_expiree(page)
-        await _selectionner_activite_recente(page, groupe)
-        await asyncio.sleep(
-            random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
-            * delai_multiplicateur
-        )
 
-        await _actualiser_fil_avant_scroll(page, groupe)
-        await asyncio.sleep(
-            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
-            * delai_multiplicateur
-        )
+            await _actualiser_fil_avant_scroll(page, groupe)
+            await asyncio.sleep(
+                random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                * delai_multiplicateur
+            )
 
         # Posts "mis en avant" (filtrés via seen_ids - pas de ré-export).
         #
@@ -1767,6 +1784,10 @@ async def scraper_groupe(
         )
         if not posts_initiaux:
             await _sauvegarder_html_debug(page, groupe.id)
+        if recherche:
+            from group_search import matching_post
+            posts_initiaux = list({p["id"]: p for p in posts_initiaux + posts_captures
+                                   if matching_post(p, recherche, groupe.id)}.values())
         posts_inedits_initiaux = [
             p for p in posts_initiaux if p["id"] not in seen_ids
         ]
@@ -1805,6 +1826,8 @@ async def scraper_groupe(
             posts_dom = await _extraire_posts_weblite_dom(page, groupe)
             posts_dom_observes.update(post["id"] for post in posts_dom)
             nouveaux_bruts = posts_captures[debut_capture:] + posts_dom
+            if recherche:
+                nouveaux_bruts = [p for p in nouveaux_bruts if matching_post(p, recherche, groupe.id)]
 
             # Le repère doit provenir d'un véritable id/permalien Facebook,
             # jamais du hash auteur+texte qui confond deux republications.
@@ -1866,9 +1889,9 @@ async def scraper_groupe(
                 etapes_sans_nouveau += 1
 
             logger.info(
-                "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
+                "Groupe %s | recherche=%s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
                 "| weblite_dom=%d | posts capturés cumulés=%d | retenus=%d | sans nouveauté=%d/20",
-                groupe.nom, etapes_scroll, compteur_reponses_vues,
+                groupe.nom, recherche or "fil", etapes_scroll, compteur_reponses_vues,
                 compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
                 len(nouveaux_posts), etapes_sans_nouveau,
             )
@@ -1948,6 +1971,8 @@ async def scraper_groupe(
 
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
+        if recherche:
+            raise StructureFacebookInattendueError("Recherche interrompue par un timeout : couverture non confirmée.") from exc
     finally:
         page.remove_listener("response", _sur_reponse)
         if taches_en_cours:
@@ -1956,6 +1981,37 @@ async def scraper_groupe(
 
     return nouveaux_posts, nouveau_repere
 
+
+
+async def scraper_recherches_groupe(context, groupe, max_days_back, seen_ids,
+                                    delai_multiplicateur=1.0, post_repere=None,
+                                    rattrapage=False, fichiers_sauvegardes=None):
+    """Deux recherches indépendantes ; sauvegarde terrain avant de passer à parcelle."""
+    from group_search import TERMS, in_window
+    resultats = {}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days_back)
+    base_seen = dict(seen_ids)
+    for term in TERMS:
+        # Les doublons de terrain ne doivent pas arrêter trop tôt la recherche parcelle.
+        query_seen = dict(base_seen)
+        posts, _ = await scraper_groupe(
+            context, groupe, max_days_back, query_seen,
+            delai_multiplicateur=delai_multiplicateur, post_repere=None,
+            rattrapage=rattrapage, recherche=term,
+        )
+        nouveaux = [p for p in posts if p['id'] not in resultats and in_window(p, cutoff)]
+        # Dédoublonner aussi une éventuelle répétition interne au résultat.
+        nouveaux = list({p['id']: p for p in nouveaux}.values())
+        if nouveaux:
+            path = sauvegarder_posts_groupe(nouveaux, groupe.id)
+            if fichiers_sauvegardes is not None:
+                fichiers_sauvegardes.append(path)
+        resultats.update((p['id'], p) for p in nouveaux)
+        seen_ids.update(query_seen)
+        logger.info('Groupe %s | recherche="%s" terminée | %d publications sauvegardées | cumul unique=%d | dates incertaines=%d',
+                    groupe.nom, term, len(nouveaux), len(resultats),
+                    sum(bool(p.get('date_incertaine') or not p.get('date_publication')) for p in nouveaux))
+    return list(resultats.values()), None
 
 # --------------------------------------------------------------------------- #
 # Orchestration : batches de groupes + pauses inter-batch
@@ -2149,7 +2205,7 @@ async def executer_scraping(
                         if proxy is not None:
                             await verifier_proxy_et_region(contexte, compte)
                         await echauffement(contexte)
-                        posts, nouveau_repere = await scraper_groupe(
+                        posts, nouveau_repere = await scraper_recherches_groupe(
                             contexte,
                             groupe,
                             days_back,
@@ -2157,6 +2213,7 @@ async def executer_scraping(
                             delai_multiplicateur=ajustements.delai_multiplicateur,
                             post_repere=None if mode == "backfill" else reperes_dernier_post.get(groupe.id),
                             rattrapage=mode == "backfill",
+                            fichiers_sauvegardes=fichiers_sauvegardes,
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
@@ -2233,10 +2290,6 @@ async def executer_scraping(
                     if not echec_groupe:
                         if nouveau_repere:
                             reperes_dernier_post[groupe.id] = nouveau_repere
-                        if posts:
-                            fichiers_sauvegardes.append(
-                                sauvegarder_posts_groupe(posts, groupe.id)
-                            )
                         seen_ids.update(seen_pour_groupe)
                         sauvegarder_seen_ids(seen_ids, compte=compte)
                         sauvegarder_dernier_post_connu(

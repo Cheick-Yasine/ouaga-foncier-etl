@@ -303,7 +303,7 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     monkeypatch.setattr(scraper, "echauffement", AsyncMock())
     monkeypatch.setattr(
         scraper,
-        "scraper_groupe",
+        "scraper_recherches_groupe",
         AsyncMock(
             side_effect=[
                 ([], None),
@@ -331,7 +331,7 @@ async def test_navigateur_est_ferme_apres_chaque_groupe_meme_entre_batches(
     assert all(c.args[3] is None for c in scraper.creer_navigateur.await_args_list)
 
     assert "ancien" in historique
-    for c in scraper.scraper_groupe.await_args_list:
+    for c in scraper.scraper_recherches_groupe.await_args_list:
         assert c.kwargs["post_repere"] == (None if mode == "backfill" else "ancien")
         assert ("ancien" in c.args[3]) == (mode == "daily")
 
