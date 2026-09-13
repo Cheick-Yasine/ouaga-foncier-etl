@@ -33,6 +33,15 @@ for _dir in (RAW_DIR, PROCESSED_DIR, STATE_DIR, LOG_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 GROUPS_CSV_PATH = BASE_DIR / "groups.csv"
+
+
+def mode_navigateur() -> str:
+    """Même interface pour le diagnostic et les sous-processus de collecte."""
+    mode = os.environ.get("OUAGA_BROWSER_MODE", "mobile").strip().lower()
+    if mode not in {"mobile", "desktop"}:
+        raise ValueError("OUAGA_BROWSER_MODE doit être mobile ou desktop.")
+    return mode
+
 SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
 # {groupe_id: post_id} du post le plus récent connu pour chaque groupe, au
 # moment où le run précédent a terminé son scroll. Sert de repère d'arrêt :
@@ -317,19 +326,18 @@ def charger_groupes(
                     f"Compte '{valeur_compte}' invalide pour le groupe '{ligne['id'].strip()}' "
                     f"dans {chemin} (valeurs valides : {sorted(COMPTES_VALIDES)})."
                 )
-            # Normalise l'URL vers m.facebook.com (mode mobile) si elle pointe
-            # encore vers www/web - cohérent avec le fingerprint mobile.
+            # Aligner l'adresse du groupe sur l'interface du navigateur.
             url_brute = ligne["url"].strip()
-            url_mobile = re.sub(
-                r"https?://(www\.|web\.)?facebook\.com",
-                "https://m.facebook.com",
+            url_normalisee = re.sub(
+                r"https?://(?:(?:www|web|m)\.)?facebook\.com(?=/|$)",
+                "https://www.facebook.com" if mode_navigateur() == "desktop" else "https://m.facebook.com",
                 url_brute,
             )
             groupes.append(
                 Groupe(
                     id=ligne["id"].strip(),
                     nom=ligne["nom"].strip(),
-                    url=url_mobile,
+                    url=url_normalisee,
                     actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
                     compte=valeur_compte,
                 )

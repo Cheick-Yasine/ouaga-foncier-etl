@@ -115,12 +115,15 @@ def main(argv=None):
     load_dotenv(ROOT / '.env')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compte', choices=['all','1','2','3','4','5'], default='all')
+    parser.add_argument('--browser', choices=['mobile', 'desktop'], help='Interface Facebook (desktop = ordinateur).')
     parser.add_argument('--data-dir', type=Path, default=Path(os.environ.get('OUAGA_PERSISTENT_DIR', str(Path.home() / 'ouaga-etl-data'))))
     parser.add_argument('--collect-timeout', type=int, default=7200)
     parser.add_argument('--process-timeout', type=int, default=1800)
     parser.add_argument('--process-only', action='store_true')
     parser.add_argument('--backfill-days', type=int, help='Rattrapage de 1 à 14 jours, sans arrêt aux anciens repères.')
     args = parser.parse_args(argv)
+    if args.browser is not None:
+        os.environ['OUAGA_BROWSER_MODE'] = args.browser
     if min(args.collect_timeout, args.process_timeout) <= 0:
         parser.error('Les durées doivent être positives.')
     if args.backfill_days is not None and not 1 <= args.backfill_days <= 14:

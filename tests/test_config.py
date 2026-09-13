@@ -7,6 +7,18 @@ import pytest
 import config
 
 
+@pytest.mark.parametrize('mode,host', [('mobile', 'm'), ('desktop', 'www')])
+def test_group_urls_match_browser_interface(monkeypatch, tmp_path, mode, host):
+    monkeypatch.setenv('OUAGA_BROWSER_MODE', mode)
+    csv = tmp_path / 'groups.csv'
+    csv.write_text('id,nom,url,actif,compte\n' + ''.join(
+        f'{i},Groupe {i},https://{prefix}facebook.com/groups/{i}/,1,1\n'
+        for i, prefix in enumerate(['m.', 'www.', 'web.', ''], 1)
+    ))
+    groups = config.charger_groupes(chemin=csv, compte='1')
+    assert [g.url for g in groups] == [f'https://{host}.facebook.com/groups/{i}/' for i in range(1, 5)]
+
+
 class TestEstCandidatFoncier:
     def test_annonce_vente_claire_est_acceptee(self):
         texte = (

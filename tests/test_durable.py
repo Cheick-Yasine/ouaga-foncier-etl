@@ -130,3 +130,25 @@ def test_backfill_passes_window_and_mode_to_children(tmp_path, monkeypatch):
     assert daily.execute_account('1', tmp_path, 10, 10, backfill_days=8) == 0
     assert calls[0][calls[0].index('--days-back') + 1] == '8'
     assert all(args[args.index('--mode') + 1] == 'backfill' for args in calls)
+
+
+def test_desktop_cli_propagates_to_collection_and_processing(tmp_path, monkeypatch):
+    import dotenv
+    from unittest.mock import Mock
+    monkeypatch.setattr(dotenv, 'load_dotenv', Mock())
+    monkeypatch.setenv('OUAGA_BROWSER_MODE', 'mobile')
+    root = tmp_path / 'compte_1' / 'raw'
+    root.mkdir(parents=True)
+    (root / 'one.json').write_text('[]')
+    calls = []
+    def child(args, env, timeout):
+        calls.append(args)
+        assert env['OUAGA_BROWSER_MODE'] == 'desktop'
+        assert env['OUAGA_DATA_DIR'] == str(root.parent)
+        assert args[args.index('--compte') + 1] == '1'
+        return 0
+    monkeypatch.setattr(daily, 'run_child', child)
+    assert daily.main(['--compte', '1', '--browser', 'desktop', '--backfill-days', '5',
+                       '--data-dir', str(tmp_path)]) == 0
+    assert len(calls) == 2
+    assert calls[0][calls[0].index('--days-back') + 1] == '5'

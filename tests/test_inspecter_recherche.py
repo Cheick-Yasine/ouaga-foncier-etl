@@ -8,11 +8,13 @@ def test_route_does_not_expose_query_tokens():
     assert 'SECRET' not in str(route)
 
 
-async def test_visible_browser_uses_requested_mode(monkeypatch):
+@pytest.mark.parametrize('mode', ['mobile', 'desktop'])
+async def test_visible_browser_uses_requested_mode(monkeypatch, mode):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
     import scraper
     import config
+    monkeypatch.setenv('OUAGA_BROWSER_MODE', mode)
     context = SimpleNamespace(add_init_script=AsyncMock(), add_cookies=AsyncMock(), set_default_navigation_timeout=Mock())
     browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
     launch = AsyncMock(return_value=browser)
@@ -21,6 +23,39 @@ async def test_visible_browser_uses_requested_mode(monkeypatch):
     monkeypatch.setattr(scraper, '_charger_origins_sauvegardees', lambda _: [])
     await scraper.creer_navigateur(SimpleNamespace(chromium=SimpleNamespace(launch=launch)), [], '1', headless=False)
     assert launch.call_args.kwargs['headless'] is False
+    options = browser.new_context.await_args.kwargs
+    if mode == 'desktop':
+        assert options['viewport'] == {'width': 1440, 'height': 900}
+        assert options['is_mobile'] is False and options['has_touch'] is False
+        assert 'user_agent' not in options  # Chromium conserve son agent ordinateur natif.
+        context.add_init_script.assert_not_awaited()
+    else:
+        assert options['viewport'] == {'width': 360, 'height': 780}
+        assert options['is_mobile'] is True and options['has_touch'] is True
+        assert options['user_agent'] == 'test-UA'
+
+
+def test_inspection_cli_selects_desktop_before_loading_config(monkeypatch, tmp_path):
+    import os
+    import sys
+    import config
+    import dotenv
+    from unittest.mock import AsyncMock, Mock
+    from scripts import inspecter_recherche as diagnostic
+    monkeypatch.setenv('OUAGA_BROWSER_MODE', 'mobile')
+    monkeypatch.setenv('OUAGA_DATA_DIR', str(tmp_path))
+    monkeypatch.setattr(dotenv, 'load_dotenv', Mock())
+    monkeypatch.setattr(config, 'configurer_logging', Mock())
+    async def inspect(args):
+        assert args.compte == '1' and args.browser == 'desktop'
+        assert config.mode_navigateur() == 'desktop'
+        assert os.environ['OUAGA_DATA_DIR'] == str(tmp_path / 'compte_1')
+    inspect_mock = AsyncMock(side_effect=inspect)
+    monkeypatch.setattr(diagnostic, 'inspect', inspect_mock)
+    monkeypatch.setattr(sys, 'argv', ['inspecter_recherche.py', '--compte', '1', '--groupe', '123',
+                                    '--browser', 'desktop', '--data-dir', str(tmp_path)])
+    diagnostic.main()
+    inspect_mock.assert_awaited_once()
 
 
 @pytest.mark.parametrize('group_id', ['101', '202'])

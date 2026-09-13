@@ -1,10 +1,11 @@
 """Scraping Facebook (Playwright async) - mode quotidien et rattrapage (backfill).
 
 
-CHOIX D'ARCHITECTURE : entrée mobile, extraction JSON Comet compatible
+CHOIX D'ARCHITECTURE : entrée mobile ou ordinateur, extraction JSON Comet
 -----------------------------------------------------------------------
-Les URLs sont normalisées vers m.facebook.com et chaque compte conserve un
-profil Android stable. Si Facebook redirige vers www/web, cette redirection est
+Les URLs suivent OUAGA_BROWSER_MODE : m.facebook.com avec profil Android en
+mode mobile, www.facebook.com avec Chromium natif en mode desktop.
+Si Facebook redirige vers www/web, cette redirection est
 journalisée et le même parseur Comet reste utilisable. Une page sans JSON
 initial et sans réponse GraphQL reconnue provoque une erreur explicite au lieu
 d'être considérée silencieusement comme un groupe vide. Comet embarque les
@@ -393,24 +394,25 @@ async def creer_navigateur(
     précis, sans non plus le supprimer entièrement (le proxy lui-même a sa
     propre réputation, pas forcément parfaite).
     """
-    user_agent, viewport = config.choisir_fingerprint_mobile(compte)
+    mode = config.mode_navigateur()
+    if mode == "desktop":
+        options_interface = dict(viewport={"width": 1440, "height": 900}, is_mobile=False, has_touch=False)
+        logger.info("Navigateur ordinateur : viewport=1440x900 | agent utilisateur natif Chromium | tactile désactivé")
+    else:
+        user_agent, viewport = config.choisir_fingerprint_mobile(compte)
+        options_interface = dict(viewport=viewport, user_agent=user_agent, is_mobile=True, has_touch=True)
+        logger.info(
+            "Fingerprint mobile : viewport=%sx%s | UA=%s...",
+            viewport["width"], viewport["height"], user_agent[:60],
+        )
     region = config.parametres_regionaux(compte)
-    logger.info(
-        "Fingerprint mobile : viewport=%sx%s | UA=%s...",
-        viewport["width"],
-        viewport["height"],
-        user_agent[:60],
-    )
     navigateur = await playwright.chromium.launch(
         headless=headless,
-        args=["--disable-blink-features=AutomationControlled"],
+        args=["--disable-blink-features=AutomationControlled"] if mode == "mobile" else [],
         proxy=None,
     )
     contexte = await navigateur.new_context(
-        viewport=viewport,
-        user_agent=user_agent,
-        is_mobile=True,
-        has_touch=True,
+        **options_interface,
         locale=region.locale,
         timezone_id=region.fuseau_horaire,
         storage_state={"cookies": [], "origins": _charger_origins_sauvegardees(compte)},
@@ -418,9 +420,10 @@ async def creer_navigateur(
     # Masque le flag standard qui trahit un navigateur piloté par automation.
     # Patch minimal et documenté publiquement (pas une suite de contournement) -
     # voir README.md pour ce qui n'est délibérément PAS fait au-delà de ça.
-    await contexte.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
+    if mode == "mobile":
+        await contexte.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
     await contexte.add_cookies(cookies)
     contexte.set_default_navigation_timeout(config.NAVIGATION_TIMEOUT_MS)
     return navigateur, contexte
