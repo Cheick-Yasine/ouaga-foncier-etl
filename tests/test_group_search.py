@@ -59,18 +59,21 @@ async def test_query_order_dedup_and_checkpoint(monkeypatch, fail_second):
     assert [c.kwargs['recherche'] for c in mock.await_args_list] == ['terrain', 'parcelle']
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('role,works', [('checkbox', True), ('switch', True), ('radio', True), ('button', True), ('checkbox', False)])
+@pytest.mark.parametrize('role,works', [('checkbox', True), ('switch', True), ('radio', True), ('button', True), ('tab', True), ('tab', False), ('checkbox', False)])
 async def test_sort_requires_confirmed_selection(monkeypatch, role, works):
     import playwright.async_api
     state = {'checked': False}
     async def click(**kwargs):
         state['checked'] = works
     control = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_checked=AsyncMock(side_effect=lambda: state['checked']),
-                              get_attribute=AsyncMock(side_effect=lambda _: str(state['checked']).lower()), click=AsyncMock(side_effect=click))
+                              get_attribute=AsyncMock(side_effect=lambda _: str(state['checked']).lower()), click=AsyncMock(side_effect=click),
+                              scroll_into_view_if_needed=AsyncMock())
     page = SimpleNamespace(get_by_role=lambda r, **kw: SimpleNamespace(count=AsyncMock(return_value=int(r==role)), nth=lambda i: control))
     async def verify(**kwargs):
         assert state['checked'], 'tri non confirmé'
     async def verify_attr(*args, **kwargs):
+        if role == 'tab':
+            assert args == ('aria-selected', 'true')
         await verify()
     monkeypatch.setattr(playwright.async_api, 'expect', lambda _: SimpleNamespace(to_be_checked=verify, to_have_attribute=verify_attr))
     if works:
@@ -79,6 +82,8 @@ async def test_sort_requires_confirmed_selection(monkeypatch, role, works):
         with pytest.raises(AssertionError, match='tri non confirmé'):
             await gs.select_recent(page)
     control.click.assert_awaited_once()
+    if role == 'tab':
+        control.scroll_into_view_if_needed.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -90,6 +95,7 @@ async def test_activity_recent_is_not_publication_sort():
 
 def test_exact_label_from_user_screenshot():
     assert gs.RECENT.fullmatch('Plus récent')
+    assert gs.RECENT.fullmatch('Plus récentes')
     assert not gs.RECENT.fullmatch('Publications que vous avez vues')
 
 @pytest.mark.asyncio
@@ -205,7 +211,7 @@ async def test_loupe_without_main_or_dialog_fills_then_checks_group(monkeypatch)
     button.click.assert_awaited_once()
     field.fill.assert_awaited_once_with('terrain')
     field.press.assert_awaited_once_with('Enter')
-    scope.assert_awaited_once_with(page, group, 'terrain')
+    scope.assert_awaited_once_with(page, group, 'terrain', submitted_from_group=False)
 
 
 @pytest.mark.asyncio
@@ -222,6 +228,7 @@ async def test_explicit_mobile_submit_instead_of_enter():
 async def test_recent_filter_without_desktop_heading_confirms_results():
     def labels(pattern, **kwargs):
         assert pattern.fullmatch('Plus récent')
+        assert pattern.fullmatch('Plus récentes')
         return SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: SimpleNamespace(is_visible=AsyncMock(return_value=True)))
     await gs.wait_search_results(SimpleNamespace(get_by_text=labels), timeout=0)
 
@@ -231,3 +238,101 @@ async def test_search_form_alone_does_not_confirm_results():
     page = SimpleNamespace(get_by_text=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=0)))
     with pytest.raises(ValueError, match='recherche non confirmée'):
         await gs.wait_search_results(page, timeout=0)
+
+
+@pytest.mark.parametrize('origin,query,field_value,field_count,accepted', [
+    (True, 'terrain', 'terrain', 1, True),
+    (False, 'terrain', 'terrain', 1, False),
+    (True, 'parcelle', 'terrain', 1, False),
+    (True, 'terrain', 'parcelle', 1, False),
+    (True, 'terrain', 'terrain', 0, False),
+    (True, 'terrain', 'terrain', 2, False),
+])
+async def test_mobile_search_results_requires_group_origin_and_query(origin, query, field_value, field_count, accepted):
+    field = SimpleNamespace(is_visible=AsyncMock(return_value=True), input_value=AsyncMock(return_value=field_value))
+    fields = SimpleNamespace(count=AsyncMock(return_value=field_count), nth=lambda _: field)
+    def labels(pattern, **kwargs):
+        # The mobile screenshot has no desktop search heading.
+        return SimpleNamespace(count=AsyncMock(return_value=int(bool(pattern.fullmatch('Dans le groupe')))),
+                               nth=lambda _: SimpleNamespace(is_visible=AsyncMock(return_value=True)))
+    page = SimpleNamespace(url=f'https://www.facebook.com/search_results/?q={query}',
+                           get_by_placeholder=lambda *a, **k: fields, get_by_text=labels)
+    group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Nom configuré différent du titre mobile')
+    if accepted:
+        await gs.assert_search_scope(page, group, 'terrain', submitted_from_group=origin)
+    else:
+        with pytest.raises(ValueError):
+            await gs.assert_search_scope(page, group, 'terrain', submitted_from_group=origin)
+
+
+async def test_stateless_recent_button_is_not_accepted_as_sorted():
+    empty = SimpleNamespace(count=AsyncMock(return_value=0))
+    control = SimpleNamespace(is_visible=AsyncMock(return_value=True), get_attribute=AsyncMock(return_value=None),
+                              click=AsyncMock(), scroll_into_view_if_needed=AsyncMock())
+    buttons = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: control)
+    page = SimpleNamespace(get_by_role=lambda role, **k: buttons if role == 'button' else empty,
+                           get_by_text=lambda *a, **k: empty)
+    assert not await gs.select_recent(page)
+    control.click.assert_awaited_once()  # ouvrir un menu une fois, sans basculer en boucle
+
+
+def test_diagnostic_includes_mobile_filter_tabs_and_selection():
+    from scripts.diagnostic_recherche import Diagnostic
+    diagnostic = Diagnostic()
+    diagnostic.feed('<div role="tab" aria-selected="false">Plus récentes</div>'
+                    '<div role="tab" aria-selected="true">Dans le groupe</div>'
+                    '<button aria-pressed="false">Plus récentes</button>')
+    assert diagnostic.controls[0] == {'tag': 'div', 'role': 'tab', 'aria-selected': 'false', 'texte': 'Plus récentes'}
+    assert diagnostic.controls[1]['aria-selected'] == 'true'
+    assert diagnostic.controls[2]['aria-pressed'] == 'false'
+
+
+async def test_complete_mobile_navigation_and_recent_selection(monkeypatch):
+    import playwright.async_api
+    empty = SimpleNamespace(count=AsyncMock(return_value=0), get_by_role=lambda *a, **k: empty)
+    def collection(control):
+        return SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: control, first=control)
+    state = {'value': '', 'selected': False}
+    group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe')
+    page = SimpleNamespace(url=group.url)
+    async def goto(url, **kwargs):
+        # Observed: the direct search URL redirects back to the group.
+        page.url = 'https://www.facebook.com/groups/123/'
+    async def fill(value):
+        state['value'] = value
+    async def submit(**kwargs):
+        page.url = 'https://www.facebook.com/search_results/?q=' + state['value']
+    async def select(**kwargs):
+        state['selected'] = True
+    field = SimpleNamespace(fill=AsyncMock(side_effect=fill), is_visible=AsyncMock(return_value=True),
+                            input_value=AsyncMock(side_effect=lambda: state['value']))
+    search = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    send = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock(side_effect=submit))
+    recent = SimpleNamespace(is_visible=AsyncMock(return_value=True), wait_for=AsyncMock(),
+                             scroll_into_view_if_needed=AsyncMock(), click=AsyncMock(side_effect=select),
+                             get_attribute=AsyncMock(side_effect=lambda name: str(state['selected']).lower() if name == 'aria-selected' else None))
+    def roles(role, **kwargs):
+        pattern = kwargs.get('name')
+        for expected_role, name, control in [('button', 'Rechercher', search), ('button', 'Envoyer la recherche', send), ('tab', 'Plus récentes', recent)]:
+            if role == expected_role and pattern and pattern.fullmatch(name):
+                return collection(control)
+        return empty
+    def texts(pattern, **kwargs):
+        if '/search_results/' in page.url and pattern.fullmatch('Plus récentes'):
+            return collection(recent)
+        return empty
+    page.goto = AsyncMock(side_effect=goto)
+    page.get_by_role = roles
+    page.get_by_text = texts
+    page.get_by_placeholder = lambda *a, **k: collection(field)
+    monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
+    async def verify_attribute(name, value, **kwargs):
+        assert name == 'aria-selected' and value == 'true' and state['selected']
+    monkeypatch.setattr(playwright.async_api, 'expect', lambda _: SimpleNamespace(to_have_attribute=verify_attribute))
+    # Keep the real scope checks, loupe submission and sorting functions together.
+    await gs.configure_search(page, group, 'terrain')
+    assert page.url == 'https://www.facebook.com/search_results/?q=terrain'
+    search.click.assert_awaited_once()
+    send.click.assert_awaited_once()
+    recent.scroll_into_view_if_needed.assert_awaited_once()
+    recent.click.assert_awaited_once()

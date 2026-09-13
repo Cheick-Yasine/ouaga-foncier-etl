@@ -6,7 +6,8 @@ import time
 from urllib.parse import urlencode, urlparse, parse_qs
 
 TERMS = ('terrain', 'parcelle')
-RECENT = re.compile(r'^(Plus récent|Publications (?:les plus )?récentes|Les plus récentes|Most recent(?: posts)?|Recent posts|Newest posts)$', re.I)
+RECENT = re.compile(r'^(Plus récent(?:e)?s?|Publications (?:les plus )?récentes|Les plus récentes|Most recent(?: posts)?|Recent posts|Newest posts)$', re.I)
+RESULTS = re.compile(r'^(?:Résultats de recherche|Search results|Dans le groupe|In (?:the|this) group)$|' + RECENT.pattern, re.I)
 
 
 def search_url(group_url, term):
@@ -24,22 +25,28 @@ def assert_search_url(url, group_url, term):
         raise ValueError('Facebook a quitté la recherche demandée ; collecte interrompue.')
 
 
-async def select_recent(page):
+async def select_recent(page, *, open_menu=True):
     """Clique un contrôle sémantique et exige une preuve de sélection.
 
     Pas de repli sur « Activité récente », qui peut classer par commentaires.
     Une variante d'interface inconnue doit être inspectée, jamais acceptée à tort.
     """
     from playwright.async_api import expect
-    for role in ('checkbox', 'switch', 'radio', 'menuitemradio', 'button'):
+    menu_buttons = []
+    for role in ('checkbox', 'switch', 'radio', 'menuitemradio', 'tab', 'button'):
         controls = page.get_by_role(role, name=RECENT)
         for i in range(await controls.count()):
             control = controls.nth(i)
             if not await control.is_visible():
                 continue
-            attribute = 'aria-pressed' if role == 'button' else 'aria-checked'
-            if role == 'button' and await control.get_attribute(attribute) is None:
-                continue  # un simple bouton de menu n'est pas une preuve de tri
+            attribute = {'button': 'aria-pressed', 'tab': 'aria-selected'}.get(role, 'aria-checked')
+            if role in ('button', 'tab') and await control.get_attribute(attribute) is None:
+                if role == 'button':
+                    menu_buttons.append(control)
+                continue  # un clic sans état de sélection n'est pas une preuve de tri
+            if role == 'tab':
+                # La barre de filtres WebLite défile horizontalement.
+                await control.scroll_into_view_if_needed(timeout=5000)
             if role in ('checkbox', 'radio'):
                 if not await control.is_checked():
                     await control.click(timeout=5000)
@@ -48,6 +55,7 @@ async def select_recent(page):
                 if await control.get_attribute(attribute) != 'true':
                     await control.click(timeout=5000)
                 await expect(control).to_have_attribute(attribute, 'true', timeout=5000)
+            logging.getLogger('ouaga_foncier_etl.group_search').info('Tri par publications récentes confirmé (%s).', role)
             return True
     # Le libellé et le switch peuvent être des éléments frères (capture utilisateur).
     labels = page.get_by_text(RECENT, exact=True)
@@ -70,6 +78,11 @@ async def select_recent(page):
                     await control.click(timeout=5000)
                 await expect(control).to_have_attribute('aria-checked', 'true', timeout=5000)
             return True
+    if open_menu and len(menu_buttons) == 1:
+        await menu_buttons[0].scroll_into_view_if_needed(timeout=5000)
+        await menu_buttons[0].click(timeout=5000)
+        # Certains boutons ouvrent un choix : exiger ensuite son état sélectionné.
+        return await select_recent(page, open_menu=False)
     return False
 
 
@@ -89,8 +102,7 @@ def result_title(page):
 
 async def wait_search_results(page, timeout=15):
     """Le panneau récent mobile remplace le titre bureau comme preuve de résultats."""
-    pattern = re.compile(r'^(Résultats de recherche|Search results|Plus récent|Publications (?:les plus )?récentes|Les plus récentes|Most recent(?: posts)?|Recent posts|Newest posts)$', re.I)
-    markers = page.get_by_text(pattern, exact=True)
+    markers = page.get_by_text(RESULTS, exact=True)
     deadline = time.monotonic() + timeout
     while True:
         for i in range(await markers.count()):
@@ -112,7 +124,7 @@ async def submit_search(page, field):
         logging.getLogger("ouaga_foncier_etl.group_search").info('Recherche envoyée par Entrée (aucun bouton explicite).')
 
 
-async def assert_search_scope(page, group, term):
+async def assert_search_scope(page, group, term, *, submitted_from_group=False):
     from scraper import _verifier_domaine_facebook
     _verifier_domaine_facebook(page.url)
     try:
@@ -122,6 +134,18 @@ async def assert_search_scope(page, group, term):
         pass
     # Variante d'URL : exiger les preuves rendues de recherche ET de groupe ET de mot.
     parsed = urlparse(page.url)
+    if parsed.path.rstrip('/') == '/search_results':
+        # WebLite omet l'identifiant du groupe dans cette route. L'URL seule ne
+        # suffit pas : il faut avoir ouvert le groupe exact et utilisé son champ.
+        if not submitted_from_group or parse_qs(parsed.query).get('q') != [term]:
+            raise ValueError('Origine de la recherche mobile non confirmée pour ce groupe.')
+        fields = page.get_by_placeholder('Rechercher dans ce groupe', exact=True)
+        visible = [fields.nth(i) for i in range(await fields.count())
+                   if await fields.nth(i).is_visible()]
+        if len(visible) != 1 or (await visible[0].input_value()).strip().casefold() != term.casefold():
+            raise ValueError('Champ et mot de la recherche mobile non confirmés.')
+        await wait_search_results(page, timeout=10)
+        return
     group_path = urlparse(group.url).path.rstrip('/')
     if parsed.path.rstrip('/') != group_path and not parsed.path.startswith(group_path + '/'):
         raise ValueError('Recherche hors du groupe attendu ; collecte interrompue.')
@@ -172,6 +196,7 @@ async def search_via_group_button(page, group, term):
     if not clicked:
         raise ValueError('Loupe du groupe non reconnue : vérifier son libellé accessible dans cette interface.')
     fields = page.get_by_placeholder('Rechercher dans ce groupe', exact=True)
+    group_field_confirmed = await fields.count() == 1
     if await fields.count() == 0:
         fields = page.get_by_role('searchbox', name=names).or_(page.get_by_role('textbox', name=names))
     if await fields.count() == 0:
@@ -187,7 +212,8 @@ async def search_via_group_button(page, group, term):
     await submit_search(page, fields.first)
     await wait_search_results(page)
     await detecter_blocage_ou_session_expiree(page)
-    await assert_search_scope(page, group, term)
+    await assert_search_scope(page, group, term, submitted_from_group=group_field_confirmed)
+    return group_field_confirmed
 
 
 async def configure_search(page, group, term):
@@ -196,11 +222,12 @@ async def configure_search(page, group, term):
     await page.goto(search_url(group.url, term), wait_until='domcontentloaded')
     _verifier_domaine_facebook(page.url)
     await detecter_blocage_ou_session_expiree(page)
+    submitted_from_group = False
     try:
         await assert_search_scope(page, group, term)
     except (ValueError, PlaywrightTimeoutError):
         logging.getLogger("ouaga_foncier_etl.group_search").info('Recherche directe non confirmée (chemin reçu : %s) ; essai par la loupe du groupe.', urlparse(page.url).path)
-        await search_via_group_button(page, group, term)
+        submitted_from_group = await search_via_group_button(page, group, term)
     # Attend le panneau rendu ; l'absence de cette interface doit rester explicite.
     try:
         await page.get_by_text(RECENT).first.wait_for(state='visible', timeout=10000)
@@ -213,7 +240,7 @@ async def configure_search(page, group, term):
         if not await select_recent(page):
             raise ValueError('Tri « Publications récentes » non confirmé : aucun scroll effectué. Une capture du panneau de filtres est nécessaire.')
     await detecter_blocage_ou_session_expiree(page)
-    await assert_search_scope(page, group, term)
+    await assert_search_scope(page, group, term, submitted_from_group=submitted_from_group)
 
 
 def matching_post(post, term, group_id):

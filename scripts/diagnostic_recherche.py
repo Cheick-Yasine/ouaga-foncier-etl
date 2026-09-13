@@ -7,7 +7,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-UI = re.compile(r'recherch|search|plus récent|most recent|recent posts|filtr|trier', re.I)
+UI = re.compile(r'recherch|search|plus récent|most recent|recent posts|filtr|trier|dans le groupe|date de publication|publié par', re.I)
 VOID = {'input', 'img', 'br', 'hr', 'meta', 'link', 'source', 'area', 'base', 'wbr', 'embed', 'param', 'col', 'track'}
 
 
@@ -65,13 +65,13 @@ class Diagnostic(HTMLParser):
             return
         a = node['attrs']
         relevant = UI.search(' '.join([node['text'], a.get('aria-label', ''), a.get('placeholder', '')]))
-        is_control = node['tag'] in {'a','button','input','h1','h2','h3','label'} or a.get('role') in {'button','link','searchbox','textbox','switch','checkbox','heading'}
+        is_control = node['tag'] in {'a','button','input','h1','h2','h3','label'} or a.get('role') in {'button','link','searchbox','textbox','switch','checkbox','heading','tab','radio','menuitemradio'}
         if node['tag'] == 'input' and a.get('type', 'text') in {'text', 'search'}:
             relevant = True
         if not relevant or not is_control or len(self.controls) >= 60:
             return
         item = {'tag': node['tag']}
-        for key in ('role', 'aria-label', 'placeholder', 'aria-checked', 'type'):
+        for key in ('role', 'aria-label', 'placeholder', 'aria-checked', 'aria-selected', 'aria-pressed', 'aria-expanded', 'type'):
             if a.get(key):
                 item[key] = clean(a[key])
         if node['tag'] != 'input' and node['text'].strip():
