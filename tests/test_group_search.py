@@ -167,7 +167,7 @@ async def test_weblite_unique_search_button(visibility, clicked):
 
 @pytest.mark.asyncio
 async def test_root_group_route_requires_rendered_search_evidence():
-    title = SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock()))
+    title = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: SimpleNamespace(is_visible=AsyncMock(return_value=True)))
     field = SimpleNamespace(is_visible=AsyncMock(return_value=True), input_value=AsyncMock(return_value='terrain'))
     inputs = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: field)
     page = SimpleNamespace(url='https://m.facebook.com/groups/123/?view=search',
@@ -195,8 +195,8 @@ async def test_loupe_without_main_or_dialog_fills_then_checks_group(monkeypatch)
         pattern = kwargs.get('name')
         return buttons if role=='button' and pattern and pattern.fullmatch('Rechercher') else empty
     page = SimpleNamespace(url='https://m.facebook.com/groups/123/', goto=AsyncMock(), get_by_role=roles,
-                           locator=lambda _: fields,
-                           get_by_text=lambda *a, **k: SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock())))
+                           locator=lambda _: fields, get_by_placeholder=lambda *a, **k: empty,
+                           get_by_text=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: SimpleNamespace(is_visible=AsyncMock(return_value=True))))
     group = SimpleNamespace(url=page.url, nom='Groupe')
     scope = AsyncMock()
     monkeypatch.setattr(gs, 'assert_search_scope', scope)
@@ -206,3 +206,28 @@ async def test_loupe_without_main_or_dialog_fills_then_checks_group(monkeypatch)
     field.fill.assert_awaited_once_with('terrain')
     field.press.assert_awaited_once_with('Enter')
     scope.assert_awaited_once_with(page, group, 'terrain')
+
+
+@pytest.mark.asyncio
+async def test_explicit_mobile_submit_instead_of_enter():
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    page = SimpleNamespace(get_by_role=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: button))
+    field = SimpleNamespace(press=AsyncMock())
+    await gs.submit_search(page, field)
+    button.click.assert_awaited_once()
+    field.press.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recent_filter_without_desktop_heading_confirms_results():
+    def labels(pattern, **kwargs):
+        assert pattern.fullmatch('Plus récent')
+        return SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: SimpleNamespace(is_visible=AsyncMock(return_value=True)))
+    await gs.wait_search_results(SimpleNamespace(get_by_text=labels), timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_search_form_alone_does_not_confirm_results():
+    page = SimpleNamespace(get_by_text=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=0)))
+    with pytest.raises(ValueError, match='recherche non confirmée'):
+        await gs.wait_search_results(page, timeout=0)

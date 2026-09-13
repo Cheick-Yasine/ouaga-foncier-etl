@@ -1,6 +1,8 @@
 """Recherche de groupe : tri confirmé par l'état visible, sans filtre URL inventé."""
 import re
 import logging
+import asyncio
+import time
 from urllib.parse import urlencode, urlparse, parse_qs
 
 TERMS = ('terrain', 'parcelle')
@@ -85,6 +87,31 @@ def result_title(page):
     return page.get_by_text(re.compile(r'^(Résultats de recherche|Search results)$', re.I), exact=True)
 
 
+async def wait_search_results(page, timeout=15):
+    """Le panneau récent mobile remplace le titre bureau comme preuve de résultats."""
+    pattern = re.compile(r'^(Résultats de recherche|Search results|Plus récent|Publications (?:les plus )?récentes|Les plus récentes|Most recent(?: posts)?|Recent posts|Newest posts)$', re.I)
+    markers = page.get_by_text(pattern, exact=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        for i in range(await markers.count()):
+            if await markers.nth(i).is_visible():
+                return
+        if time.monotonic() >= deadline:
+            raise ValueError('Après envoi, ni résultats ni filtre récent visibles : recherche non confirmée.')
+        await asyncio.sleep(0.25)
+
+
+async def submit_search(page, field):
+    buttons = page.get_by_role('button', name=re.compile(r'^(Envoyer la recherche|Submit search)$', re.I))
+    if await click_unique_visible(buttons):
+        logging.getLogger(__name__).info('Clic sur « Envoyer la recherche » effectué.')
+    elif await buttons.count():
+        raise ValueError('Bouton Envoyer la recherche ambigu ou invisible.')
+    else:
+        await field.press('Enter')
+        logging.getLogger(__name__).info('Recherche envoyée par Entrée (aucun bouton explicite).')
+
+
 async def assert_search_scope(page, group, term):
     from scraper import _verifier_domaine_facebook
     _verifier_domaine_facebook(page.url)
@@ -98,8 +125,7 @@ async def assert_search_scope(page, group, term):
     group_path = urlparse(group.url).path.rstrip('/')
     if parsed.path.rstrip('/') != group_path and not parsed.path.startswith(group_path + '/'):
         raise ValueError('Recherche hors du groupe attendu ; collecte interrompue.')
-    heading = result_title(page)
-    await heading.first.wait_for(state='visible', timeout=10000)
+    await wait_search_results(page, timeout=10)
     normalize = lambda value: ' '.join(value.split()).casefold()
     if normalize(group.nom) not in normalize(await page.locator('body').inner_text()):
         raise ValueError('Nom du groupe absent des résultats de recherche.')
@@ -145,7 +171,9 @@ async def search_via_group_button(page, group, term):
             logging.getLogger(__name__).info('Bouton mobile « Rechercher » ouvert ; validation du groupe exigée après saisie.')
     if not clicked:
         raise ValueError('Loupe du groupe non reconnue : vérifier son libellé accessible dans cette interface.')
-    fields = page.get_by_role('searchbox', name=names).or_(page.get_by_role('textbox', name=names))
+    fields = page.get_by_placeholder('Rechercher dans ce groupe', exact=True)
+    if await fields.count() == 0:
+        fields = page.get_by_role('searchbox', name=names).or_(page.get_by_role('textbox', name=names))
     if await fields.count() == 0:
         # Le champ du dialogue de la loupe n’est pas la recherche globale Facebook.
         fields = page.get_by_role('dialog').locator('input:not([type="hidden"])')
@@ -156,8 +184,8 @@ async def search_via_group_button(page, group, term):
     if await fields.count() != 1:
         raise ValueError('Champ de recherche du groupe non identifié sans ambiguïté.')
     await fields.first.fill(term)
-    await fields.first.press('Enter')
-    await result_title(page).first.wait_for(state='visible', timeout=15000)
+    await submit_search(page, fields.first)
+    await wait_search_results(page)
     await detecter_blocage_ou_session_expiree(page)
     await assert_search_scope(page, group, term)
 
