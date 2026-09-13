@@ -352,3 +352,85 @@ async def test_expected_search_url_alone_cannot_confirm_results(monkeypatch, has
         with pytest.raises(ValueError, match='recherche non confirmée'):
             await gs.assert_search_scope(page, group, 'terrain')
     markers.assert_awaited_once_with(page, timeout=10)
+
+
+class DesktopControls:
+    def __init__(self, *controls):
+        self.controls = list(controls)
+
+    async def count(self):
+        return len(self.controls)
+
+    def nth(self, index):
+        return self.controls[index]
+
+    def or_(self, other):
+        return DesktopControls(*self.controls, *other.controls)
+
+
+@pytest.mark.parametrize('group_button_present', [True, False])
+async def test_desktop_loupe_is_scoped_to_group_tabs(group_button_present):
+    import re
+    global_search = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    group_search = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    boundary = SimpleNamespace(evaluate=AsyncMock(return_value=True))
+    row = SimpleNamespace(evaluate=AsyncMock(return_value=False),
+                          get_by_role=lambda *a, **k: DesktopControls(group_search) if group_button_present else DesktopControls(),
+                          locator=lambda _: boundary)
+    discussion = SimpleNamespace(is_visible=AsyncMock(return_value=True), locator=lambda _: row)
+    def roles(role, **kwargs):
+        pattern = kwargs.get('name')
+        if role == 'tab' and pattern.fullmatch('Discussion'):
+            return DesktopControls(discussion)
+        if role == 'button' and pattern.fullmatch('Rechercher'):
+            return DesktopControls(global_search)  # disponible, mais interdit hors des onglets
+        return DesktopControls()
+    page = SimpleNamespace(get_by_role=roles)
+    names = re.compile(r'^Rechercher dans ce groupe$')
+    if group_button_present:
+        await gs.open_desktop_group_search(page, names)
+        group_search.click.assert_awaited_once()
+    else:
+        with pytest.raises(ValueError, match='Loupe près des onglets'):
+            await gs.open_desktop_group_search(page, names)
+    global_search.click.assert_not_awaited()
+
+
+@pytest.mark.parametrize('group_field_present', [True, False])
+async def test_desktop_field_never_uses_facebook_global_search(group_field_present):
+    import re
+    def field(label):
+        return SimpleNamespace(is_visible=AsyncMock(return_value=True),
+                               get_attribute=AsyncMock(side_effect=lambda attr: label if attr == 'placeholder' else None),
+                               fill=AsyncMock())
+    global_field = field('Rechercher sur Facebook')
+    group_field = field('Rechercher')  # libellé générique, mais dans le dialogue de la loupe
+    dialog_fields = DesktopControls(global_field, *([group_field] if group_field_present else []))
+    page = SimpleNamespace(get_by_role=lambda role, **k: SimpleNamespace(locator=lambda _: dialog_fields) if role == 'dialog' else DesktopControls(),
+                           get_by_placeholder=lambda *a, **k: DesktopControls())
+    if group_field_present:
+        selected = await gs.desktop_group_search_field(page, re.compile('groupe'), timeout=0)
+        assert selected is group_field
+    else:
+        with pytest.raises(ValueError, match='Champ de recherche du groupe absent'):
+            await gs.desktop_group_search_field(page, re.compile('groupe'), timeout=0)
+    global_field.fill.assert_not_awaited()
+
+
+async def test_desktop_search_submits_in_group_field_and_rejects_global_results(monkeypatch):
+    import config
+    monkeypatch.setenv('OUAGA_BROWSER_MODE', 'desktop')
+    page = SimpleNamespace(url='https://www.facebook.com/groups/123/', goto=AsyncMock())
+    group = SimpleNamespace(url=page.url, nom='Groupe')
+    field = SimpleNamespace(fill=AsyncMock(), press=AsyncMock())
+    async def submit(*args):
+        page.url = 'https://www.facebook.com/search/top/?q=terrain'
+    field.press.side_effect = submit
+    monkeypatch.setattr(gs, 'open_desktop_group_search', AsyncMock())
+    monkeypatch.setattr(gs, 'desktop_group_search_field', AsyncMock(return_value=field))
+    monkeypatch.setattr(gs, 'wait_search_results', AsyncMock())
+    monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
+    with pytest.raises(ValueError, match='hors du groupe'):
+        await gs.search_via_group_button(page, group, 'terrain')
+    field.fill.assert_awaited_once_with('terrain')
+    field.press.assert_awaited_once_with('Enter')

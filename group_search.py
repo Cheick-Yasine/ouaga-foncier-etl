@@ -165,7 +165,58 @@ async def assert_search_scope(page, group, term, *, submitted_from_group=False):
     raise ValueError('Mot recherché non confirmé dans la page de résultats.')
 
 
+async def open_desktop_group_search(page, names):
+    """Loupe nommée du groupe ou bouton situé près de ses onglets uniquement."""
+    for role in ('button', 'link'):
+        if await click_unique_visible(page.get_by_role(role, name=names)):
+            return
+    anchors = page.get_by_role('tab', name=re.compile(r'^Discussions?$', re.I)).or_(
+        page.get_by_role('link', name=re.compile(r'^Discussions?$', re.I)))
+    for i in range(await anchors.count()):
+        row = anchors.nth(i)
+        if not await row.is_visible():
+            continue
+        for _ in range(6):
+            row = row.locator('..')
+            # Ne jamais élargir jusqu'à la barre globale Facebook ou tout le document.
+            if await row.evaluate("el => ['BODY', 'HTML'].includes(el.tagName) || el.getAttribute('role') === 'banner' || !!el.closest('[role=banner]') || !!el.querySelector('[role=banner]')"):
+                break
+            buttons = row.get_by_role('button', name=re.compile(r'^(Rechercher|Search)$', re.I))
+            if await click_unique_visible(buttons):
+                return
+    raise ValueError('Loupe près des onglets du groupe non identifiée. La recherche générale Facebook ne sera pas utilisée.')
+
+
+async def desktop_group_search_field(page, names, timeout=10):
+    """Champ nommé du groupe ou champ du dialogue ouvert par sa loupe."""
+    named = page.get_by_role('searchbox', name=names).or_(page.get_by_role('textbox', name=names)).or_(
+        page.get_by_placeholder(re.compile(r'^(Rechercher dans (?:ce|le) groupe|Search this group)$', re.I)))
+    dialog = page.get_by_role('dialog').locator(
+        'input:not([type]), input[type="text"], input[type="search"]')
+    deadline = time.monotonic() + timeout
+    while True:
+        for candidates in (named, dialog):
+            visible = []
+            for i in range(await candidates.count()):
+                field = candidates.nth(i)
+                if not await field.is_visible():
+                    continue
+                labels = [(await field.get_attribute(attr) or '').strip().casefold()
+                          for attr in ('placeholder', 'aria-label')]
+                if any(label in {'rechercher sur facebook', 'search facebook'} for label in labels):
+                    continue
+                visible.append(field)
+            if len(visible) > 1:
+                raise ValueError('Plusieurs champs possibles dans la recherche du groupe.')
+            if visible:
+                return visible[0]
+        if time.monotonic() >= deadline:
+            raise ValueError('Champ de recherche du groupe absent du dialogue. Aucun texte saisi dans la recherche générale.')
+        await asyncio.sleep(0.25)
+
+
 async def search_via_group_button(page, group, term):
+    import config
     from scraper import detecter_blocage_ou_session_expiree, _verifier_domaine_facebook
     parsed = urlparse(group.url)
     await page.goto(f'https://www.facebook.com{parsed.path}', wait_until='domcontentloaded')
@@ -174,6 +225,16 @@ async def search_via_group_button(page, group, term):
     if urlparse(page.url).path.rstrip('/') != parsed.path.rstrip('/'):
         raise ValueError('Impossible d’ouvrir le groupe avant la recherche.')
     names = re.compile(r'^(Rechercher dans (?:ce|le) groupe|Rechercher dans le groupe|Search (?:this|in this) group)$', re.I)
+    if config.mode_navigateur() == 'desktop':
+        await open_desktop_group_search(page, names)
+        logging.getLogger('ouaga_foncier_etl.group_search').info('Loupe du groupe ouverte en mode ordinateur ; saisie dans son champ dédié.')
+        field = await desktop_group_search_field(page, names)
+        await field.fill(term)
+        await field.press('Enter')
+        await wait_search_results(page)
+        await detecter_blocage_ou_session_expiree(page)
+        await assert_search_scope(page, group, term, submitted_from_group=True)
+        return True
     clicked = False
     for role in ('button', 'link'):
         buttons = page.get_by_role(role, name=names)
