@@ -1703,7 +1703,8 @@ async def scraper_groupe(
             taches_en_cours.add(tache)
             tache.add_done_callback(taches_en_cours.discard)
 
-    page.on("response", _sur_reponse)
+    if not recherche:
+        page.on("response", _sur_reponse)
     # Navigue vers `groupe.url` tel que renseigné dans groups.csv, plutôt que
     # de reconstruire systématiquement une URL `/groups/<id>/` à partir de
     # `groupe.id` (comportement d'origine, valable uniquement pour un vrai
@@ -1730,6 +1731,8 @@ async def scraper_groupe(
                 diagnostic.write_text(await page.content(), encoding="utf-8")
                 logger.error('Recherche non configurée. Diagnostic local : %s', diagnostic)
                 raise StructureFacebookInattendueError(str(exc)) from exc
+            # Commencer la capture après validation : exclut le fil ouvert par la loupe.
+            page.on("response", _sur_reponse)
             await asyncio.sleep(config.PAGE_DELAY_MIN_S)
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
@@ -1786,7 +1789,8 @@ async def scraper_groupe(
             await _sauvegarder_html_debug(page, groupe.id)
         if recherche:
             from group_search import matching_post
-            posts_initiaux = list({p["id"]: p for p in posts_initiaux + posts_captures
+            posts_visibles = await _extraire_posts_weblite_dom(page, groupe)
+            posts_initiaux = list({p["id"]: p for p in posts_initiaux + posts_captures + posts_visibles
                                    if matching_post(p, recherche, groupe.id)}.values())
         posts_inedits_initiaux = [
             p for p in posts_initiaux if p["id"] not in seen_ids

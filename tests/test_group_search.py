@@ -84,5 +84,49 @@ async def test_sort_requires_confirmed_selection(monkeypatch, role, works):
 @pytest.mark.asyncio
 async def test_activity_recent_is_not_publication_sort():
     assert not gs.RECENT.fullmatch('Activité récente')
-    page = SimpleNamespace(get_by_role=lambda *a, **kw: SimpleNamespace(count=AsyncMock(return_value=0)))
+    page = SimpleNamespace(get_by_role=lambda *a, **kw: SimpleNamespace(count=AsyncMock(return_value=0)), get_by_text=lambda *a, **kw: SimpleNamespace(count=AsyncMock(return_value=0)))
     assert await gs.select_recent(page) is False
+
+
+def test_exact_label_from_user_screenshot():
+    assert gs.RECENT.fullmatch('Plus récent')
+    assert not gs.RECENT.fullmatch('Publications que vous avez vues')
+
+@pytest.mark.asyncio
+async def test_neighbor_switch_from_screenshot(monkeypatch):
+    import playwright.async_api
+    control = SimpleNamespace(is_visible=AsyncMock(return_value=True), get_attribute=AsyncMock(side_effect=lambda k: 'false' if k=='aria-checked' else None), click=AsyncMock())
+    switches = SimpleNamespace(count=AsyncMock(return_value=1), first=control)
+    row = SimpleNamespace(locator=lambda _: switches)
+    label = SimpleNamespace(locator=lambda _: row)
+    page = SimpleNamespace(get_by_role=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=0)),
+                           get_by_text=lambda *a, **k: SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: label))
+    assertion = AsyncMock()
+    monkeypatch.setattr(playwright.async_api, 'expect', lambda _: SimpleNamespace(to_have_attribute=assertion))
+    assert await gs.select_recent(page)
+    control.click.assert_awaited_once()
+    assertion.assert_awaited_once_with('aria-checked', 'true', timeout=5000)
+
+
+@pytest.mark.asyncio
+async def test_redirect_uses_group_search_not_general_feed(monkeypatch):
+    page = SimpleNamespace(url='https://m.facebook.com/groups/123/', goto=AsyncMock(),
+                           get_by_text=lambda *a, **k: SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock())))
+    group = SimpleNamespace(url=page.url, nom='Groupe')
+    scope = AsyncMock(side_effect=[ValueError('route mobile différente'), None])
+    fallback = AsyncMock()
+    monkeypatch.setattr(gs, 'assert_search_scope', scope)
+    monkeypatch.setattr(gs, 'search_via_group_button', fallback)
+    monkeypatch.setattr(gs, 'select_recent', AsyncMock(return_value=True))
+    monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
+    await gs.configure_search(page, group, 'terrain')
+    fallback.assert_awaited_once_with(page, group, 'terrain')
+    assert scope.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rendered_scope_rejects_different_group():
+    page = SimpleNamespace(url='https://www.facebook.com/groups/999/search/?query=terrain')
+    group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe')
+    with pytest.raises(ValueError, match='hors du groupe'):
+        await gs.assert_search_scope(page, group, 'terrain')
