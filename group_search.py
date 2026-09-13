@@ -71,6 +71,20 @@ async def select_recent(page):
     return False
 
 
+async def click_unique_visible(candidates):
+    visible = [candidates.nth(i) for i in range(await candidates.count())
+               if await candidates.nth(i).is_visible()]
+    if len(visible) != 1:
+        return False
+    await visible[0].click(timeout=5000)
+    return True
+
+
+def result_title(page):
+    # WebLite affiche parfois un simple div, sans rôle heading.
+    return page.get_by_text(re.compile(r'^(Résultats de recherche|Search results)$', re.I), exact=True)
+
+
 async def assert_search_scope(page, group, term):
     from scraper import _verifier_domaine_facebook
     _verifier_domaine_facebook(page.url)
@@ -82,9 +96,9 @@ async def assert_search_scope(page, group, term):
     # Variante d'URL : exiger les preuves rendues de recherche ET de groupe ET de mot.
     parsed = urlparse(page.url)
     group_path = urlparse(group.url).path.rstrip('/')
-    if not parsed.path.startswith(group_path + '/'):
+    if parsed.path.rstrip('/') != group_path and not parsed.path.startswith(group_path + '/'):
         raise ValueError('Recherche hors du groupe attendu ; collecte interrompue.')
-    heading = page.get_by_role('heading', name=re.compile(r'^(Résultats de recherche|Search results)$', re.I))
+    heading = result_title(page)
     await heading.first.wait_for(state='visible', timeout=10000)
     normalize = lambda value: ' '.join(value.split()).casefold()
     if normalize(group.nom) not in normalize(await page.locator('body').inner_text()):
@@ -124,16 +138,26 @@ async def search_via_group_button(page, group, term):
             await candidates.first.click(timeout=5000)
             clicked = True
     if not clicked:
+        # Diagnostic réel WebLite : un seul div[role=button][aria-label=Rechercher], sans main.
+        candidates = page.get_by_role('button', name=re.compile(r'^(Rechercher|Search)$', re.I))
+        clicked = await click_unique_visible(candidates)
+        if clicked:
+            logging.getLogger(__name__).info('Bouton mobile « Rechercher » ouvert ; validation du groupe exigée après saisie.')
+    if not clicked:
         raise ValueError('Loupe du groupe non reconnue : vérifier son libellé accessible dans cette interface.')
     fields = page.get_by_role('searchbox', name=names).or_(page.get_by_role('textbox', name=names))
     if await fields.count() == 0:
         # Le champ du dialogue de la loupe n’est pas la recherche globale Facebook.
         fields = page.get_by_role('dialog').locator('input:not([type="hidden"])')
+    if await fields.count() == 0:
+        # WebLite n'expose pas toujours searchbox ou dialog. Ne remplir qu'un champ visible unique.
+        fields = page.locator('input[type="search"]:visible, input[type="text"]:visible, input:not([type]):visible')
+        await fields.first.wait_for(state='visible', timeout=10000)
     if await fields.count() != 1:
         raise ValueError('Champ de recherche du groupe non identifié sans ambiguïté.')
     await fields.first.fill(term)
     await fields.first.press('Enter')
-    await page.get_by_role('heading', name=re.compile(r'^(Résultats de recherche|Search results)$', re.I)).first.wait_for(state='visible', timeout=15000)
+    await result_title(page).first.wait_for(state='visible', timeout=15000)
     await detecter_blocage_ou_session_expiree(page)
     await assert_search_scope(page, group, term)
 

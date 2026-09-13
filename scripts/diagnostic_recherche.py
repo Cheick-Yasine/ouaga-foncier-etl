@@ -66,6 +66,8 @@ class Diagnostic(HTMLParser):
         a = node['attrs']
         relevant = UI.search(' '.join([node['text'], a.get('aria-label', ''), a.get('placeholder', '')]))
         is_control = node['tag'] in {'a','button','input','h1','h2','h3','label'} or a.get('role') in {'button','link','searchbox','textbox','switch','checkbox','heading'}
+        if node['tag'] == 'input' and a.get('type', 'text') in {'text', 'search'}:
+            relevant = True
         if not relevant or not is_control or len(self.controls) >= 60:
             return
         item = {'tag': node['tag']}

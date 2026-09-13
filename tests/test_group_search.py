@@ -155,3 +155,54 @@ def test_diagnostic_excludes_secrets_and_retains_search_controls():
     assert 'SECRET' not in output
     assert 'Rechercher dans ce groupe' in output
     assert 'terrain' in output
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('visibility,clicked', [([True], True), ([False,True],True), ([True,True],False), ([],False)])
+async def test_weblite_unique_search_button(visibility, clicked):
+    buttons = [SimpleNamespace(is_visible=AsyncMock(return_value=v), click=AsyncMock()) for v in visibility]
+    candidates = SimpleNamespace(count=AsyncMock(return_value=len(buttons)), nth=lambda i: buttons[i])
+    assert await gs.click_unique_visible(candidates) is clicked
+    assert sum(b.click.await_count for b in buttons) == int(clicked)
+
+
+@pytest.mark.asyncio
+async def test_root_group_route_requires_rendered_search_evidence():
+    title = SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock()))
+    field = SimpleNamespace(is_visible=AsyncMock(return_value=True), input_value=AsyncMock(return_value='terrain'))
+    inputs = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: field)
+    page = SimpleNamespace(url='https://m.facebook.com/groups/123/?view=search',
+                           get_by_text=lambda *a, **k: title,
+                           locator=lambda selector: SimpleNamespace(inner_text=AsyncMock(return_value='Résultats de recherche dans Groupe 123')) if selector=='body' else inputs)
+    group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe 123')
+    await gs.assert_search_scope(page, group, 'terrain')
+    field.input_value.return_value = 'parcelle'
+    with pytest.raises(ValueError, match='Mot recherché'):
+        await gs.assert_search_scope(page, group, 'terrain')
+
+@pytest.mark.asyncio
+async def test_loupe_without_main_or_dialog_fills_then_checks_group(monkeypatch):
+    class Empty:
+        async def count(self): return 0
+        def or_(self, other): return self
+        def get_by_role(self, *a, **k): return self
+        def locator(self, *a, **k): return self
+    empty = Empty()
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    buttons = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: button)
+    field = SimpleNamespace(wait_for=AsyncMock(), fill=AsyncMock(), press=AsyncMock())
+    fields = SimpleNamespace(count=AsyncMock(return_value=1), first=field)
+    def roles(role, **kwargs):
+        pattern = kwargs.get('name')
+        return buttons if role=='button' and pattern and pattern.fullmatch('Rechercher') else empty
+    page = SimpleNamespace(url='https://m.facebook.com/groups/123/', goto=AsyncMock(), get_by_role=roles,
+                           locator=lambda _: fields,
+                           get_by_text=lambda *a, **k: SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock())))
+    group = SimpleNamespace(url=page.url, nom='Groupe')
+    scope = AsyncMock()
+    monkeypatch.setattr(gs, 'assert_search_scope', scope)
+    monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
+    await gs.search_via_group_button(page, group, 'terrain')
+    button.click.assert_awaited_once()
+    field.fill.assert_awaited_once_with('terrain')
+    field.press.assert_awaited_once_with('Enter')
+    scope.assert_awaited_once_with(page, group, 'terrain')
