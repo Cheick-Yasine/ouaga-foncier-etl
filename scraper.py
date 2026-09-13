@@ -373,6 +373,8 @@ async def creer_navigateur(
     cookies: list[dict[str, Any]],
     compte: str | None = None,
     proxy: dict[str, str] | None = None,
+    *,
+    headless: bool = True,
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
@@ -400,7 +402,7 @@ async def creer_navigateur(
         user_agent[:60],
     )
     navigateur = await playwright.chromium.launch(
-        headless=True,
+        headless=headless,
         args=["--disable-blink-features=AutomationControlled"],
         proxy=None,
     )

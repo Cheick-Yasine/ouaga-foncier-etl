@@ -104,12 +104,12 @@ async def wait_search_results(page, timeout=15):
 async def submit_search(page, field):
     buttons = page.get_by_role('button', name=re.compile(r'^(Envoyer la recherche|Submit search)$', re.I))
     if await click_unique_visible(buttons):
-        logging.getLogger(__name__).info('Clic sur « Envoyer la recherche » effectué.')
+        logging.getLogger("ouaga_foncier_etl.group_search").info('Clic sur « Envoyer la recherche » effectué.')
     elif await buttons.count():
         raise ValueError('Bouton Envoyer la recherche ambigu ou invisible.')
     else:
         await field.press('Enter')
-        logging.getLogger(__name__).info('Recherche envoyée par Entrée (aucun bouton explicite).')
+        logging.getLogger("ouaga_foncier_etl.group_search").info('Recherche envoyée par Entrée (aucun bouton explicite).')
 
 
 async def assert_search_scope(page, group, term):
@@ -168,7 +168,7 @@ async def search_via_group_button(page, group, term):
         candidates = page.get_by_role('button', name=re.compile(r'^(Rechercher|Search)$', re.I))
         clicked = await click_unique_visible(candidates)
         if clicked:
-            logging.getLogger(__name__).info('Bouton mobile « Rechercher » ouvert ; validation du groupe exigée après saisie.')
+            logging.getLogger("ouaga_foncier_etl.group_search").info('Bouton mobile « Rechercher » ouvert ; validation du groupe exigée après saisie.')
     if not clicked:
         raise ValueError('Loupe du groupe non reconnue : vérifier son libellé accessible dans cette interface.')
     fields = page.get_by_placeholder('Rechercher dans ce groupe', exact=True)
@@ -199,7 +199,7 @@ async def configure_search(page, group, term):
     try:
         await assert_search_scope(page, group, term)
     except (ValueError, PlaywrightTimeoutError):
-        logging.getLogger(__name__).info('Recherche directe non confirmée (chemin reçu : %s) ; essai par la loupe du groupe.', urlparse(page.url).path)
+        logging.getLogger("ouaga_foncier_etl.group_search").info('Recherche directe non confirmée (chemin reçu : %s) ; essai par la loupe du groupe.', urlparse(page.url).path)
         await search_via_group_button(page, group, term)
     # Attend le panneau rendu ; l'absence de cette interface doit rester explicite.
     try:
