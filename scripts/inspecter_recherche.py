@@ -42,7 +42,7 @@ async def inspect(args):
     cooldown = scraper.verifier_cooldown(args.compte)
     if cooldown:
         raise ValueError(f'Pause active jusqu’à {cooldown.isoformat()}.')
-    groups = config.charger_groupes(None, args.compte)
+    groups = config.charger_groupes(compte=args.compte)
     group = next((g for g in groups if str(g.id) == args.groupe), None)
     if group is None:
         raise ValueError('Groupe absent des groupes actifs de ce compte.')
