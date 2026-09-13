@@ -129,9 +129,13 @@ async def assert_search_scope(page, group, term, *, submitted_from_group=False):
     _verifier_domaine_facebook(page.url)
     try:
         assert_search_url(page.url, group.url, term)
-        return
     except ValueError:
         pass
+    else:
+        # Facebook peut conserver cette adresse tout en affichant le fil du
+        # groupe. Une URL attendue ne remplace pas les résultats rendus.
+        await wait_search_results(page, timeout=10)
+        return
     # Variante d'URL : exiger les preuves rendues de recherche ET de groupe ET de mot.
     parsed = urlparse(page.url)
     if parsed.path.rstrip('/') == '/search_results':
@@ -217,17 +221,12 @@ async def search_via_group_button(page, group, term):
 
 
 async def configure_search(page, group, term):
-    from scraper import detecter_blocage_ou_session_expiree, _verifier_domaine_facebook
-    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-    await page.goto(search_url(group.url, term), wait_until='domcontentloaded')
-    _verifier_domaine_facebook(page.url)
-    await detecter_blocage_ou_session_expiree(page)
-    submitted_from_group = False
-    try:
-        await assert_search_scope(page, group, term)
-    except (ValueError, PlaywrightTimeoutError):
-        logging.getLogger("ouaga_foncier_etl.group_search").info('Recherche directe non confirmée (chemin reçu : %s) ; essai par la loupe du groupe.', urlparse(page.url).path)
-        submitted_from_group = await search_via_group_button(page, group, term)
+    from scraper import detecter_blocage_ou_session_expiree
+    search_url(group.url, term)  # Valider une cible groupe ; ne pas naviguer vers cette URL.
+    logger = logging.getLogger('ouaga_foncier_etl.group_search')
+    logger.info('Recherche via la loupe du groupe : ouverture, saisie et envoi de « %s ».', term)
+    submitted_from_group = await search_via_group_button(page, group, term)
+    logger.info('Résultats de recherche confirmés ; sélection du filtre « Plus récentes ».')
     # Attend le panneau rendu ; l'absence de cette interface doit rester explicite.
     try:
         await page.get_by_text(RECENT).first.wait_for(state='visible', timeout=10000)

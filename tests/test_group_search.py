@@ -115,19 +115,20 @@ async def test_neighbor_switch_from_screenshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_redirect_uses_group_search_not_general_feed(monkeypatch):
+async def test_configure_always_uses_group_button_before_sort(monkeypatch):
     page = SimpleNamespace(url='https://m.facebook.com/groups/123/', goto=AsyncMock(),
                            get_by_text=lambda *a, **k: SimpleNamespace(first=SimpleNamespace(wait_for=AsyncMock())))
     group = SimpleNamespace(url=page.url, nom='Groupe')
-    scope = AsyncMock(side_effect=[ValueError('route mobile différente'), None])
-    fallback = AsyncMock()
+    scope = AsyncMock()
+    fallback = AsyncMock(return_value=True)
     monkeypatch.setattr(gs, 'assert_search_scope', scope)
     monkeypatch.setattr(gs, 'search_via_group_button', fallback)
     monkeypatch.setattr(gs, 'select_recent', AsyncMock(return_value=True))
     monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
     await gs.configure_search(page, group, 'terrain')
     fallback.assert_awaited_once_with(page, group, 'terrain')
-    assert scope.await_count == 2
+    page.goto.assert_not_awaited()  # aucune navigation directe /groups/id/search/
+    scope.assert_awaited_once_with(page, group, 'terrain', submitted_from_group=True)
 
 
 @pytest.mark.asyncio
@@ -296,7 +297,7 @@ async def test_complete_mobile_navigation_and_recent_selection(monkeypatch):
     group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe')
     page = SimpleNamespace(url=group.url)
     async def goto(url, **kwargs):
-        # Observed: the direct search URL redirects back to the group.
+        assert url == 'https://www.facebook.com/groups/123/'
         page.url = 'https://www.facebook.com/groups/123/'
     async def fill(value):
         state['value'] = value
@@ -336,3 +337,18 @@ async def test_complete_mobile_navigation_and_recent_selection(monkeypatch):
     send.click.assert_awaited_once()
     recent.scroll_into_view_if_needed.assert_awaited_once()
     recent.click.assert_awaited_once()
+
+
+@pytest.mark.parametrize('has_results', [False, True])
+async def test_expected_search_url_alone_cannot_confirm_results(monkeypatch, has_results):
+    # Régression réelle : adresse /groups/id/search/?q=terrain, mais fil général affiché.
+    page = SimpleNamespace(url='https://m.facebook.com/groups/123/search/?q=terrain')
+    group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe')
+    markers = AsyncMock(side_effect=None if has_results else ValueError('recherche non confirmée'))
+    monkeypatch.setattr(gs, 'wait_search_results', markers)
+    if has_results:
+        await gs.assert_search_scope(page, group, 'terrain')
+    else:
+        with pytest.raises(ValueError, match='recherche non confirmée'):
+            await gs.assert_search_scope(page, group, 'terrain')
+    markers.assert_awaited_once_with(page, timeout=10)
