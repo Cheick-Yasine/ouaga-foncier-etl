@@ -1703,8 +1703,10 @@ async def scraper_groupe(
             taches_en_cours.add(tache)
             tache.add_done_callback(taches_en_cours.discard)
 
+    ecoute_reponses_active = False
     if not recherche:
         page.on("response", _sur_reponse)
+        ecoute_reponses_active = True
     # Navigue vers `groupe.url` tel que renseigné dans groups.csv, plutôt que
     # de reconstruire systématiquement une URL `/groups/<id>/` à partir de
     # `groupe.id` (comportement d'origine, valable uniquement pour un vrai
@@ -1733,6 +1735,7 @@ async def scraper_groupe(
                 raise StructureFacebookInattendueError(str(exc)) from exc
             # Commencer la capture après validation : exclut le fil ouvert par la loupe.
             page.on("response", _sur_reponse)
+            ecoute_reponses_active = True
             await asyncio.sleep(config.PAGE_DELAY_MIN_S)
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
@@ -1978,7 +1981,8 @@ async def scraper_groupe(
         if recherche:
             raise StructureFacebookInattendueError("Recherche interrompue par un timeout : couverture non confirmée.") from exc
     finally:
-        page.remove_listener("response", _sur_reponse)
+        if ecoute_reponses_active:
+            page.remove_listener("response", _sur_reponse)
         if taches_en_cours:
             await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
         await page.close()

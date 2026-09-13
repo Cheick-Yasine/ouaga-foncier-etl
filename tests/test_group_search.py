@@ -130,3 +130,28 @@ async def test_rendered_scope_rejects_different_group():
     group = SimpleNamespace(url='https://m.facebook.com/groups/123/', nom='Groupe')
     with pytest.raises(ValueError, match='hors du groupe'):
         await gs.assert_search_scope(page, group, 'terrain')
+
+@pytest.mark.asyncio
+async def test_search_setup_failure_does_not_remove_unregistered_listener(monkeypatch, tmp_path):
+    import config
+    page = SimpleNamespace(content=AsyncMock(return_value='<html>diagnostic</html>'),
+                           on=Mock(), remove_listener=Mock(side_effect=KeyError('response')), close=AsyncMock())
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+    group = SimpleNamespace(id='123', nom='Groupe', url='https://m.facebook.com/groups/123/')
+    monkeypatch.setattr(config, 'LOG_DIR', tmp_path)
+    monkeypatch.setattr(gs, 'configure_search', AsyncMock(side_effect=ValueError('Loupe non reconnue')))
+    with pytest.raises(scraper.StructureFacebookInattendueError, match='Loupe non reconnue'):
+        await scraper.scraper_groupe(context, group, 5, {}, recherche='terrain', rattrapage=True)
+    page.remove_listener.assert_not_called()
+    page.close.assert_awaited_once()
+
+
+def test_diagnostic_excludes_secrets_and_retains_search_controls():
+    from scripts.diagnostic_recherche import Diagnostic
+    import json
+    parser = Diagnostic()
+    parser.feed('<script>search SECRET_COOKIE</script><input type="hidden" value="SECRET_TOKEN"><div role="button" aria-label="Rechercher dans ce groupe"></div><a href="/groups/123/search/?q=terrain&amp;token=SECRET_TOKEN">Rechercher</a>')
+    output = json.dumps(parser.controls)
+    assert 'SECRET' not in output
+    assert 'Rechercher dans ce groupe' in output
+    assert 'terrain' in output
