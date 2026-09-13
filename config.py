@@ -663,7 +663,7 @@ PAUSE_ENTRE_GROUPES_MAX_S = 900.0  # 15 minutes
 PAUSE_ENTRE_BATCHES_MIN_S = 1200.0  # 20 minutes
 PAUSE_ENTRE_BATCHES_MAX_S = 1800.0  # 30 minutes
 
-MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
+MAX_PAGES_SANS_NOUVEAU_POST = 20  # même seuil pour pages/scrolls sans nouveauté
 # Un seul post ancien peut être un contenu original inclus dans une
 # republication récente. Il faut donc plusieurs lots consécutifs dont TOUTES
 # les dates d'apparition dans le groupe sont anciennes avant d'arrêter.

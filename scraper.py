@@ -1578,6 +1578,7 @@ async def scraper_groupe(
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
     post_repere: str | None = None,
+    rattrapage: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne (les nouveaux posts non vus, le nouveau
@@ -1625,6 +1626,9 @@ async def scraper_groupe(
     d'extraction pour la justification (posts épinglés = pas d'ordre
     chronologique fiable, donc inutilisables comme signal de fraîcheur ; une
     fois vus ils entrent dans `seen_ids` et ne sont plus jamais réévalués).
+
+    En rattrapage, aucun plafond total de scrolls. Le seuil sans nouveauté,
+    les lots hors fenêtre et les contrôles de session restent actifs.
 
     Args:
         delai_multiplicateur: facteur appliqué aux délais entre étapes de
@@ -1783,7 +1787,8 @@ async def scraper_groupe(
         etapes_hors_fenetre = 0
         etapes_scroll = 0
 
-        while etapes_scroll < config.MAX_PAGES_ABSOLU:
+        while rattrapage or etapes_scroll < config.MAX_PAGES_ABSOLU:
+            await detecter_blocage_ou_session_expiree(page)
             debut_capture = len(posts_captures)
             # Scroll page-niveau (window), plus fiable en headless que
             # page.mouse.wheel dont l'effet dépend de la position du curseur.
@@ -1862,9 +1867,10 @@ async def scraper_groupe(
 
             logger.info(
                 "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
-                "| weblite_dom=%d | posts capturés cumulés=%d",
+                "| weblite_dom=%d | posts capturés cumulés=%d | retenus=%d | sans nouveauté=%d/20",
                 groupe.nom, etapes_scroll, compteur_reponses_vues,
                 compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
+                len(nouveaux_posts), etapes_sans_nouveau,
             )
 
             emit_progress("scroll", groupe.id, scroll=etapes_scroll,
@@ -1915,7 +1921,7 @@ async def scraper_groupe(
 
             etapes_scroll += 1
 
-        if etapes_scroll >= config.MAX_PAGES_ABSOLU and not repere_trouve:
+        if not rattrapage and etapes_scroll >= config.MAX_PAGES_ABSOLU and not repere_trouve:
             logger.warning(
                 "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint SANS avoir "
                 "retrouvé le post-repère du run précédent (id=%s) - soit ce post "
@@ -2150,6 +2156,7 @@ async def executer_scraping(
                             seen_pour_groupe,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
                             post_repere=None if mode == "backfill" else reperes_dernier_post.get(groupe.id),
+                            rattrapage=mode == "backfill",
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
