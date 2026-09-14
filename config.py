@@ -42,6 +42,15 @@ def mode_navigateur() -> str:
         raise ValueError("OUAGA_BROWSER_MODE doit être mobile ou desktop.")
     return mode
 
+
+def moteur_navigateur() -> str:
+    moteur = os.environ.get('OUAGA_BROWSER_ENGINE', 'chromium').strip().lower()
+    if moteur not in {'chromium', 'firefox'}:
+        raise ValueError('OUAGA_BROWSER_ENGINE doit être chromium ou firefox.')
+    if moteur == 'firefox' and mode_navigateur() != 'desktop':
+        raise ValueError('Firefox nécessite --browser desktop.')
+    return moteur
+
 SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
 # {groupe_id: post_id} du post le plus récent connu pour chaque groupe, au
 # moment où le run précédent a terminé son scroll. Sert de repère d'arrêt :

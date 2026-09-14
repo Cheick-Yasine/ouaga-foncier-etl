@@ -137,6 +137,8 @@ def test_desktop_cli_propagates_to_collection_and_processing(tmp_path, monkeypat
     from unittest.mock import Mock
     monkeypatch.setattr(dotenv, 'load_dotenv', Mock())
     monkeypatch.setenv('OUAGA_BROWSER_MODE', 'mobile')
+    monkeypatch.setenv('OUAGA_BROWSER_ENGINE', 'chromium')
+    monkeypatch.setenv('OUAGA_BROWSER_VISIBLE', '0')
     root = tmp_path / 'compte_1' / 'raw'
     root.mkdir(parents=True)
     (root / 'one.json').write_text('[]')
@@ -144,11 +146,14 @@ def test_desktop_cli_propagates_to_collection_and_processing(tmp_path, monkeypat
     def child(args, env, timeout):
         calls.append(args)
         assert env['OUAGA_BROWSER_MODE'] == 'desktop'
+        assert env['OUAGA_BROWSER_ENGINE'] == 'firefox'
+        assert env['OUAGA_BROWSER_VISIBLE'] == '1'
         assert env['OUAGA_DATA_DIR'] == str(root.parent)
         assert args[args.index('--compte') + 1] == '1'
         return 0
     monkeypatch.setattr(daily, 'run_child', child)
-    assert daily.main(['--compte', '1', '--browser', 'desktop', '--backfill-days', '5',
+    assert daily.main(['--compte', '1', '--browser', 'desktop', '--engine', 'firefox', '--visible', '--group-limit', '1', '--backfill-days', '5',
                        '--data-dir', str(tmp_path)]) == 0
     assert len(calls) == 2
     assert calls[0][calls[0].index('--days-back') + 1] == '5'
+    assert calls[0][calls[0].index('--group-limit') + 1] == '1'

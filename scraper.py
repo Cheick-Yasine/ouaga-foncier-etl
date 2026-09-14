@@ -50,6 +50,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import urllib.parse
@@ -64,6 +65,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
+    Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -91,6 +93,13 @@ class InterfaceFacebookInattendueError(Exception):
 
 class StructureFacebookInattendueError(Exception):
     """Levée si la page ne présente aucun signal exploitable connu."""
+
+
+class RechercheIncompleteError(StructureFacebookInattendueError):
+    """Résultats conservés, mais aucune preuve de couverture complète."""
+    def __init__(self, message, posts):
+        super().__init__(message)
+        self.posts = posts
 
 
 class CooldownActifError(Exception):
@@ -375,7 +384,7 @@ async def creer_navigateur(
     compte: str | None = None,
     proxy: dict[str, str] | None = None,
     *,
-    headless: bool = True,
+    headless: bool | None = None,
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
@@ -395,9 +404,14 @@ async def creer_navigateur(
     propre réputation, pas forcément parfaite).
     """
     mode = config.mode_navigateur()
+    moteur = config.moteur_navigateur()
+    if headless is None:
+        headless = os.environ.get('OUAGA_BROWSER_VISIBLE') != '1'
     if mode == "desktop":
         options_interface = dict(viewport={"width": 1440, "height": 900}, is_mobile=False, has_touch=False)
-        logger.info("Navigateur ordinateur : viewport=1440x900 | agent utilisateur natif Chromium | tactile désactivé")
+        if moteur == 'firefox':
+            options_interface.pop('is_mobile')  # aucune émulation mobile dans Firefox
+        logger.info("Navigateur ordinateur : moteur=%s | viewport=1440x900 | agent utilisateur natif | tactile désactivé", moteur)
     else:
         user_agent, viewport = config.choisir_fingerprint_mobile(compte)
         options_interface = dict(viewport=viewport, user_agent=user_agent, is_mobile=True, has_touch=True)
@@ -406,7 +420,7 @@ async def creer_navigateur(
             viewport["width"], viewport["height"], user_agent[:60],
         )
     region = config.parametres_regionaux(compte)
-    navigateur = await playwright.chromium.launch(
+    navigateur = await getattr(playwright, moteur).launch(
         headless=headless,
         args=["--disable-blink-features=AutomationControlled"] if mode == "mobile" else [],
         proxy=None,
@@ -545,6 +559,17 @@ async def _scroll_humain(page: Page, delai_multiplicateur: float = 1.0) -> None:
 
 
 async def detecter_blocage_ou_session_expiree(page: Page) -> None:
+    from search_runtime import lire_apres_navigation
+    try:
+        await lire_apres_navigation(page, lambda: _detecter_blocage_une_fois(page))
+    except PlaywrightError as exc:
+        from search_runtime import navigation_interrompue
+        if navigation_interrompue(exc):
+            raise StructureFacebookInattendueError('Navigation instable pendant la vérification de session.') from exc
+        raise
+
+
+async def _detecter_blocage_une_fois(page: Page) -> None:
     """Vérifie l'URL et le contenu visible pour détecter un mur anti-bot ou une
     session expirée. Lève une exception dédiée dans les deux cas, pour que
     l'appelant puisse arrêter proprement plutôt que de scraper une page d'erreur.
@@ -553,10 +578,7 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
     if any(fragment in url for fragment in SELECTEURS["checkpoint_url_fragments"]):
         raise BlocageDetecteError(f"URL de checkpoint/connexion détectée : {page.url}")
 
-    try:
-        contenu = (await page.content()).lower()
-    except Exception:  # page déjà fermée, navigation en cours, etc.
-        return
+    contenu = (await page.content()).lower()
 
     if any(mot in contenu for mot in MOTS_CHECKPOINT_TEXTE):
         raise BlocageDetecteError("Texte de vérification anti-bot détecté sur la page.")
@@ -1651,6 +1673,8 @@ async def scraper_groupe(
     page = await context.new_page()
     nouveaux_posts: list[dict[str, Any]] = []
     posts_captures: list[dict[str, Any]] = []
+    ids_captures: set[str] = set()
+    statuts_graphql: dict[int, int] = {}
     taches_en_cours: set[asyncio.Task] = set()
     nb_posts_trouves_via_scroll = 0  # exclut les posts "mis en avant" du HTML initial
     # Défini tôt (avant le try) pour être toujours retournable, y compris si
@@ -1672,12 +1696,12 @@ async def scraper_groupe(
         `posts_captures`. Best-effort : toute erreur est avalée pour ne
         jamais interrompre le scraping sur une réponse mal formée.
         """
+        statuts_graphql[reponse.status] = statuts_graphql.get(reponse.status, 0) + 1
         try:
             corps = await reponse.text()
         except Exception:
             return
-        # Ancien préfixe anti-JSON-hijacking parfois toujours présent.
-        corps = corps.removeprefix("for (;;);")
+        from search_runtime import graphql_payloads
         if len(echantillons_graphql_bruts) < config.NB_ECHANTILLONS_DEBUG_GRAPHQL:
             echantillons_graphql_bruts.append(
                 {"url": reponse.url, "corps_tronque": corps[:5000]}
@@ -1685,17 +1709,11 @@ async def scraper_groupe(
         # Une réponse GraphQL Facebook peut contenir plusieurs objets JSON
         # concaténés ligne par ligne ("multipart") - on tente le corps entier
         # puis chaque ligne individuellement.
-        for candidat in (corps, *corps.splitlines()):
-            candidat = candidat.strip()
-            if not candidat:
-                continue
-            try:
-                payload = json.loads(candidat)
-            except json.JSONDecodeError:
-                continue
-            posts_captures.extend(
-                extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
-            )
+        for payload in graphql_payloads(corps):
+            for post in extraire_stories_depuis_json(payload, groupe.id, groupe.nom):
+                if post['id'] not in ids_captures:
+                    ids_captures.add(post['id'])
+                    posts_captures.append(post)
 
     def _sur_reponse(reponse: Any) -> None:
         # Callback SYNCHRONE (API d'événements Playwright) : on ne fait que
@@ -1709,6 +1727,11 @@ async def scraper_groupe(
             tache.add_done_callback(taches_en_cours.discard)
 
     ecoute_reponses_active = False
+    def commencer_capture_recherche():
+        nonlocal ecoute_reponses_active
+        if not ecoute_reponses_active:
+            page.on('response', _sur_reponse)
+            ecoute_reponses_active = True
     if not recherche:
         page.on("response", _sur_reponse)
         ecoute_reponses_active = True
@@ -1732,15 +1755,13 @@ async def scraper_groupe(
             logger.info('Groupe %s | recherche="%s" | préparation du tri récent', groupe.nom, recherche)
             # Navigation directe vers la recherche ; aucun fil général n’est ouvert.
             try:
-                await configure_search(page, groupe, recherche)
+                await configure_search(page, groupe, recherche, on_results_ready=commencer_capture_recherche)
             except (ValueError, PlaywrightTimeoutError) as exc:
                 diagnostic = config.LOG_DIR / f"recherche_{groupe.id}_{recherche}.html"
                 diagnostic.write_text(await page.content(), encoding="utf-8")
                 logger.error('Recherche non configurée. Diagnostic local : %s', diagnostic)
                 raise StructureFacebookInattendueError(str(exc)) from exc
-            # Commencer la capture après validation : exclut le fil ouvert par la loupe.
-            page.on("response", _sur_reponse)
-            ecoute_reponses_active = True
+            # La capture commence après validation du groupe et AVANT le filtre.
             await asyncio.sleep(config.PAGE_DELAY_MIN_S)
             if taches_en_cours:
                 await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
@@ -1789,7 +1810,8 @@ async def scraper_groupe(
         #      `seen_ids` et ne sera plus jamais réévalué (impact réel
         #      observé : une seule fois par groupe, pas une pollution
         #      quotidienne récurrente du jeu de données).
-        html_initial = await page.content()
+        from search_runtime import lire_apres_navigation
+        html_initial = await lire_apres_navigation(page, page.content)
         posts_initiaux = _extraire_stories_depuis_scripts_json(
             html_initial, groupe.id, groupe.nom
         )
@@ -1806,6 +1828,7 @@ async def scraper_groupe(
         for p in posts_inedits_initiaux:
             seen_ids[p["id"]] = p["scrape_le"]
         nouveaux_posts.extend(posts_inedits_initiaux)
+        prochaine_capture = len(posts_captures)
         # Note : les posts "mis en avant" ne sont volontairement PAS utilisés
         # comme candidat pour `nouveau_repere` (pas de garantie chronologique,
         # voir le commentaire détaillé plus haut sur ce même sujet) ni comme
@@ -1819,13 +1842,23 @@ async def scraper_groupe(
         etapes_sans_nouveau = 0
         etapes_hors_fenetre = 0
         etapes_scroll = 0
+        # Les réponses arrivant entre deux tours doivent également être traitées.
+        mouvement = None
+        reprise_effectuee = False
+        diagnostic_ecrit = False
 
         while rattrapage or etapes_scroll < config.MAX_PAGES_ABSOLU:
             await detecter_blocage_ou_session_expiree(page)
-            debut_capture = len(posts_captures)
-            # Scroll page-niveau (window), plus fiable en headless que
-            # page.mouse.wheel dont l'effet dépend de la position du curseur.
-            await _scroll_humain(page, delai_multiplicateur)
+            if recherche and config.mode_navigateur() == 'desktop':
+                from search_runtime import defiler_resultats
+                reprendre = etapes_sans_nouveau >= 3 and not reprise_effectuee
+                mouvement = await defiler_resultats(page, reprendre=reprendre)
+                reprise_effectuee |= reprendre
+                logger.info('Défilement %s | position=%s -> %s | hauteur=%s | bas=%s | reprise=%s',
+                            mouvement['apres']['cible'], mouvement['avant']['position'], mouvement['apres']['position'],
+                            mouvement['apres']['hauteur'], mouvement['apres']['bas'], reprendre)
+            else:
+                await _scroll_humain(page, delai_multiplicateur)
             await asyncio.sleep(
                 random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
                 * delai_multiplicateur
@@ -1837,7 +1870,8 @@ async def scraper_groupe(
 
             posts_dom = await _extraire_posts_weblite_dom(page, groupe)
             posts_dom_observes.update(post["id"] for post in posts_dom)
-            nouveaux_bruts = posts_captures[debut_capture:] + posts_dom
+            nouveaux_bruts = posts_captures[prochaine_capture:] + posts_dom
+            prochaine_capture = len(posts_captures)
             if recherche:
                 nouveaux_bruts = [p for p in nouveaux_bruts if matching_post(p, recherche, groupe.id)]
 
@@ -1913,6 +1947,20 @@ async def scraper_groupe(
                           dom=len(posts_dom_observes), captured=len(posts_captures),
                           selected=len(nouveaux_posts))
 
+            if recherche:
+                from search_runtime import statistiques_dates, diagnostic_stagnation
+                stats = statistiques_dates(nouveaux_posts, date_limite)
+                logger.info('Recherche=%s | dates : dans les %s jours=%s | hors fenêtre=%s | incertaines=%s | plus récent=%s | HTTP GraphQL=%s',
+                            recherche, max_days_back, stats['dans_fenetre'], stats['hors_fenetre'],
+                            stats['dates_incertaines'], stats['date_max'], statuts_graphql)
+                if etapes_sans_nouveau >= 3 and not diagnostic_ecrit:
+                    dossier = config.LOG_DIR / f'stagnation_{groupe.id}_{recherche}'
+                    await diagnostic_stagnation(page, dossier, dict(groupe=groupe.id, recherche=recherche,
+                        mouvement=mouvement, captures_uniques=len(posts_captures), retenus=len(nouveaux_posts),
+                        statuts_graphql=statuts_graphql, **stats))
+                    diagnostic_ecrit = True
+                    logger.warning('Chargement sans nouveauté : diagnostic %s ; fin des résultats non prouvée.', dossier)
+
             # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
             # retrouvé -> on a la certitude d'avoir tout rattrapé sur ce groupe.
             if repere_trouve:
@@ -1952,6 +2000,9 @@ async def scraper_groupe(
                     groupe.nom,
                     etapes_sans_nouveau,
                 )
+                if recherche:
+                    raise RechercheIncompleteError(
+                        f'Recherche {recherche} : chargement sans nouveauté, couverture non confirmée.', nouveaux_posts)
                 break
 
             etapes_scroll += 1
@@ -2002,16 +2053,22 @@ async def scraper_recherches_groupe(context, groupe, max_days_back, seen_ids,
     """Deux recherches indépendantes ; sauvegarde terrain avant de passer à parcelle."""
     from group_search import TERMS, in_window
     resultats = {}
+    incompletes = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_days_back)
     base_seen = dict(seen_ids)
     for term in TERMS:
         # Les doublons de terrain ne doivent pas arrêter trop tôt la recherche parcelle.
         query_seen = dict(base_seen)
-        posts, _ = await scraper_groupe(
-            context, groupe, max_days_back, query_seen,
-            delai_multiplicateur=delai_multiplicateur, post_repere=None,
-            rattrapage=rattrapage, recherche=term,
-        )
+        try:
+            posts, _ = await scraper_groupe(
+                context, groupe, max_days_back, query_seen,
+                delai_multiplicateur=delai_multiplicateur, post_repere=None,
+                rattrapage=rattrapage, recherche=term,
+            )
+        except RechercheIncompleteError as exc:
+            posts = exc.posts
+            incompletes.append(term)
+            logger.warning('%s Les résultats partiels seront sauvegardés.', exc)
         nouveaux = [p for p in posts if p['id'] not in resultats and in_window(p, cutoff)]
         # Dédoublonner aussi une éventuelle répétition interne au résultat.
         nouveaux = list({p['id']: p for p in nouveaux}.values())
@@ -2020,10 +2077,12 @@ async def scraper_recherches_groupe(context, groupe, max_days_back, seen_ids,
             if fichiers_sauvegardes is not None:
                 fichiers_sauvegardes.append(path)
         resultats.update((p['id'], p) for p in nouveaux)
-        seen_ids.update(query_seen)
+        seen_ids.update({p['id']: query_seen[p['id']] for p in nouveaux if p['id'] in query_seen})
         logger.info('Groupe %s | recherche="%s" terminée | %d publications sauvegardées | cumul unique=%d | dates incertaines=%d',
                     groupe.nom, term, len(nouveaux), len(resultats),
                     sum(bool(p.get('date_incertaine') or not p.get('date_publication')) for p in nouveaux))
+    if incompletes:
+        raise RechercheIncompleteError('Recherches incomplètes : ' + ', '.join(incompletes), list(resultats.values()))
     return list(resultats.values()), None
 
 # --------------------------------------------------------------------------- #

@@ -74,12 +74,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compte', choices=list('12345'), required=True)
     parser.add_argument('--browser', choices=['mobile', 'desktop'], help='Interface Facebook (desktop = ordinateur).')
+    parser.add_argument('--engine', choices=['chromium', 'firefox'], help='Moteur du navigateur ; Firefox nécessite desktop.')
     parser.add_argument('--groupe', required=True)
     parser.add_argument('--mot', choices=['terrain', 'parcelle'], default='terrain')
     parser.add_argument('--data-dir', type=Path, default=Path(os.environ.get('OUAGA_PERSISTENT_DIR', str(Path.home() / 'ouaga-etl-data'))))
     args = parser.parse_args()
     if args.browser is not None:
         os.environ['OUAGA_BROWSER_MODE'] = args.browser
+    if args.engine is not None:
+        os.environ['OUAGA_BROWSER_ENGINE'] = args.engine
+    if os.environ.get('OUAGA_BROWSER_ENGINE') == 'firefox' and os.environ.get('OUAGA_BROWSER_MODE', 'mobile') != 'desktop':
+        parser.error('Firefox nécessite --browser desktop.')
     root = args.data_dir.expanduser().resolve() / f'compte_{args.compte}'
     os.environ['OUAGA_DATA_DIR'] = str(root)
     import config

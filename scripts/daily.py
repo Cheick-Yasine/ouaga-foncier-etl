@@ -58,7 +58,7 @@ def pending_files(db, root):
     return [p for p in sorted((root / 'raw').glob('*.json')) if p.name not in done]
 
 
-def execute_account(account, base, collect_timeout, process_timeout, process_only=False, backfill_days=None):
+def execute_account(account, base, collect_timeout, process_timeout, process_only=False, backfill_days=None, group_limit=None):
     root = base / f'compte_{account}'
     root.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, OUAGA_DATA_DIR=str(root))
@@ -85,7 +85,10 @@ def execute_account(account, base, collect_timeout, process_timeout, process_onl
             if backfill_days is not None:
                 days = backfill_days
                 gap_exceeded = False
-            code = None if process_only else run_child(['--compte', account, '--collect-only', '--mode', mode, '--days-back', str(days)], env, collect_timeout)
+            collect_args = ['--compte', account, '--collect-only', '--mode', mode, '--days-back', str(days)]
+            if group_limit is not None:
+                collect_args += ['--group-limit', str(group_limit)]
+            code = None if process_only else run_child(collect_args, env, collect_timeout)
             for path in pending_files(db, root):
                 result = run_child(['--compte', account, '--mode', mode, '--process-file', str(path)], env, process_timeout)
                 if result:
@@ -116,6 +119,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compte', choices=['all','1','2','3','4','5'], default='all')
     parser.add_argument('--browser', choices=['mobile', 'desktop'], help='Interface Facebook (desktop = ordinateur).')
+    parser.add_argument('--engine', choices=['chromium', 'firefox'], help='Moteur du navigateur ; Firefox nécessite desktop.')
+    parser.add_argument('--visible', action='store_true', help='Afficher la fenêtre de collecte.')
+    parser.add_argument('--group-limit', type=int, help='Limiter cet essai à N groupes du compte.')
     parser.add_argument('--data-dir', type=Path, default=Path(os.environ.get('OUAGA_PERSISTENT_DIR', str(Path.home() / 'ouaga-etl-data'))))
     parser.add_argument('--collect-timeout', type=int, default=7200)
     parser.add_argument('--process-timeout', type=int, default=1800)
@@ -124,6 +130,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.browser is not None:
         os.environ['OUAGA_BROWSER_MODE'] = args.browser
+    if args.engine is not None:
+        os.environ['OUAGA_BROWSER_ENGINE'] = args.engine
+    if args.visible:
+        os.environ['OUAGA_BROWSER_VISIBLE'] = '1'
+    if os.environ.get('OUAGA_BROWSER_ENGINE') == 'firefox' and os.environ.get('OUAGA_BROWSER_MODE', 'mobile') != 'desktop':
+        parser.error('Firefox nécessite --browser desktop.')
+    if args.group_limit is not None and args.group_limit < 1:
+        parser.error('--group-limit doit être positif.')
     if min(args.collect_timeout, args.process_timeout) <= 0:
         parser.error('Les durées doivent être positives.')
     if args.backfill_days is not None and not 1 <= args.backfill_days <= 14:
@@ -133,7 +147,7 @@ def main(argv=None):
     failed = 0
     for account in accounts:
         try:
-            failed |= execute_account(account, base, args.collect_timeout, args.process_timeout, args.process_only, args.backfill_days)
+            failed |= execute_account(account, base, args.collect_timeout, args.process_timeout, args.process_only, args.backfill_days, args.group_limit)
         except Exception as exc:
             print(f'Compte {account} : superviseur interrompu ({type(exc).__name__}). Vérifier le journal local.', file=sys.stderr)
             failed = 1

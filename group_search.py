@@ -281,12 +281,14 @@ async def search_via_group_button(page, group, term):
     return group_field_confirmed
 
 
-async def configure_search(page, group, term):
+async def configure_search(page, group, term, *, on_results_ready=None):
     from scraper import detecter_blocage_ou_session_expiree
     search_url(group.url, term)  # Valider une cible groupe ; ne pas naviguer vers cette URL.
     logger = logging.getLogger('ouaga_foncier_etl.group_search')
     logger.info('Recherche via la loupe du groupe : ouverture, saisie et envoi de « %s ».', term)
     submitted_from_group = await search_via_group_button(page, group, term)
+    if on_results_ready is not None:
+        on_results_ready()  # écouter AVANT le chargement déclenché par le filtre
     logger.info('Résultats de recherche confirmés ; sélection du filtre « Plus récentes ».')
     # Attend le panneau rendu ; l'absence de cette interface doit rester explicite.
     try:
@@ -299,8 +301,18 @@ async def configure_search(page, group, term):
         await _cliquer_premier_libelle_visible(page, ('Trier', 'Trier par', 'Sort', 'Sort by', 'Filtres', 'Filters'))
         if not await select_recent(page):
             raise ValueError('Tri « Publications récentes » non confirmé : aucun scroll effectué. Une capture du panneau de filtres est nécessaire.')
-    await detecter_blocage_ou_session_expiree(page)
-    await assert_search_scope(page, group, term, submitted_from_group=submitted_from_group)
+    from search_runtime import lire_apres_navigation
+    async def validate():
+        await detecter_blocage_ou_session_expiree(page)
+        await assert_search_scope(page, group, term, submitted_from_group=submitted_from_group)
+    from playwright.async_api import Error as PlaywrightError
+    from search_runtime import navigation_interrompue
+    try:
+        await lire_apres_navigation(page, validate)
+    except PlaywrightError as exc:
+        if navigation_interrompue(exc):
+            raise ValueError('Recherche instable après le tri : navigation non terminée après trois vérifications.') from exc
+        raise
 
 
 def matching_post(post, term, group_id):

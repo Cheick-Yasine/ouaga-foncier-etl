@@ -123,9 +123,15 @@ async def test_configure_always_uses_group_button_before_sort(monkeypatch):
     fallback = AsyncMock(return_value=True)
     monkeypatch.setattr(gs, 'assert_search_scope', scope)
     monkeypatch.setattr(gs, 'search_via_group_button', fallback)
-    monkeypatch.setattr(gs, 'select_recent', AsyncMock(return_value=True))
+    events = []
+    async def sort(_):
+        assert events == ['capture']
+        events.append('sort')
+        return True
+    monkeypatch.setattr(gs, 'select_recent', sort)
     monkeypatch.setattr(scraper, 'detecter_blocage_ou_session_expiree', AsyncMock())
-    await gs.configure_search(page, group, 'terrain')
+    await gs.configure_search(page, group, 'terrain', on_results_ready=lambda: events.append('capture'))
+    assert events == ['capture', 'sort']
     fallback.assert_awaited_once_with(page, group, 'terrain')
     page.goto.assert_not_awaited()  # aucune navigation directe /groups/id/search/
     scope.assert_awaited_once_with(page, group, 'terrain', submitted_from_group=True)

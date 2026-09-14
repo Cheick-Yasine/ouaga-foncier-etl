@@ -8,27 +8,29 @@ def test_route_does_not_expose_query_tokens():
     assert 'SECRET' not in str(route)
 
 
-@pytest.mark.parametrize('mode', ['mobile', 'desktop'])
-async def test_visible_browser_uses_requested_mode(monkeypatch, mode):
+@pytest.mark.parametrize('mode,engine', [('mobile', 'chromium'), ('desktop', 'chromium'), ('desktop', 'firefox')])
+async def test_visible_browser_uses_requested_mode(monkeypatch, mode, engine):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
     import scraper
     import config
     monkeypatch.setenv('OUAGA_BROWSER_MODE', mode)
+    monkeypatch.setenv('OUAGA_BROWSER_ENGINE', engine)
     context = SimpleNamespace(add_init_script=AsyncMock(), add_cookies=AsyncMock(), set_default_navigation_timeout=Mock())
     browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
     launch = AsyncMock(return_value=browser)
     monkeypatch.setattr(config, 'choisir_fingerprint_mobile', lambda _: ('test-UA', {'width': 360, 'height': 780}))
     monkeypatch.setattr(config, 'parametres_regionaux', lambda _: SimpleNamespace(locale='fr-FR', fuseau_horaire='Africa/Ouagadougou'))
     monkeypatch.setattr(scraper, '_charger_origins_sauvegardees', lambda _: [])
-    await scraper.creer_navigateur(SimpleNamespace(chromium=SimpleNamespace(launch=launch)), [], '1', headless=False)
+    await scraper.creer_navigateur(SimpleNamespace(**{engine: SimpleNamespace(launch=launch)}), [], '1', headless=False)
     assert launch.call_args.kwargs['headless'] is False
     options = browser.new_context.await_args.kwargs
     if mode == 'desktop':
         assert options['viewport'] == {'width': 1440, 'height': 900}
-        assert options['is_mobile'] is False and options['has_touch'] is False
+        assert options.get('is_mobile', False) is False and options['has_touch'] is False
         assert 'user_agent' not in options  # Chromium conserve son agent ordinateur natif.
         context.add_init_script.assert_not_awaited()
+        assert launch.await_args.kwargs['args'] == []
     else:
         assert options['viewport'] == {'width': 360, 'height': 780}
         assert options['is_mobile'] is True and options['has_touch'] is True
