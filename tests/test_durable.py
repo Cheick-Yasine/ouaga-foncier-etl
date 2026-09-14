@@ -5,6 +5,63 @@ from durable import atomic_json, account_lock
 from scripts import daily
 
 
+def test_second_lock_reports_busy_and_preserves_lock_file(tmp_path):
+    from durable import AccountBusyError
+    path = tmp_path / 'daily.lock'
+    with account_lock(path):
+        with pytest.raises(AccountBusyError):
+            with account_lock(path):
+                pytest.fail('Le second propriétaire ne doit pas entrer')
+        assert path.exists()
+    with account_lock(path):
+        pass  # libéré après fermeture du premier propriétaire
+
+
+def test_windows_lock_permission_error_is_reported_as_busy(monkeypatch):
+    import errno
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from durable import _acquire_lock, AccountBusyError
+    locking = Mock(side_effect=PermissionError(errno.EACCES, 'Permission denied'))
+    monkeypatch.setitem(sys.modules, 'msvcrt', SimpleNamespace(locking=locking, LK_NBLCK=2))
+    with pytest.raises(AccountBusyError):
+        _acquire_lock(SimpleNamespace(fileno=lambda: 123), windows=True)
+    locking.assert_called_once_with(123, 2, 1)
+    locking.side_effect = OSError(errno.EBADF, 'Invalid file descriptor')
+    with pytest.raises(OSError) as error:
+        _acquire_lock(SimpleNamespace(fileno=lambda: 123), windows=True)
+    assert error.value.errno == errno.EBADF
+
+
+def test_supervisor_reports_real_access_failure_with_path(monkeypatch, tmp_path, capsys):
+    import errno
+    import dotenv
+    from unittest.mock import Mock
+    monkeypatch.setattr(dotenv, 'load_dotenv', Mock())
+    monkeypatch.delenv('OUAGA_BROWSER_ENGINE', raising=False)
+    denied = str(tmp_path / 'compte_1' / 'status.json')
+    monkeypatch.setattr(daily, 'execute_account', Mock(side_effect=PermissionError(errno.EACCES, 'Permission denied', denied)))
+    assert daily.main(['--compte', '1', '--data-dir', str(tmp_path)]) == 1
+    message = capsys.readouterr().err
+    assert denied in message and 'accès refusé' in message and 'errno=13' in message
+    assert 'déjà utilisé' not in message
+
+
+def test_supervisor_with_active_diagnostic_does_not_start_collection(monkeypatch, tmp_path, capsys):
+    import dotenv
+    from unittest.mock import Mock
+    monkeypatch.setattr(dotenv, 'load_dotenv', Mock())
+    monkeypatch.delenv('OUAGA_BROWSER_ENGINE', raising=False)
+    child = Mock()
+    monkeypatch.setattr(daily, 'run_child', child)
+    with account_lock(tmp_path / 'compte_1' / 'daily.lock'):
+        assert daily.main(['--compte', '1', '--data-dir', str(tmp_path)]) == 1
+    assert 'déjà utilisé' in capsys.readouterr().err
+    child.assert_not_called()
+    assert not (tmp_path / 'compte_1' / 'journal.sqlite3').exists()
+
+
 def test_atomic_failure_preserves_previous(tmp_path, monkeypatch):
     path = tmp_path / 'state.json'
     atomic_json(path, {'old': True})

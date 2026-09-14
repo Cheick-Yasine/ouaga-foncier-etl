@@ -89,9 +89,12 @@ def main():
     os.environ['OUAGA_DATA_DIR'] = str(root)
     import config
     config.configurer_logging()
-    from durable import account_lock
-    with account_lock(root / 'daily.lock'):
-        asyncio.run(inspect(args))
+    from durable import account_lock, AccountBusyError
+    try:
+        with account_lock(root / 'daily.lock'):
+            asyncio.run(inspect(args))
+    except AccountBusyError:
+        parser.exit(1, 'Ce compte est déjà utilisé par une collecte ou un diagnostic. Fermer cet autre processus avant de relancer.\n')
 
 
 if __name__ == '__main__':

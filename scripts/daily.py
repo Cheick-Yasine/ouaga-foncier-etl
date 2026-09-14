@@ -14,11 +14,12 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import traceback
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from durable import account_lock, atomic_json
+from durable import account_lock, atomic_json, AccountBusyError
 
 
 def now():
@@ -148,6 +149,20 @@ def main(argv=None):
     for account in accounts:
         try:
             failed |= execute_account(account, base, args.collect_timeout, args.process_timeout, args.process_only, args.backfill_days, args.group_limit)
+        except AccountBusyError:
+            print(f'Compte {account} : déjà utilisé par une collecte ou un diagnostic. '
+                  'Terminer le diagnostic avec Entrée, ou arrêter l’autre collecte avec Ctrl+C, puis relancer. '
+                  f'Verrou : {base / ("compte_" + account) / "daily.lock"}', file=sys.stderr)
+            failed = 1
+        except PermissionError as exc:
+            frames = traceback.extract_tb(exc.__traceback__)
+            frame = frames[-1] if frames else None
+            operation = f'{Path(frame.filename).name}:{frame.lineno} ({frame.name})' if frame else 'inconnue'
+            print(f'Compte {account} : accès refusé | opération={operation} | '
+                  f'errno={exc.errno} | winerror={getattr(exc, "winerror", None)} | '
+                  f'fichier={exc.filename or "non précisé"} | destination={exc.filename2 or "non précisée"} | '
+                  f'dossier du compte={base / ("compte_" + account)}', file=sys.stderr)
+            failed = 1
         except Exception as exc:
             print(f'Compte {account} : superviseur interrompu ({type(exc).__name__}). Vérifier le journal local.', file=sys.stderr)
             failed = 1

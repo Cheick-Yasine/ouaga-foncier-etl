@@ -1,10 +1,31 @@
 """Persistence locale et verrou OS, sans dépendance externe."""
 from __future__ import annotations
 import contextlib
+import errno
 import json
 import os
 import tempfile
 from pathlib import Path
+
+
+class AccountBusyError(RuntimeError):
+    """Le verrou de ce compte appartient déjà à un autre processus."""
+
+
+def _acquire_lock(stream, windows):
+    try:
+        if windows:
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        # Intercepter seulement l'appel de verrouillage. Un accès refusé lors
+        # de l'ouverture/création du fichier reste une vraie erreur d'accès.
+        if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise AccountBusyError('Une collecte ou un diagnostic utilise déjà ce compte.') from exc
+        raise
 
 
 def atomic_json(path: Path, value, private=False):
@@ -34,10 +55,7 @@ def account_lock(path: Path):
                 stream.write(b'0')
                 stream.flush()
             stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _acquire_lock(stream, windows=os.name == 'nt')
         try:
             yield
         finally:
@@ -45,4 +63,5 @@ def account_lock(path: Path):
                 stream.seek(0)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
             else:
+                import fcntl
                 fcntl.flock(stream, fcntl.LOCK_UN)
