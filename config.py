@@ -460,7 +460,7 @@ MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives s
 # rien la plupart du temps (on s'arrête bien avant, dès que le repère est
 # retrouvé) tout en couvrant un rattrapage raisonnable si le repère est
 # introuvable.
-MAX_PAGES_ABSOLU = 1000
+MAX_PAGES_ABSOLU = 250
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
