@@ -31,6 +31,14 @@ import config
 import main as pipeline_main
 import scraper
 
+# Régression constatée le 2026-09-16 : config.py était encore à 4 alors que
+# le seuil validé pour les runs durables est 20. On l'impose ici au runtime
+# sans modifier la logique de navigation elle-même.
+config.MAX_PAGES_SANS_NOUVEAU_POST = max(
+    config.MAX_PAGES_SANS_NOUVEAU_POST,
+    20,
+)
+
 LIVE_DIR = config.RAW_DIR / "_live"
 RUN_ID = os.environ.get("GITHUB_RUN_ID") or datetime.now(timezone.utc).strftime("local-%Y%m%dT%H%M%SZ")
 
