@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -63,6 +64,33 @@ def _ecriture_atomique_json(chemin: Path, contenu: list[dict[str, Any]]) -> None
     os.replace(temporaire, chemin)
 
 
+def _reprendre_checkpoints_en_attente() -> None:
+    """Reprend les RAW Neon non traités laissés par un ancien run.
+
+    La reprise est best-effort : si OpenAI ou Neon est momentanément
+    indisponible, le nouveau scraping peut tout de même démarrer et les lignes
+    restent ``processed = FALSE`` pour le run suivant.
+    """
+    script = ROOT / "scripts" / "process_recovered_raw.py"
+    if not script.exists() or not os.environ.get("DATABASE_URL", "").strip():
+        return
+
+    print("Vérification des checkpoints Neon non traités avant le scraping...")
+    try:
+        resultat = subprocess.run(
+            [sys.executable, str(script), "--pending-only"],
+            cwd=str(ROOT),
+            check=False,
+        )
+        if resultat.returncode != 0:
+            print(
+                "ATTENTION: la reprise pré-run a échoué; les checkpoints restent "
+                "non traités et seront retentés ultérieurement."
+            )
+    except Exception as exc:
+        print(f"ATTENTION: reprise pré-run impossible: {exc}")
+
+
 class JournalLive:
     def __init__(self) -> None:
         self.ids_deja_connus = set(scraper.charger_seen_ids().keys())
@@ -92,8 +120,6 @@ class JournalLive:
                 autocommit=True,
                 connect_timeout=15,
             )
-            # Deux execute séparés : plus robuste avec le protocole étendu de
-            # PostgreSQL/psycopg qu'une chaîne contenant plusieurs commandes.
             self.conn.execute(CREATE_CHECKPOINT_TABLE_SQL)
             self.conn.execute(CREATE_CHECKPOINT_INDEX_SQL)
             if initial:
@@ -175,8 +201,6 @@ class JournalLive:
             nouveaux.append(post)
 
         if nouveaux:
-            # Toujours écrire localement AVANT Neon. Une panne réseau ne doit
-            # jamais faire perdre un post déjà extrait du navigateur.
             _ecriture_atomique_json(
                 LIVE_DIR / f"live_{groupe_id}.json",
                 list(journal.values()),
@@ -239,6 +263,7 @@ def _installer_journal_live(journal: JournalLive) -> None:
 
 def main() -> int:
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    _reprendre_checkpoints_en_attente()
     journal = JournalLive()
     _installer_journal_live(journal)
     try:
