@@ -116,7 +116,7 @@ jobs:
           if [ "${{ github.event.inputs.skip_llm }}" = "true" ]; then
             ARGS+=(--skip-llm)
           fi
-          python scripts/backfill_missing_period.py "${ARGS[@]}"
+          python scripts/backfill_missing_period_all_missing.py "${ARGS[@]}"
 
       - name: Traitement de secours des RAW de la période
         if: always() && steps.pipeline.outcome == 'failure'
