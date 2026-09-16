@@ -1,7 +1,7 @@
 """Rattrapage fiable d'une période historique manquante.
 
 Ce point d'entrée est volontairement séparé du quotidien. Il traite un seul
-Groupe incomplet par run et considère une période comme couverte uniquement
+groupe incomplet par run et considère une période comme couverte uniquement
 quand le fil principal a été parcouru jusqu'en dessous de la date de début
 avec plusieurs confirmations consécutives.
 
@@ -18,11 +18,14 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+import psycopg
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -46,6 +49,23 @@ BACKFILL_SESSION_CHECK_EVERY = 5
 _TARGET_START: datetime | None = None
 _TARGET_END_EXCLUSIVE: datetime | None = None
 _PERIOD_KEY = ""
+_EXISTING_ANNONCE_IDS: set[str] = set()
+_EXISTING_IDS_LOADED = False
+
+RECENT_LABELS = [
+    "activité récente",
+    "publications récentes",
+    "les plus récentes",
+    "recent activity",
+    "most recent",
+    "new posts",
+]
+RELEVANT_LABELS = [
+    "plus pertinents",
+    "pertinents d'abord",
+    "pertinents d’abord",
+    "most relevant",
+]
 
 
 def _parse_iso_date(value: str) -> date:
@@ -103,19 +123,25 @@ def _sauvegarder_couverture(contenu: dict[str, Any]) -> None:
 
 def _etat_groupe(groupe_id: str) -> dict[str, Any]:
     couverture = _charger_couverture()
-    periode = couverture.setdefault("periods", {}).setdefault(
+    return dict(
+        couverture.get("periods", {})
+        .get(_PERIOD_KEY, {})
+        .get("groups", {})
+        .get(groupe_id, {})
+    )
+
+
+def _assurer_periode(couverture: dict[str, Any]) -> dict[str, Any]:
+    assert _TARGET_START is not None
+    assert _TARGET_END_EXCLUSIVE is not None
+    return couverture.setdefault("periods", {}).setdefault(
         _PERIOD_KEY,
         {
-            "start_date": _TARGET_START.date().isoformat() if _TARGET_START else None,
-            "end_date": (
-                (_TARGET_END_EXCLUSIVE - timedelta(days=1)).date().isoformat()
-                if _TARGET_END_EXCLUSIVE
-                else None
-            ),
+            "start_date": _TARGET_START.date().isoformat(),
+            "end_date": (_TARGET_END_EXCLUSIVE - timedelta(days=1)).date().isoformat(),
             "groups": {},
         },
     )
-    return dict(periode.setdefault("groups", {}).get(groupe_id, {}))
 
 
 def _marquer_groupe(
@@ -128,24 +154,15 @@ def _marquer_groupe(
     target_posts_new: int,
     oldest_seen: datetime | None,
     newest_seen: datetime | None,
+    recent_sort_confirmed: bool,
 ) -> None:
     couverture = _charger_couverture()
-    periode = couverture.setdefault("periods", {}).setdefault(
-        _PERIOD_KEY,
-        {
-            "start_date": _TARGET_START.date().isoformat() if _TARGET_START else None,
-            "end_date": (
-                (_TARGET_END_EXCLUSIVE - timedelta(days=1)).date().isoformat()
-                if _TARGET_END_EXCLUSIVE
-                else None
-            ),
-            "groups": {},
-        },
-    )
+    periode = _assurer_periode(couverture)
     periode.setdefault("groups", {})[groupe.id] = {
         "group_name": groupe.nom,
         "status": status,
         "reason": reason,
+        "recent_sort_confirmed": recent_sort_confirmed,
         "scroll_steps": scroll_steps,
         "target_posts_observed": target_posts_observed,
         "target_posts_new": target_posts_new,
@@ -178,10 +195,98 @@ def _choisir_prochain_groupe(
     return None
 
 
-class BackfillJournal(JournalLive):
-    """Checkpoint Neon limité à la période visée, pour éviter de retraiter
-    tout le haut du fil si le run échoue pendant le rattrapage.
+def _charger_ids_annonces_existantes() -> tuple[set[str], bool]:
+    """Charge les IDs déjà présents dans la base finale.
+
+    Lors du premier passage d'un groupe, cela permet de retraiter un post qui
+    aurait été marqué ``seen`` lors d'un ancien run interrompu mais qui n'aurait
+    jamais atteint ``annonces``. Si Neon est indisponible, on revient au
+    comportement prudent basé sur ``seen_ids``.
     """
+    dsn = os.environ.get("DATABASE_URL", "").strip()
+    if not dsn:
+        return set(), False
+    try:
+        with psycopg.connect(dsn, connect_timeout=15) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM annonces")
+                return {str(row[0]) for row in cur.fetchall()}, True
+    except Exception as exc:
+        print(f"ATTENTION: impossible de charger les IDs de annonces existantes: {exc}")
+        return set(), False
+
+
+async def _premier_visible(page: Any, labels: list[str]) -> Any | None:
+    for label in labels:
+        motif = re.compile(re.escape(label), re.IGNORECASE)
+        locator = page.get_by_text(motif, exact=False)
+        try:
+            count = min(await locator.count(), 8)
+        except Exception:
+            continue
+        for i in range(count):
+            candidat = locator.nth(i)
+            try:
+                if await candidat.is_visible():
+                    return candidat
+            except Exception:
+                continue
+    return None
+
+
+async def _forcer_tri_recent(page: Any) -> bool:
+    """Tente de confirmer/activer l'ordre récent du fil.
+
+    On ne déclare jamais une couverture historique complète si ce tri ne peut
+    pas être confirmé. Les libellés français et anglais les plus courants sont
+    gérés, sans supposer un sélecteur CSS interne Facebook stable.
+    """
+    recent = await _premier_visible(page, RECENT_LABELS)
+    if recent is not None:
+        try:
+            await recent.click(timeout=5_000)
+            await asyncio.sleep(2)
+        except Exception:
+            # S'il s'agit déjà du libellé de l'état actif, le clic n'est pas
+            # nécessaire : sa présence visible suffit comme confirmation.
+            pass
+        scraper.logger.info("BACKFILL: tri récent visible/confirmé.")
+        return True
+
+    relevant = await _premier_visible(page, RELEVANT_LABELS)
+    if relevant is None:
+        scraper.logger.warning(
+            "BACKFILL: impossible de trouver le contrôle de tri récent. "
+            "La période ne sera pas marquée complète sur ce run."
+        )
+        return False
+
+    try:
+        await relevant.click(timeout=5_000)
+        await asyncio.sleep(2)
+    except Exception as exc:
+        scraper.logger.warning("BACKFILL: ouverture du menu de tri impossible: %s", exc)
+        return False
+
+    recent = await _premier_visible(page, RECENT_LABELS)
+    if recent is None:
+        scraper.logger.warning(
+            "BACKFILL: menu de tri ouvert mais option récente introuvable."
+        )
+        return False
+
+    try:
+        await recent.click(timeout=5_000)
+        await asyncio.sleep(3)
+        scraper.logger.info("BACKFILL: option de tri récent activée.")
+        return True
+    except Exception as exc:
+        scraper.logger.warning("BACKFILL: activation du tri récent impossible: %s", exc)
+        return False
+
+
+class BackfillJournal(JournalLive):
+    """Checkpoint Neon limité à la période visée."""
 
     def ajouter(self, groupe_id: str, posts: list[dict[str, Any]]) -> None:
         super().ajouter(groupe_id, [p for p in posts if _dans_periode(p)])
@@ -197,17 +302,18 @@ async def _scraper_groupe_backfill(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Parcourt le fil principal pour une fenêtre historique précise.
 
-    Différences avec le mode quotidien :
-    - le post-repère est volontairement ignoré ;
-    - les posts épinglés du HTML initial ne servent pas de signal chronologique ;
+    Différences avec le quotidien :
+    - le post-repère est ignoré ;
+    - le tri récent doit être confirmé pour obtenir le statut ``complete`` ;
     - 20 scrolls vides sont tolérés ;
     - un vieux post isolé ne suffit jamais à arrêter le backfill ;
-    - il faut 5 étapes avec contenu daté, toutes entièrement antérieures à la
-      date de début, pour déclarer la période couverte.
+    - il faut 5 étapes datées consécutives, toutes entièrement antérieures à la
+      date de début, pour considérer que le bas de la période a été dépassé.
     """
     assert _TARGET_START is not None
     assert _TARGET_END_EXCLUSIVE is not None
 
+    premiere_tentative = not bool(_etat_groupe(groupe.id))
     page = await context.new_page()
     posts_captures: list[dict[str, Any]] = []
     taches: set[asyncio.Task[Any]] = set()
@@ -223,6 +329,7 @@ async def _scraper_groupe_backfill(
     target_posts_observed = 0
     oldest_seen: datetime | None = None
     newest_seen: datetime | None = None
+    recent_sort_confirmed = False
     status = "incomplete"
     reason = "run_interrompu"
 
@@ -266,13 +373,19 @@ async def _scraper_groupe_backfill(
         )
         await page.goto(url_groupe, wait_until="domcontentloaded")
         await scraper.detecter_blocage_ou_session_expiree(page)
+        recent_sort_confirmed = await _forcer_tri_recent(page)
+
         await asyncio.sleep(
             scraper.random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
             * delai_multiplicateur
         )
 
         while scroll_steps < config.MAX_PAGES_ABSOLU:
-            debut_capture = len(posts_captures)
+            # Au premier passage, inclure aussi les réponses GraphQL du
+            # chargement initial : elles appartiennent au vrai fil et peuvent
+            # contenir les premiers posts avant le premier scroll.
+            debut_capture = 0 if scroll_steps == 0 else len(posts_captures)
+
             await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
             await asyncio.sleep(
                 scraper.random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
@@ -290,12 +403,10 @@ async def _scraper_groupe_backfill(
                 ids_flux_vus.add(post_id)
                 etape.append(post)
 
-            if etape:
-                empty_steps = 0
-            else:
-                empty_steps += 1
-
+            empty_steps = 0 if etape else empty_steps + 1
             dates_etape: list[datetime] = []
+            ajoutes_cette_etape = 0
+
             for post in etape:
                 dt = _date_post(post)
                 if dt is None:
@@ -307,29 +418,46 @@ async def _scraper_groupe_backfill(
                 if _TARGET_START <= dt < _TARGET_END_EXCLUSIVE:
                     target_posts_observed += 1
                     post_id = str(post.get("id") or "").strip()
-                    if (
-                        post_id
-                        and post_id not in seen_ids
-                        and post_id not in ids_target_vus
-                    ):
+                    if not post_id or post_id in ids_target_vus:
+                        continue
+
+                    if _EXISTING_IDS_LOADED:
+                        # Au premier passage du nouveau système, retraiter aussi
+                        # les IDs anciennement vus mais absents de la base finale :
+                        # ils peuvent provenir d'un vieux run interrompu.
+                        eligible = (
+                            post_id not in _EXISTING_ANNONCE_IDS
+                            and (premiere_tentative or post_id not in seen_ids)
+                        )
+                    else:
+                        eligible = post_id not in seen_ids
+
+                    if eligible:
                         ids_target_vus.add(post_id)
                         seen_ids[post_id] = post.get("scrape_le") or datetime.now(
                             timezone.utc
                         ).isoformat()
                         nouveaux_target.append(post)
+                        ajoutes_cette_etape += 1
 
-            # La confirmation d'avoir dépassé la période ne repose JAMAIS sur
-            # un seul vieux post. Toute l'étape doit être antérieure au début,
-            # et cela doit se répéter plusieurs fois de suite.
+            # Sauvegarde incrémentale de seen_ids : si la session expire plus
+            # tard, le prochain essai du même groupe ne repaysera pas les mêmes
+            # posts déjà récupérés pendant ce nouveau backfill.
+            if ajoutes_cette_etape:
+                scraper.sauvegarder_seen_ids(seen_ids)
+
+            # Cinq confirmations réellement consécutives : une étape sans date
+            # ne compte pas et casse la série au lieu de la prolonger.
             if dates_etape and all(dt < _TARGET_START for dt in dates_etape):
                 old_confirm_steps += 1
-            elif dates_etape:
+            else:
                 old_confirm_steps = 0
 
+            scroll_steps += 1
             scraper.logger.info(
                 "BACKFILL %s | scroll %d | réseau=%d graphql=%d | "
                 "posts flux uniques=%d | cible observés=%d nouveaux=%d | "
-                "anciens confirmés=%d/%d | vides=%d/%d",
+                "anciens confirmés=%d/%d | vides=%d/%d | tri_recent=%s",
                 groupe.nom,
                 scroll_steps,
                 compteur_reponses_vues,
@@ -341,11 +469,16 @@ async def _scraper_groupe_backfill(
                 BACKFILL_OLD_CONFIRM_STEPS,
                 empty_steps,
                 BACKFILL_MAX_EMPTY_STEPS,
+                recent_sort_confirmed,
             )
 
             if old_confirm_steps >= BACKFILL_OLD_CONFIRM_STEPS:
-                status = "complete"
-                reason = "periode_depassee_confirmee"
+                if recent_sort_confirmed:
+                    status = "complete"
+                    reason = "periode_depassee_confirmee"
+                else:
+                    status = "incomplete"
+                    reason = "periode_depassee_mais_tri_recent_non_confirme"
                 break
 
             if empty_steps >= BACKFILL_MAX_EMPTY_STEPS:
@@ -353,7 +486,6 @@ async def _scraper_groupe_backfill(
                 reason = "20_scrolls_sans_nouveau_post"
                 break
 
-            scroll_steps += 1
             if scroll_steps % BACKFILL_SESSION_CHECK_EVERY == 0:
                 await scraper.detecter_blocage_ou_session_expiree(page)
         else:
@@ -382,6 +514,7 @@ async def _scraper_groupe_backfill(
             target_posts_new=len(nouveaux_target),
             oldest_seen=oldest_seen,
             newest_seen=newest_seen,
+            recent_sort_confirmed=recent_sort_confirmed,
         )
         page.remove_listener("response", _sur_reponse)
         if taches:
@@ -412,6 +545,7 @@ def _parser_args() -> argparse.Namespace:
 
 def main() -> int:
     global _TARGET_START, _TARGET_END_EXCLUSIVE, _PERIOD_KEY
+    global _EXISTING_ANNONCE_IDS, _EXISTING_IDS_LOADED
 
     args = _parser_args()
     _TARGET_START = _datetime_utc(args.start_date)
@@ -420,6 +554,12 @@ def main() -> int:
 
     chargeur_original: Callable[..., list[config.Groupe]] = config.charger_groupes
     groupes = chargeur_original(limite=None)
+
+    couverture = _charger_couverture()
+    periode = _assurer_periode(couverture)
+    periode["active_groups_total"] = len(groupes)
+    _sauvegarder_couverture(couverture)
+
     groupe = _choisir_prochain_groupe(groupes, args.group_id)
     if groupe is None:
         print(
@@ -427,8 +567,11 @@ def main() -> int:
         )
         return 0
 
+    _EXISTING_ANNONCE_IDS, _EXISTING_IDS_LOADED = _charger_ids_annonces_existantes()
     print(
-        f"Backfill {_PERIOD_KEY} : prochain groupe = {groupe.nom} ({groupe.id})."
+        f"Backfill {_PERIOD_KEY} : prochain groupe = {groupe.nom} ({groupe.id}). "
+        f"IDs annonces déjà en base chargés={len(_EXISTING_ANNONCE_IDS)} "
+        f"(connexion_ok={_EXISTING_IDS_LOADED})."
     )
 
     def _charger_selection(*_args: Any, **_kwargs: Any) -> list[config.Groupe]:
