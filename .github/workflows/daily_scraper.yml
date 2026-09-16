@@ -12,7 +12,7 @@ on:
         options: [daily, backfill]
         default: daily
       days_back:
-        description: "Nombre de jours à remonter"
+        description: "Jours à remonter, ou période AAAA-MM-JJ:AAAA-MM-JJ en backfill"
         type: string
         default: "7"
       round_robin:
@@ -136,17 +136,33 @@ jobs:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
         run: |
-          ARGS=(
-            --mode "${{ steps.params.outputs.mode }}"
-            --days-back "${{ steps.params.outputs.days_back }}"
-            --group-limit "${{ steps.params.outputs.group_limit }}"
-            --batch-size "${{ steps.params.outputs.batch_size }}"
-          )
-          if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
-            ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
+          MODE="${{ steps.params.outputs.mode }}"
+          DAYS_BACK="${{ steps.params.outputs.days_back }}"
+
+          # Backfill historique exact : réutilise le champ days_back existant
+          # sous la forme AAAA-MM-JJ:AAAA-MM-JJ. Le script traite un seul groupe
+          # incomplet et le prochain lancement reprend automatiquement le suivant.
+          if [ "$MODE" = "backfill" ] && [[ "$DAYS_BACK" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}:[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            START_DATE="${DAYS_BACK%%:*}"
+            END_DATE="${DAYS_BACK##*:}"
+            echo "Backfill historique exact : $START_DATE -> $END_DATE"
+            python scripts/backfill_missing_period.py \
+              --start-date "$START_DATE" \
+              --end-date "$END_DATE"
+          else
+            ARGS=(
+              --mode "$MODE"
+              --days-back "$DAYS_BACK"
+              --group-limit "${{ steps.params.outputs.group_limit }}"
+              --batch-size "${{ steps.params.outputs.batch_size }}"
+            )
+            if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
+              ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
+            fi
+            python scripts/resilient_entrypoint.py "${ARGS[@]}"
           fi
-          python scripts/resilient_entrypoint.py "${ARGS[@]}"
 
       - name: Traitement de secours des RAW déjà récupérés
         if: always() && steps.pipeline.outcome == 'failure'
@@ -200,6 +216,7 @@ jobs:
             data/processed/annonces.xlsx
             data/processed/annonces_*.csv
             data/processed/rejetes_*.json
+            data/state/backfill_coverage.json
             data/logs/*.log
             data/logs/debug_page_vide_*.html
             data/logs/debug_scroll_vide_*.json
