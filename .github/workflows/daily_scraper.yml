@@ -2,24 +2,6 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # Deux horaires fixes par jour : 00h00 et 12h00 UTC (demande explicite de
-    # l'utilisateur). Un run traite TOUS les groupes actifs d'affilée, un par
-    # un, avec des pauses volontairement longues entre eux (10-15 min entre
-    # deux groupes, 20-30 min entre deux lots de 5 - voir
-    # config.PAUSE_ENTRE_GROUPES_*/PAUSE_ENTRE_BATCHES_*). Le rattrapage
-    # complet par groupe est garanti par le mécanisme de "post-repère" (voir
-    # DERNIER_POST_CONNU_PATH dans config.py), pas par l'espacement des runs -
-    # celui-ci ne sert qu'à limiter le rythme d'activité de la session vis-à-
-    # vis de Facebook.
-    #
-    # ATTENTION - risque de dépassement de la limite GitHub Actions (6h/360min
-    # par job, infranchissable même en augmentant timeout-minutes) : avec ces
-    # pauses longues, ~13 groupes actifs consomment déjà 140-210 minutes rien
-    # qu'en pauses, avant le temps de scroll réel et la structuration LLM. À
-    # surveiller sur les premiers runs réels (voir le log "Budget de session
-    # atteint" dans scraper.py) - si le run est régulièrement tronqué avant la
-    # fin de tous les groupes, il faudra soit réduire batch_size/le nombre de
-    # groupes actifs, soit raccourcir ces pauses.
     - cron: "0 0 * * *"
     - cron: "0 12 * * *"
   workflow_dispatch:
@@ -30,49 +12,37 @@ on:
         options: [daily, backfill]
         default: daily
       days_back:
-        description: "Nombre de jours à remonter (surtout pertinent en mode backfill)"
+        description: "Nombre de jours à remonter"
         type: string
         default: "7"
       round_robin:
-        description: "Round-robin (1-2 groupes/run) plutôt que tous les groupes d'un coup"
+        description: "Round-robin plutôt que tous les groupes"
         type: boolean
         default: false
       groups_per_run:
-        description: "Nombre de groupes traités ce run (utilisé si round_robin=true)"
+        description: "Nombre de groupes en round-robin"
         type: string
         default: "1"
       group_limit:
-        description: "Nombre max de groupes traités sur ce run (ignoré si round_robin=true ; 0 = tous)"
+        description: "Nombre max de groupes (0 = tous)"
         type: string
         default: "0"
       batch_size:
-        description: "Taille des lots de groupes entre deux pauses longues anti-détection"
+        description: "Taille des lots de groupes"
         type: string
         default: "5"
 
 permissions:
   contents: read
 
-# Un seul run actif à la fois : deux scrapes concurrents sur la même session
-# Facebook (mêmes cookies) multiplieraient le risque de détection anti-bot.
 concurrency:
   group: ouaga-foncier-etl
   cancel-in-progress: false
 
 jobs:
-  # Job séparé et bloquant : si la suite de tests échoue (régression sur les
-  # regex, le parseur d'horodatage, le throttle adaptatif, etc.), le job de
-  # scraping ne démarre même pas. Sans ce garde-fou, la première victime d'un
-  # bug serait un run réel contre Facebook - gaspillé, ou pire, faussement
-  # remonté comme un blocage anti-bot.
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Service Postgres éphémère, propre à ce job, entièrement indépendant de la
-    # base maître de production (voir DATABASE_URL plus bas). Sert uniquement
-    # à exécuter les tests de tests/test_processor_db.py contre un vrai serveur
-    # PostgreSQL plutôt que des mocks - conformément à la même logique déjà
-    # appliquée aux autres modules (regex, parseur d'horodatage, throttle...).
     services:
       postgres:
         image: postgres:16
@@ -88,21 +58,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - name: "Checkout du dépôt"
+      - name: Checkout du dépôt
         uses: actions/checkout@v4
 
-      - name: "Configuration Python"
+      - name: Configuration Python
         uses: actions/setup-python@v5
         with:
-          # Version tranchée à 3.12.7 (confirmée pour la CI et l'exécution)
           python-version: "3.12.7"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: "Installation des dépendances"
+      - name: Installation des dépendances
         run: pip install -r requirements.txt
 
-      - name: "Suite de tests (pytest)"
+      - name: Suite de tests
         env:
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ouaga_foncier_etl_test
         run: pytest -q
@@ -110,38 +79,26 @@ jobs:
   scrape-and-process:
     needs: tests
     runs-on: ubuntu-latest
-    # 360 = LE MAXIMUM ABSOLU pour un runner hébergé GitHub (limite dure, non
-    # contournable même avec une valeur plus élevée ici - un job est tué
-    # d'office à 6h). Voir SESSION_DUREE_MAX_MINUTES dans config.py (plafonné
-    # à 300 pour laisser 60 min de marge aux étapes hors scraping).
     timeout-minutes: 360
+
     steps:
-      - name: "Checkout du dépôt"
+      - name: Checkout du dépôt
         uses: actions/checkout@v4
 
-      - name: "Configuration Python"
+      - name: Configuration Python
         uses: actions/setup-python@v5
         with:
-          # Version tranchée à 3.12.7 (confirmée pour la CI et l'exécution)
           python-version: "3.12.7"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: "Installation des dépendances Python"
+      - name: Installation des dépendances Python
         run: pip install -r requirements.txt
 
-      - name: "Installation de Chromium (Playwright)"
+      - name: Installation de Chromium
         run: playwright install --with-deps chromium
 
-      # État persistant entre deux runs : storage_state (localStorage, pour un
-      # fingerprint de navigateur cohérent d'un jour à l'autre plutôt qu'un
-      # navigateur "neuf" à chaque fois), déduplication des posts déjà vus,
-      # cooldown anti-blocage et score de confiance du throttle adaptatif.
-      # Clé unique par run + restore-keys en préfixe : c'est le pattern
-      # standard pour "toujours restaurer le plus récent, toujours sauvegarder
-      # le nouveau" avec actions/cache (une clé exacte n'est jamais réécrite
-      # une fois créée).
-      - name: "Restauration de l'état persistant (data/state)"
+      - name: Restauration de l'état persistant
         uses: actions/cache/restore@v4
         with:
           path: data/state
@@ -149,15 +106,11 @@ jobs:
           restore-keys: |
             etat-scraper-
 
-      # Jitter anti-empreinte temporelle : uniquement sur le déclenchement cron,
-      # pour que le run ne démarre jamais à un horaire parfaitement fixe et
-      # prévisible (ex: toujours 00:05:00 pile). Pas de jitter en déclenchement
-      # manuel (l'utilisateur attend un retour rapide).
-      - name: "Délai aléatoire avant démarrage (cron uniquement)"
+      - name: Délai aléatoire avant démarrage
         if: github.event_name == 'schedule'
-        run: sleep $(( RANDOM % 1800 ))  # 0 à 30 minutes
+        run: sleep $(( RANDOM % 1800 ))
 
-      - name: "Résolution des paramètres d'exécution"
+      - name: Résolution des paramètres
         id: params
         shell: bash
         run: |
@@ -177,13 +130,11 @@ jobs:
             echo "batch_size=${{ github.event.inputs.batch_size }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "Exécution du pipeline ETL"
+      - name: Exécution du pipeline ETL résilient
+        id: pipeline
         env:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          # Base maître PostgreSQL hébergée sur Neon (tier gratuit) - voir
-          # README.md, section "Base de données", pour le dimensionnement et
-          # les étapes de configuration du secret.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           ARGS=(
@@ -195,46 +146,29 @@ jobs:
           if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
             ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
           fi
-          python main.py "${ARGS[@]}"
+          python scripts/resilient_entrypoint.py "${ARGS[@]}"
 
-      # Installe un pg_dump compatible avec la version serveur de Neon. BUG
-      # RÉEL rencontré le 2026-08-01 (run 30713685617) : le pg_dump 16.14
-      # préinstallé sur ubuntu-latest refusait de dumper le serveur Neon en
-      # PostgreSQL 18.4 ("server version mismatch"), silencieusement avalé
-      # par le `|| true` de l'étape suivante - la sauvegarde SQL ne s'est
-      # donc JAMAIS produite jusqu'ici, sans faire échouer le job. Méthode
-      # d'installation officielle PGDG (dépôt apt.postgresql.org) plutôt
-      # qu'une gestion manuelle de clé/sources.list.
-      - name: "Installer pg_dump compatible avec la version PostgreSQL de Neon"
+      - name: Traitement de secours des RAW déjà récupérés
+        if: always() && steps.pipeline.outcome == 'failure'
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/process_recovered_raw.py
+
+      - name: Installer pg_dump compatible avec Neon
         if: always()
-        # continue-on-error : cette étape est une sauvegarde OPTIONNELLE, pas
-        # le cœur du pipeline (scraping + insertion en base déjà faits avant).
-        # Un échec ici (verrou apt, dépôt PGDG temporairement indisponible,
-        # etc.) ne doit jamais faire échouer tout le run dans l'interface
-        # GitHub - ce qui masquerait à tort un scraping par ailleurs réussi.
         continue-on-error: true
         run: |
-          # Attente du déverrouillage d'apt avant toute tentative - un
-          # processus système en arrière-plan (souvent unattended-upgrades,
-          # lancé automatiquement au démarrage du runner) peut détenir le
-          # verrou /var/lib/apt/lists/lock pendant quelques dizaines de
-          # secondes. ÉCHEC RÉEL CONSTATÉ (2026-08-17) : "Could not get lock
-          # ... held by process ...", faisant échouer tout le run malgré un
-          # scraping/traitement par ailleurs réussi - ce correctif attend
-          # jusqu'à 2 minutes (24 x 5s) que le verrou se libère avant
-          # d'abandonner, au lieu d'échouer immédiatement au premier essai.
           attendre_deverrouillage_apt() {
             for _ in $(seq 1 24); do
               if sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
-                echo "Verrou apt détenu par un autre processus, attente 5s..."
                 sleep 5
               else
                 return 0
               fi
             done
-            echo "::warning::Verrou apt toujours détenu après 2 min d'attente - tentative quand même."
           }
-
           attendre_deverrouillage_apt
           sudo apt-get install -y postgresql-common
           attendre_deverrouillage_apt
@@ -242,44 +176,26 @@ jobs:
           attendre_deverrouillage_apt
           sudo apt-get install -y postgresql-client-18
 
-      # Sauvegarde ponctuelle de la base maître dans l'artefact du run, en plus
-      # de la base PostgreSQL elle-même (qui reste la source de vérité). Utile
-      # pour retrouver un état antérieur sans dépendre de la politique de
-      # sauvegarde de l'hébergeur Postgres choisi.
-      #
-      # ÉCHEC CONFIRMÉ du premier essai (run 30714569155, 2026-08-01) : après
-      # installation de postgresql-client-18 ci-dessus, l'appel nu à `pg_dump`
-      # utilisait TOUJOURS le binaire 16.14 ("server version mismatch"
-      # identique). Cause : sur ce runner, `/usr/bin/pg_dump` n'est pas géré
-      # par le système d'alternatives de postgresql-common (seul `psql` l'est,
-      # confirmé dans les logs de l'étape précédente - "using .../18/.../
-      # psql.1.gz ... in auto mode", rien d'équivalent pour pg_dump). On
-      # appelle donc directement le binaire versionné installé par le paquet
-      # `postgresql-client-18` (chemin standard Debian/Ubuntu), avec repli
-      # explicite (+ avertissement visible) sur `pg_dump` générique si ce
-      # chemin venait à changer.
-      - name: "Sauvegarde SQL de la base maître (pg_dump)"
+      - name: Sauvegarde SQL de la base maître
         if: always()
-        # Même logique que l'étape précédente : sauvegarde optionnelle, ne
-        # doit jamais faire échouer tout le run.
         continue-on-error: true
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           PG_DUMP_BIN="/usr/lib/postgresql/18/bin/pg_dump"
           if [ ! -x "$PG_DUMP_BIN" ]; then
-            echo "::warning::$PG_DUMP_BIN introuvable, repli sur 'pg_dump' générique (risque de mismatch de version serveur)"
             PG_DUMP_BIN="pg_dump"
           fi
-          "$PG_DUMP_BIN" --version || true
           "$PG_DUMP_BIN" "$DATABASE_URL" --no-owner --no-privileges -f data/processed/annonces_backup.sql || true
 
-      - name: "Upload de l'artefact (dump base maître, Excel, CSV du run, logs)"
-        if: always()  # même en cas d'échec partiel, on récupère les données déjà collectées
+      - name: Upload des données récupérées et des exports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: "annonces-foncieres-${{ github.run_id }}"
           path: |
+            data/raw/*.json
+            data/raw/_live/*.json
             data/processed/annonces_backup.sql
             data/processed/annonces.xlsx
             data/processed/annonces_*.csv
@@ -290,8 +206,8 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: "Sauvegarde de l'état persistant pour le prochain run"
-        if: always()  # même si le run a été coupé par un cooldown/blocage, l'état doit être conservé
+      - name: Sauvegarde de l'état persistant pour le prochain run
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: data/state
