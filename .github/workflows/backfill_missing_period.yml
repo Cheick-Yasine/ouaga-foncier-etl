@@ -1,0 +1,162 @@
+name: Rattrapage historique des annonces manquantes
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Début de la période à rattraper (AAAA-MM-JJ)"
+        type: string
+        required: true
+        default: "2026-08-31"
+      end_date:
+        description: "Fin de la période à rattraper incluse (AAAA-MM-JJ)"
+        type: string
+        required: true
+        default: "2026-09-06"
+      group_id:
+        description: "Optionnel : forcer un groupe Facebook précis"
+        type: string
+        required: false
+        default: ""
+      skip_llm:
+        description: "Tester la collecte sans appeler le LLM"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ouaga-foncier-etl
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ouaga_foncier_etl_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.7"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: Suite de tests
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ouaga_foncier_etl_test
+        run: pytest -q
+
+  backfill-one-group:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.7"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Installation des dépendances Python
+        run: pip install -r requirements.txt
+
+      - name: Installation de Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Restauration de l'état persistant
+        uses: actions/cache/restore@v4
+        with:
+          path: data/state
+          key: etat-scraper-${{ github.run_id }}
+          restore-keys: |
+            etat-scraper-
+
+      - name: Rattrapage d'un groupe incomplet
+        id: pipeline
+        env:
+          FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
+        run: |
+          ARGS=(
+            --start-date "${{ github.event.inputs.start_date }}"
+            --end-date "${{ github.event.inputs.end_date }}"
+          )
+          if [ -n "${{ github.event.inputs.group_id }}" ]; then
+            ARGS+=(--group-id "${{ github.event.inputs.group_id }}")
+          fi
+          if [ "${{ github.event.inputs.skip_llm }}" = "true" ]; then
+            ARGS+=(--skip-llm)
+          fi
+          python scripts/backfill_missing_period.py "${ARGS[@]}"
+
+      - name: Traitement de secours des RAW de la période
+        if: always() && steps.pipeline.outcome == 'failure'
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/process_recovered_raw.py
+
+      - name: Afficher l'état de couverture
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f data/state/backfill_coverage.json ]; then
+            cat data/state/backfill_coverage.json
+          else
+            echo "Aucun état de couverture créé."
+          fi
+
+      - name: Upload des RAW, exports et couverture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "backfill-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}-${{ github.run_id }}"
+          path: |
+            data/raw/*.json
+            data/raw/_live/*.json
+            data/processed/annonces.xlsx
+            data/processed/annonces_*.csv
+            data/processed/rejetes_*.json
+            data/state/backfill_coverage.json
+            data/logs/*.log
+            data/logs/debug_page_vide_*.html
+            data/logs/debug_scroll_vide_*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Sauvegarde de l'état pour le prochain groupe
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/state
+          key: etat-scraper-${{ github.run_id }}
