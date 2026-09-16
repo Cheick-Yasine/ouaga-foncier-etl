@@ -148,7 +148,7 @@ jobs:
             START_DATE="${DAYS_BACK%%:*}"
             END_DATE="${DAYS_BACK##*:}"
             echo "Backfill historique exact : $START_DATE -> $END_DATE"
-            python scripts/backfill_missing_period.py \
+            python scripts/backfill_missing_period_all_missing.py \
               --start-date "$START_DATE" \
               --end-date "$END_DATE"
           else
