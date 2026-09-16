@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -32,7 +33,7 @@ import scraper
 LIVE_DIR = config.RAW_DIR / "_live"
 RUN_ID = os.environ.get("GITHUB_RUN_ID") or datetime.now(timezone.utc).strftime("local-%Y%m%dT%H%M%SZ")
 
-CHECKPOINT_SCHEMA = """
+CREATE_CHECKPOINT_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS raw_posts_checkpoint (
     post_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
@@ -40,10 +41,16 @@ CREATE TABLE IF NOT EXISTS raw_posts_checkpoint (
     payload JSONB NOT NULL,
     captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed BOOLEAN NOT NULL DEFAULT FALSE
-);
-CREATE INDEX IF NOT EXISTS idx_raw_checkpoint_run
-    ON raw_posts_checkpoint (run_id, processed);
+)
 """
+
+CREATE_CHECKPOINT_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_raw_checkpoint_run
+    ON raw_posts_checkpoint (run_id, processed)
+"""
+
+MAX_NEON_RETRIES = 3
+RETRY_DELAYS_SECONDS = (2, 5)
 
 
 def _ecriture_atomique_json(chemin: Path, contenu: list[dict[str, Any]]) -> None:
@@ -61,45 +68,99 @@ class JournalLive:
         self.ids_deja_connus = set(scraper.charger_seen_ids().keys())
         self.posts_par_groupe: dict[str, dict[str, dict[str, Any]]] = {}
         self.conn: psycopg.Connection | None = None
+        self.dsn = os.environ.get("DATABASE_URL", "").strip()
 
-        dsn = os.environ.get("DATABASE_URL", "").strip()
-        if dsn:
+        if self.dsn:
+            self._connecter_neon(initial=True)
+
+    def _fermer_connexion(self) -> None:
+        if self.conn is not None:
             try:
-                self.conn = psycopg.connect(dsn, autocommit=True)
-                self.conn.execute(CHECKPOINT_SCHEMA)
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
+    def _connecter_neon(self, *, initial: bool = False) -> bool:
+        if not self.dsn:
+            return False
+
+        self._fermer_connexion()
+        try:
+            self.conn = psycopg.connect(
+                self.dsn,
+                autocommit=True,
+                connect_timeout=15,
+            )
+            # Deux execute séparés : plus robuste avec le protocole étendu de
+            # PostgreSQL/psycopg qu'une chaîne contenant plusieurs commandes.
+            self.conn.execute(CREATE_CHECKPOINT_TABLE_SQL)
+            self.conn.execute(CREATE_CHECKPOINT_INDEX_SQL)
+            if initial:
                 print("Checkpoint durable Neon activé pour les RAW du run.")
-            except Exception as exc:
-                # Le fichier local live reste un filet de sécurité si Neon est
-                # momentanément indisponible. Le scraping ne doit pas tomber
-                # uniquement à cause du mécanisme de sauvegarde secondaire.
-                print(f"ATTENTION: checkpoint Neon indisponible: {exc}")
-                self.conn = None
+            else:
+                print("Checkpoint Neon reconnecté avec succès.")
+            return True
+        except Exception as exc:
+            print(f"ATTENTION: connexion checkpoint Neon impossible: {exc}")
+            self._fermer_connexion()
+            return False
 
     def _persister_neon(self, groupe_id: str, posts: list[dict[str, Any]]) -> None:
-        if self.conn is None or not posts:
+        if not posts or not self.dsn:
             return
-        try:
-            with self.conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO raw_posts_checkpoint
-                        (post_id, run_id, groupe_id, payload, captured_at, processed)
-                    VALUES (%s, %s, %s, %s, NOW(), FALSE)
-                    ON CONFLICT (post_id) DO UPDATE SET
-                        run_id = EXCLUDED.run_id,
-                        groupe_id = EXCLUDED.groupe_id,
-                        payload = EXCLUDED.payload,
-                        captured_at = NOW(),
-                        processed = FALSE
-                    """,
-                    [
-                        (str(p["id"]), RUN_ID, groupe_id, Jsonb(p))
-                        for p in posts
-                        if p.get("id")
-                    ],
+
+        lignes = [
+            (str(p["id"]), RUN_ID, groupe_id, Jsonb(p))
+            for p in posts
+            if p.get("id")
+        ]
+        if not lignes:
+            return
+
+        for tentative in range(1, MAX_NEON_RETRIES + 1):
+            if self.conn is None or self.conn.closed:
+                if not self._connecter_neon():
+                    if tentative < MAX_NEON_RETRIES:
+                        time.sleep(RETRY_DELAYS_SECONDS[tentative - 1])
+                    continue
+
+            try:
+                assert self.conn is not None
+                with self.conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO raw_posts_checkpoint
+                            (post_id, run_id, groupe_id, payload, captured_at, processed)
+                        VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                        ON CONFLICT (post_id) DO UPDATE SET
+                            run_id = EXCLUDED.run_id,
+                            groupe_id = EXCLUDED.groupe_id,
+                            payload = EXCLUDED.payload,
+                            captured_at = NOW(),
+                            processed = FALSE
+                        """,
+                        lignes,
+                    )
+                if tentative > 1:
+                    print(
+                        "Checkpoint Neon rétabli : "
+                        f"{len(lignes)} post(s) sauvegardé(s) après reconnexion."
+                    )
+                return
+            except Exception as exc:
+                print(
+                    "ATTENTION: écriture checkpoint Neon échouée "
+                    f"(tentative {tentative}/{MAX_NEON_RETRIES}): {exc}"
                 )
-        except Exception as exc:
-            print(f"ATTENTION: écriture checkpoint Neon échouée: {exc}")
+                self._fermer_connexion()
+                if tentative < MAX_NEON_RETRIES:
+                    time.sleep(RETRY_DELAYS_SECONDS[tentative - 1])
+
+        print(
+            "ATTENTION: checkpoint Neon abandonné pour ce lot après 3 tentatives; "
+            "le checkpoint JSON local reste disponible pour la récupération."
+        )
 
     def ajouter(self, groupe_id: str, posts: list[dict[str, Any]]) -> None:
         if not posts:
@@ -114,6 +175,8 @@ class JournalLive:
             nouveaux.append(post)
 
         if nouveaux:
+            # Toujours écrire localement AVANT Neon. Une panne réseau ne doit
+            # jamais faire perdre un post déjà extrait du navigateur.
             _ecriture_atomique_json(
                 LIVE_DIR / f"live_{groupe_id}.json",
                 list(journal.values()),
@@ -121,22 +184,33 @@ class JournalLive:
             self._persister_neon(groupe_id, nouveaux)
 
     def marquer_run_traite(self) -> None:
-        if self.conn is None:
+        if not self.dsn:
             return
-        try:
-            self.conn.execute(
-                "UPDATE raw_posts_checkpoint SET processed = TRUE WHERE run_id = %s",
-                (RUN_ID,),
-            )
-        except Exception as exc:
-            print(f"ATTENTION: impossible de marquer les checkpoints traités: {exc}")
+
+        for tentative in range(1, MAX_NEON_RETRIES + 1):
+            if self.conn is None or self.conn.closed:
+                if not self._connecter_neon():
+                    if tentative < MAX_NEON_RETRIES:
+                        time.sleep(RETRY_DELAYS_SECONDS[tentative - 1])
+                    continue
+            try:
+                assert self.conn is not None
+                self.conn.execute(
+                    "UPDATE raw_posts_checkpoint SET processed = TRUE WHERE run_id = %s",
+                    (RUN_ID,),
+                )
+                return
+            except Exception as exc:
+                print(
+                    "ATTENTION: impossible de marquer les checkpoints traités "
+                    f"(tentative {tentative}/{MAX_NEON_RETRIES}): {exc}"
+                )
+                self._fermer_connexion()
+                if tentative < MAX_NEON_RETRIES:
+                    time.sleep(RETRY_DELAYS_SECONDS[tentative - 1])
 
     def fermer(self) -> None:
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
+        self._fermer_connexion()
 
 
 def _installer_journal_live(journal: JournalLive) -> None:
