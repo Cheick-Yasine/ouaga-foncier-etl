@@ -391,6 +391,38 @@ def _securiser_grands_entiers(records: list[dict[str, Any]]) -> None:
                 record[field] = None
 
 
+RECOVERY_ALLOWED_TYPES = {"parcelle", "terrain", "maison"}
+RECOVERY_OUTSIDE_RE = re.compile(
+    r"\\b(bobo(?:[- ]dioulasso)?|sapouy|tenkodogo|koudougou|ouahigouya|"
+    r"fada(?: n['’]?gourma)?|banfora|kaya|dori|yako|ziniare|ziniaré)\\b",
+    re.IGNORECASE,
+)
+RECOVERY_NON_LOTI_RE = re.compile(r"\\b(non[- ]?loti(?:e|es|s)?|pas loti(?:e|es|s)?)\\b", re.IGNORECASE)
+RECOVERY_LOCATION_RE = re.compile(
+    r"\\b(location|loyer|bail|a louer|à louer|en location|mise en location)\\b",
+    re.IGNORECASE,
+)
+
+
+def _postfiltre_metier(record: dict[str, Any]) -> tuple[bool, str | None]:
+    """Barrière déterministe avant toute écriture Neon."""
+    kind = str(record.get("type_bien") or "").strip().lower()
+    text = str(record.get("texte_nettoye") or record.get("texte") or "")
+    zone = str(record.get("quartier_zone") or "")
+    haystack = f"{text} {zone}"
+
+    if kind not in RECOVERY_ALLOWED_TYPES:
+        return False, "type_hors_perimetre"
+    if RECOVERY_NON_LOTI_RE.search(haystack):
+        return False, "non_loti"
+    if RECOVERY_LOCATION_RE.search(haystack):
+        return False, "location"
+    if RECOVERY_OUTSIDE_RE.search(haystack):
+        return False, "ville_hors_perimetre"
+    if record.get("prix_fcfa") is None and record.get("superficie_m2") is None:
+        return False, "prix_et_superficie_absents"
+    return True, None
+
 def _lots(elements: list[Any], size: int) -> Iterable[list[Any]]:
     for index in range(0, len(elements), size):
         yield elements[index:index + size]
@@ -457,8 +489,19 @@ async def _traiter(
             f"(concurrence={config.LLM_MAX_CONCURRENCE})"
         )
 
-        valides, non_valides = await processor.structurer_lot(lot)
-        _securiser_grands_entiers(valides)
+        valides_llm, non_valides = await processor.structurer_lot(lot)
+        _securiser_grands_entiers(valides_llm)
+
+        valides: list[dict[str, Any]] = []
+        for record in valides_llm:
+            ok, motif = _postfiltre_metier(record)
+            if ok:
+                valides.append(record)
+            else:
+                non_valides.append({
+                    **record,
+                    "motif_rejet": f"postfiltre_metier:{motif}",
+                })
 
         # Cache LLM avant la DB : une panne Neon ne fait pas repayer le lot.
         for record in valides:
