@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 import scraper  # noqa: E402
+from dotenv import set_key  # noqa: E402
 
 
 def valider_export(chemin: Path) -> str:
@@ -70,6 +71,24 @@ def valider_export(chemin: Path) -> str:
         )
 
     return json.dumps(json.loads(texte_brut), separators=(",", ":"))
+
+
+def maj_env_local(cookies_json_compact: str) -> None:
+    """Met à jour FB_COOKIES_JSON dans le .env local du dépôt.
+
+    Le diagnostic local lit .env ; mettre à jour uniquement le secret GitHub
+    ne suffit donc pas pour tester depuis le poste Windows.
+    """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        env_path.touch()
+    set_key(
+        str(env_path),
+        config.ENV_FB_COOKIES,
+        cookies_json_compact,
+        quote_mode="always",
+    )
+    print(f"{config.ENV_FB_COOKIES} mis à jour dans {env_path}")
 
 
 def purger_etat_local() -> None:
@@ -176,6 +195,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Applique réellement `gh secret set` (sinon affiche juste la commande/le JSON).",
     )
     parseur.add_argument(
+        "--update-local-env",
+        action="store_true",
+        help="Met aussi à jour FB_COOKIES_JSON dans le .env local du dépôt.",
+    )
+    parseur.add_argument(
         "--clear-actions-cache",
         action="store_true",
         help="Supprime aussi le cache GitHub Actions data/state (etat-scraper-*).",
@@ -196,6 +220,9 @@ def main(argv: list[str] | None = None) -> int:
         parseur.error(f"Export invalide : {exc}")
 
     maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret)
+
+    if args.update_local_env:
+        maj_env_local(cookies_compacts)
 
     if not args.no_purge_etat_local:
         purger_etat_local()
