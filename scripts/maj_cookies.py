@@ -219,7 +219,12 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         parseur.error(f"Export invalide : {exc}")
 
-    maj_secret_github(args.repo, cookies_compacts, appliquer=args.set_secret)
+    if args.set_secret:
+        maj_secret_github(args.repo, cookies_compacts, appliquer=True)
+    elif not args.update_local_env:
+        # Mode historique : sans cible locale explicite, affiche seulement
+        # l'aide pour le secret GitHub.
+        maj_secret_github(args.repo, cookies_compacts, appliquer=False)
 
     if args.update_local_env:
         maj_env_local(cookies_compacts)
