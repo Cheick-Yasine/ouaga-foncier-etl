@@ -176,12 +176,11 @@ async def run(group_id: str, scrolls: int, wait_seconds: float) -> int:
 
     cookies_secret = scraper.charger_cookies(cookies_json)
     cached = scraper._charger_cookies_caches()
-    cookies = cached if cached is not None else cookies_secret
 
     traces: list[dict[str, Any]] = []
-    tasks: set[asyncio.Task[Any]] = set()
 
-    async with async_playwright() as playwright:
+    async def _tentative(playwright: Any, cookies: list[dict[str, Any]], label: str) -> None:
+        tasks: set[asyncio.Task[Any]] = set()
         browser, context = await scraper.creer_navigateur(playwright, cookies)
         page = await context.new_page()
 
@@ -235,7 +234,7 @@ async def run(group_id: str, scrolls: int, wait_seconds: float) -> int:
 
         try:
             url = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{group_id}/"
-            print(f"Ouverture : {url}")
+            print(f"Ouverture ({label}) : {url}")
             await page.goto(url, wait_until="domcontentloaded")
             await scraper.detecter_blocage_ou_session_expiree(page)
 
@@ -273,6 +272,21 @@ async def run(group_id: str, scrolls: int, wait_seconds: float) -> int:
             await page.close()
             await context.close()
             await browser.close()
+
+    async with async_playwright() as playwright:
+        if cached is not None:
+            try:
+                await _tentative(playwright, cached, "cookies sauvegardés")
+            except scraper.SessionExpireeError:
+                print(
+                    "Session sauvegardée invalide côté Facebook. "
+                    "Suppression du storage_state puis nouvel essai avec FB_COOKIES_JSON."
+                )
+                scraper.invalider_storage_state()
+                traces.clear()
+                await _tentative(playwright, cookies_secret, "FB_COOKIES_JSON")
+        else:
+            await _tentative(playwright, cookies_secret, "FB_COOKIES_JSON")
 
     # Déduplique les traces identiques pour garder un fichier lisible.
     unique: list[dict[str, Any]] = []
