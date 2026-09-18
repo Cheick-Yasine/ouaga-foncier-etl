@@ -430,7 +430,8 @@ async def _traiter_reprise(
     *,
     batch_size: int,
     concurrency: int,
-) -> tuple[int, int, Path, Path]:
+    export_master_xlsx: bool = False,
+) -> tuple[int, int, Path, Path | None]:
     candidats, rejetes_niveau1 = processor.filtrer_candidats(posts)
     empreinte = _empreinte_candidats(candidats)
     cache, checkpoint = _charger_etat(empreinte)
@@ -544,20 +545,35 @@ async def _traiter_reprise(
     ]
 
     horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    print("\nFinalisation 1/3 : enregistrement des statistiques du run...")
     processor.enregistrer_run(
         "recovery",
         len(posts),
         len(candidats),
         len(valides_totales),
     )
+    print("Finalisation 1/3 OK.")
 
-    chemin_xlsx = processor.exporter_xlsx_depuis_db()
+    print("Finalisation 2/3 : export CSV des annonces valides...")
     chemin_csv = config.PROCESSED_DIR / f"annonces_{horodatage}.csv"
     processor.exporter_csv(valides_totales, chemin_csv)
+    print("Finalisation 2/3 OK.")
+
+    print("Finalisation 3/3 : export audit des rejets...")
     processor.exporter_json_audit(
         rejetes_niveau1 + rejetes_niveau2,
         config.PROCESSED_DIR / f"rejetes_{horodatage}.json",
     )
+    print("Finalisation 3/3 OK.")
+
+    # La régénération de l'Excel maître parcourt toute la table Neon et peut
+    # être lente/inutile pour un import massif. Elle devient optionnelle.
+    chemin_xlsx = None
+    if export_master_xlsx:
+        print("Export Excel maître demandé : génération en cours...")
+        chemin_xlsx = processor.exporter_xlsx_depuis_db()
+        print("Export Excel maître OK.")
 
     return len(candidats), len(valides_totales), chemin_csv, chemin_xlsx
 
@@ -614,6 +630,7 @@ async def _executer(args: argparse.Namespace) -> int:
         posts,
         batch_size=max(1, args.batch_size),
         concurrency=max(1, args.concurrency),
+        export_master_xlsx=args.export_master_xlsx,
     )
 
     print("\nIMPORT APIFY - RESULTAT")
@@ -622,7 +639,9 @@ async def _executer(args: argparse.Namespace) -> int:
     print(f"Candidats immobiliers  : {nb_candidats}")
     print(f"Annonces valides       : {nb_valides}")
     print(f"CSV du run             : {chemin_csv}")
-    print(f"Excel maître           : {chemin_xlsx}")
+    print(
+        f"Excel maître           : {chemin_xlsx if chemin_xlsx else 'non généré (optionnel)'}"
+    )
     print(f"Cache LLM              : {CACHE_LLM_PATH}")
     print(f"Checkpoint Neon        : {CHECKPOINT_PATH}")
     print("\nOK - import terminé. Les lots déjà traités sont réutilisables après coupure.")
@@ -663,6 +682,14 @@ def parser_arguments() -> argparse.Namespace:
         type=int,
         default=10,
         help="Nombre maximal d'appels OpenAI simultanés pour ce rattrapage (défaut : 10).",
+    )
+    parser.add_argument(
+        "--export-master-xlsx",
+        action="store_true",
+        help=(
+            "Régénère aussi l'Excel maître depuis toute la base Neon. "
+            "Désactivé par défaut car cette étape peut être lente."
+        ),
     )
     return parser.parse_args()
 
