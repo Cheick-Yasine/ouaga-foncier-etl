@@ -121,19 +121,29 @@ def _normaliser_item(
     *,
     source: str,
     published: datetime,
+    date_source: str,
 ) -> dict[str, Any]:
     post_id = str(item.get("id") or "").strip() or _synthetic_id(item, source)
     texte = str(item.get("texte") or item.get("text") or "").strip()
     url = str(item.get("url") or "").strip()
     groupe_nom = str(item.get("groupe_nom") or source).strip()
 
+    # Seule une date originale est publiée comme date de publication réelle.
+    # Une date reconstruite sert à cibler la reprise, mais ne doit pas fausser
+    # les statistiques hebdomadaires de Hakimo.
+    reliable_date = published.isoformat() if date_source == "originale" else ""
+
     return {
         "id": post_id,
         "groupe_nom": groupe_nom,
         "url": url,
-        # Une vraie date ISO facilite ensuite Hakimo et évite les timestamps ambigus.
-        "date_publication": published.isoformat(),
-        "date_incertaine": _date_incertaine(item),
+        "date_publication": reliable_date,
+        "date_publication_reconstruite": (
+            published.isoformat() if date_source == "reconstruite" else ""
+        ),
+        "date_incertaine": (
+            True if date_source == "reconstruite" else _date_incertaine(item)
+        ),
         "texte": texte,
     }
 
@@ -209,7 +219,12 @@ def _charger_archives(
                 stats["date_incertaine_ignoree"] += 1
                 continue
 
-            post = _normaliser_item(raw, source=source, published=published)
+            post = _normaliser_item(
+                raw,
+                source=source,
+                published=published,
+                date_source=str(date_source),
+            )
             cle = _cle_dedup(post)
             if cle in uniques:
                 stats["doublons_archives"] += 1
@@ -272,6 +287,8 @@ def _par_jour(posts: list[dict[str, Any]]) -> list[tuple[str, int]]:
     compteur: Counter[str] = Counter()
     for post in posts:
         parsed = _parse_datetime(post.get("date_publication"))
+        if parsed is None:
+            parsed = _parse_datetime(post.get("date_publication_reconstruite"))
         if parsed is not None:
             compteur[parsed.date().isoformat()] += 1
     return sorted(compteur.items())
