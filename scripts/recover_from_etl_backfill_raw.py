@@ -71,13 +71,28 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _date_publication_archive(item: dict[str, Any]) -> datetime | None:
-    """Préfère la date originale, puis la date reconstruite par le scraper."""
-    for key in ("date_publication_originale", "date_publication"):
-        parsed = _parse_datetime(item.get(key))
-        if parsed is not None:
-            return parsed
-    return None
+def _date_publication_archive(
+    item: dict[str, Any],
+    *,
+    allow_reconstructed_dates: bool,
+) -> tuple[datetime | None, str | None]:
+    """Retourne la date et sa provenance.
+
+    Par défaut, seule date_publication_originale est considérée fiable pour
+    reconstruire l'historique. date_publication peut avoir été reconstruite
+    au moment du scraping et concentrer artificiellement beaucoup de posts sur
+    le jour de collecte.
+    """
+    original = _parse_datetime(item.get("date_publication_originale"))
+    if original is not None:
+        return original, "originale"
+
+    if allow_reconstructed_dates:
+        reconstructed = _parse_datetime(item.get("date_publication"))
+        if reconstructed is not None:
+            return reconstructed, "reconstruite"
+
+    return None, None
 
 
 def _date_incertaine(item: dict[str, Any]) -> bool:
@@ -144,6 +159,7 @@ def _charger_archives(
     start: datetime,
     end_exclusive: datetime,
     include_uncertain_dates: bool,
+    allow_reconstructed_dates: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     if not config.DATABASE_URL:
         raise ValueError("DATABASE_URL absente. Vérifiez le fichier .env.")
@@ -175,10 +191,17 @@ def _charger_archives(
                 stats["items_invalides"] += 1
                 continue
 
-            published = _date_publication_archive(raw)
+            published, date_source = _date_publication_archive(
+                raw,
+                allow_reconstructed_dates=allow_reconstructed_dates,
+            )
             if published is None:
-                stats["sans_date"] += 1
+                if _parse_datetime(raw.get("date_publication")) is not None:
+                    stats["date_reconstruite_ignoree"] += 1
+                else:
+                    stats["sans_date"] += 1
                 continue
+            stats[f"date_{date_source}"] += 1
             if not (start <= published < end_exclusive):
                 stats["hors_periode"] += 1
                 continue
@@ -506,6 +529,7 @@ async def _executer(args: argparse.Namespace) -> int:
         start=start,
         end_exclusive=end_exclusive,
         include_uncertain_dates=args.include_uncertain_dates,
+        allow_reconstructed_dates=args.include_reconstructed_dates,
     )
     manquants, present_stats = _retirer_deja_presents(archives)
 
@@ -523,7 +547,12 @@ async def _executer(args: argparse.Namespace) -> int:
     print(f"Période                 : {start_date} -> {end_date}")
     print(f"Archives Neon           : {archive_stats.get('archives', 0)}")
     print(f"Items bruts archivés    : {archive_stats.get('items_bruts', 0)}")
-    print(f"Sans date               : {archive_stats.get('sans_date', 0)}")
+    print(f"Dates originales lues   : {archive_stats.get('date_originale', 0)}")
+    print(
+        f"Dates reconstr. ignorées: "
+        f"{archive_stats.get('date_reconstruite_ignoree', 0)}"
+    )
+    print(f"Sans date exploitable   : {archive_stats.get('sans_date', 0)}")
     print(f"Doublons archives       : {archive_stats.get('doublons_archives', 0)}")
     print(f"Uniques dans période    : {archive_stats.get('uniques_periode', 0)}")
     print(f"Déjà présents par ID    : {present_stats.get('deja_par_id', 0)}")
@@ -604,6 +633,15 @@ def parser_arguments() -> argparse.Namespace:
         "--include-uncertain-dates",
         action="store_true",
         help="Inclut aussi les éléments dont date_incertaine=true.",
+    )
+    parser.add_argument(
+        "--include-reconstructed-dates",
+        action="store_true",
+        help=(
+            "Inclut aussi date_publication quand date_publication_originale "
+            "est absente. À utiliser séparément : ces dates peuvent refléter "
+            "le jour du scraping plutôt que le vrai jour de publication."
+        ),
     )
     parser.add_argument(
         "--batch-size",
