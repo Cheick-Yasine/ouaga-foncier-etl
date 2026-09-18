@@ -208,7 +208,8 @@ def sauvegarder_index_prochain_groupe(index: int) -> None:
 # Mots-clés d'inclusion : présence d'AU MOINS UN de ces motifs = candidat potentiel.
 # Regroupés par thème pour faciliter la maintenance.
 _MOTS_FONCIER = [
-    r"parcelle", r"terrain", r"lotissement", r"non\s+loti", r"zone\s+lotie",
+    r"parcelle", r"terrain", r"maison", r"cour", r"propri[eé]t[eé]",
+    r"lotissement", r"non\s+loti", r"zone\s+lotie",
     r"cession", r"hectares?", r"superficie",
 ]
 _MOTS_DOCUMENT = [
@@ -568,7 +569,7 @@ LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate l
 LLM_MAX_RETRIES = 3
 LLM_BACKOFF_BASE_S = 2.0
 
-TYPES_BIEN_VALIDES = ["parcelle", "villa", "terrain", "autre"]
+TYPES_BIEN_VALIDES = ["parcelle", "terrain", "maison", "autre"]
 
 # Schéma JSON envoyé à l'API OpenAI via Structured Outputs (response_format
 # json_schema, strict=True) pour forcer une sortie JSON garantie conforme au
@@ -643,6 +644,9 @@ PROMPT_SYSTEME_LLM = (
     "répondre avec les champs extraits, au format JSON demandé. "
     "Règles strictes : ne devine JAMAIS une valeur absente du texte (mets null) ; "
     "ne convertis pas approximativement un prix ou une superficie ambigus, laisse null ; "
-    "si le post est une recherche d'achat, du spam, ou non lié à l'immobilier/foncier "
-    "de la région de Ouagadougou, mets `est_une_annonce_valide` à false."
+    "si le post est une recherche d'achat, une location, un bien non loti, une villa, "
+    "du spam, ou un bien situé hors de Ouagadougou et de ses environs retenus, mets "
+    "`est_une_annonce_valide` à false. Les types recherchés sont uniquement parcelle, "
+    "terrain et maison. Si prix_fcfa ET superficie_m2 sont tous les deux absents, mets "
+    "`est_une_annonce_valide` à false."
 )
