@@ -198,32 +198,54 @@ async def run(group_id: str, scrolls: int, wait_seconds: float) -> int:
 
             request_meta = _safe_request_metadata(response.request)
 
+            # Facebook peut renvoyer une même requête GraphQL sous forme
+            # multipart/defer : les stories arrivent dans un chunk et le
+            # page_info dans un autre. L'ancien diagnostic traitait chaque
+            # ligne JSON séparément et pouvait donc afficher à tort
+            # "Posts + page_info = 0" même quand les deux appartenaient à la
+            # même réponse HTTP. On agrège maintenant tous les chunks d'une
+            # réponse avant de conclure.
+            posts_par_id: dict[str, dict[str, Any]] = {}
+            page_infos_agreges: list[dict[str, Any]] = []
+            page_infos_vus: set[str] = set()
+
             for payload in _parse_graphql_body(body):
-                posts = scraper.extraire_stories_depuis_json(
+                for post in scraper.extraire_stories_depuis_json(
                     payload,
                     group_id,
                     f"diagnostic_{group_id}",
-                )
-                page_infos = _extract_page_infos(payload)
+                ):
+                    post_id = str(post.get("id") or "").strip()
+                    if post_id:
+                        posts_par_id[post_id] = post
 
-                # Élimine la majorité des GraphQL sans rapport avec le fil.
-                if not posts and not page_infos:
-                    continue
+                for page_info in _extract_page_infos(payload):
+                    fp = json.dumps(page_info, ensure_ascii=False, sort_keys=True)
+                    if fp in page_infos_vus:
+                        continue
+                    page_infos_vus.add(fp)
+                    page_infos_agreges.append(page_info)
 
-                traces.append(
-                    {
-                        "captured_at": datetime.now(timezone.utc).isoformat(),
-                        "request": request_meta,
-                        "response": {
-                            "posts_detected": len(posts),
-                            "post_ids_sample": [
-                                str(post.get("id") or "")
-                                for post in posts[:5]
-                            ],
-                            "page_infos": page_infos,
-                        },
-                    }
-                )
+            posts = list(posts_par_id.values())
+
+            # Élimine la majorité des GraphQL sans rapport avec le fil.
+            if not posts and not page_infos_agreges:
+                return
+
+            traces.append(
+                {
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "request": request_meta,
+                    "response": {
+                        "posts_detected": len(posts),
+                        "post_ids_sample": [
+                            str(post.get("id") or "")
+                            for post in posts[:5]
+                        ],
+                        "page_infos": page_infos_agreges,
+                    },
+                }
+            )
 
         def on_response(response: Any) -> None:
             task = asyncio.ensure_future(inspect_response(response))
@@ -344,10 +366,38 @@ async def run(group_id: str, scrolls: int, wait_seconds: float) -> int:
             "On pourra construire le mode reprise à partir de cette trace."
         )
     else:
+        # Affiche les meilleures pistes même si Facebook sépare encore les
+        # stories et le page_info entre plusieurs requêtes.
+        posts_only = [
+            t for t in unique
+            if t.get("response", {}).get("posts_detected", 0) > 0
+        ]
+        page_only = [
+            t for t in unique
+            if t.get("response", {}).get("page_infos")
+        ]
         print(
-            "\nAucun couple posts + page_info observé. "
-            "Ne construisons pas encore la reprise directe : envoyez le fichier "
-            "diagnostic ou la sortie pour identifier la vraie requête du fil."
+            "\nToujours aucun couple posts + page_info après agrégation."
+        )
+        if posts_only:
+            req = posts_only[-1]["request"]
+            print(
+                "Dernière requête avec posts : "
+                f"{req.get('friendly_name')} | doc_id={req.get('doc_id')} | "
+                f"cursors={req.get('request_cursors') or 'aucun'}"
+            )
+        if page_only:
+            req = page_only[-1]["request"]
+            infos = page_only[-1]["response"]["page_infos"]
+            print(
+                "Dernière requête page_info  : "
+                f"{req.get('friendly_name')} | doc_id={req.get('doc_id')} | "
+                f"cursors={req.get('request_cursors') or 'aucun'} | "
+                f"page_info={infos[-1]}"
+            )
+        print(
+            "Envoyez cette sortie : elle permettra d'identifier si le curseur "
+            "vient d'une requête de fil séparée."
         )
 
     return 0
