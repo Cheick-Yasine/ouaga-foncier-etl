@@ -402,40 +402,110 @@ def _save_local_raw(path: Path, posts_by_id: dict[str, dict[str, Any]]) -> None:
 
 async def _capture_fresh_template(
     page: Any,
-    max_scrolls: int = 8,
+    group_id: str,
+    group_name: str,
+    max_scrolls: int = 16,
 ) -> tuple[str, str]:
-    captured: dict[str, str] = {}
+    """Capture un gabarit de pagination GraphQL réellement exploitable.
 
-    def on_request(request: Any) -> None:
+    Facebook peut changer le friendly_name/doc_id ou ne pas émettre exactement
+    la requête attendue au premier scroll. On valide donc la réponse elle-même :
+    requête POST GraphQL + variables contenant un curseur + réponse contenant
+    un page_info/end_cursor. Cela évite de dépendre d'un nom interne unique.
+    """
+    captured: dict[str, str] = {}
+    tasks: set[asyncio.Task[Any]] = set()
+    seen_names: set[str] = set()
+    graphql_candidates = 0
+
+    async def inspect_response(response: Any) -> None:
+        nonlocal graphql_candidates
         if captured:
             return
+
+        request = response.request
         if request.method != "POST":
             return
-        post_data = request.post_data
-        if _request_friendly_name(post_data) != FRIENDLY_NAME:
+        if not any(fragment in request.url for fragment in config.GRAPHQL_URL_FRAGMENTS):
             return
+
+        post_data = request.post_data
         if not post_data:
             return
+
+        friendly_name = _request_friendly_name(post_data)
+        if friendly_name:
+            seen_names.add(friendly_name)
+
+        # Un vrai gabarit de page suivante doit déjà contenir un curseur.
+        if not _cursor_from_post_data(post_data):
+            return
+
+        graphql_candidates += 1
+
+        try:
+            body = await response.text()
+        except Exception:
+            return
+
+        posts, page_infos = _aggregate_response(
+            body,
+            group_id,
+            group_name,
+        )
+        has_end_cursor = any(info.get("end_cursor") for info in page_infos)
+
+        if not has_end_cursor:
+            return
+
         captured["url"] = request.url
         captured["post_data"] = post_data
+        captured["friendly_name"] = friendly_name or "inconnu"
+        captured["posts_detected"] = str(len(posts))
 
-    page.on("request", on_request)
+    def on_response(response: Any) -> None:
+        task = asyncio.ensure_future(inspect_response(response))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    page.on("response", on_response)
     try:
         for index in range(1, max_scrolls + 1):
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+            # Aller au bas du DOM courant déclenche plus fiablement la
+            # pagination qu'un simple scroll relatif après plusieurs reprises.
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(4.0)
-            if captured:
-                print(f"Gabarit GraphQL capturé après {index} scroll(s).")
-                return captured["url"], captured["post_data"]
-    finally:
-        page.remove_listener("request", on_request)
 
+            if tasks:
+                await asyncio.gather(*list(tasks), return_exceptions=True)
+
+            if captured:
+                print(
+                    f"Gabarit GraphQL capturé après {index} scroll(s) | "
+                    f"requête={captured.get('friendly_name')} | "
+                    f"posts réponse={captured.get('posts_detected')}"
+                )
+                return captured["url"], captured["post_data"]
+
+            # Petit mouvement inverse pour permettre au navigateur de
+            # redéclencher l'observateur de fin de fil au prochain tour.
+            await page.evaluate("window.scrollBy(0, -Math.max(250, window.innerHeight * 0.4))")
+            await asyncio.sleep(0.8)
+    finally:
+        page.remove_listener("response", on_response)
+        if tasks:
+            await asyncio.gather(*list(tasks), return_exceptions=True)
+
+    names = ", ".join(sorted(seen_names)) if seen_names else "aucun"
     raise RuntimeError(
-        f"Aucune requête {FRIENDLY_NAME} capturée après {max_scrolls} scrolls."
+        "Aucun gabarit GraphQL paginé exploitable capturé après "
+        f"{max_scrolls} scrolls. Candidats avec curseur={graphql_candidates}; "
+        f"friendly_names observés={names}."
     )
 
 
 async def _fetch_graphql(page: Any, url: str, body: str) -> tuple[int, str]:
+    friendly_name = _request_friendly_name(body) or FRIENDLY_NAME
     result = await page.evaluate(
         """async ({url, body, friendlyName}) => {
             const response = await fetch(url, {
@@ -452,7 +522,7 @@ async def _fetch_graphql(page: Any, url: str, body: str) -> tuple[int, str]:
                 text: await response.text()
             };
         }""",
-        {"url": url, "body": body, "friendlyName": FRIENDLY_NAME},
+        {"url": url, "body": body, "friendlyName": friendly_name},
     )
     return int(result["status"]), str(result["text"])
 
@@ -553,7 +623,11 @@ async def run(args: argparse.Namespace) -> int:
                     await page.goto(url_group, wait_until="domcontentloaded")
                     await scraper.detecter_blocage_ou_session_expiree(page)
 
-                graphql_url, template_body = await _capture_fresh_template(page)
+                graphql_url, template_body = await _capture_fresh_template(
+                    page,
+                    args.group_id,
+                    group_name,
+                )
                 first_cursor = _cursor_from_post_data(template_body)
                 if not first_cursor:
                     raise RuntimeError(
@@ -601,7 +675,9 @@ async def run(args: argparse.Namespace) -> int:
                             )
                             graphql_url, template_body = await _capture_fresh_template(
                                 page,
-                                max_scrolls=4,
+                                args.group_id,
+                                group_name,
+                                max_scrolls=8,
                             )
 
                         body = _patch_cursor(template_body, current_cursor)
