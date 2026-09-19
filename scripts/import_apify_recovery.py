@@ -77,10 +77,39 @@ ALIASES = {
         "posttime",
     },
     "groupe_nom": {
-        "groupname", "groupe", "group", "pagename", "page", "profilename",
-        "profile", "authorname", "username", "ownername", "sourcename",
+        "groupname", "grouptitle", "facebookgroupname", "groupe", "group",
     },
 }
+
+
+def _charger_groupes_connus() -> dict[str, str]:
+    """Charge la correspondance ID Facebook -> nom du groupe suivi."""
+    chemin = ROOT / "groups.csv"
+    if not chemin.exists():
+        return {}
+
+    groupes: dict[str, str] = {}
+    with chemin.open("r", encoding="utf-8-sig", newline="") as f:
+        for ligne in csv.DictReader(f):
+            group_id = str(ligne.get("id") or "").strip()
+            nom = str(ligne.get("nom") or "").strip()
+            if group_id and nom:
+                groupes[group_id] = nom
+    return groupes
+
+
+_GROUPES_PAR_ID = _charger_groupes_connus()
+_RE_GROUP_ID_URL = re.compile(r"/groups/(\d+)(?:/|$)", re.I)
+
+
+def _nom_groupe_depuis_url(url: str | None) -> str | None:
+    """Privilégie l'ID du groupe dans l'URL, plus fiable que l'auteur du post."""
+    if not url:
+        return None
+    match = _RE_GROUP_ID_URL.search(str(url))
+    if not match:
+        return None
+    return _GROUPES_PAR_ID.get(match.group(1))
 
 
 def _normaliser_nom_colonne(valeur: Any) -> str:
@@ -175,7 +204,11 @@ def _normaliser_ligne(ligne: dict[str, Any], source: str) -> dict[str, Any]:
     texte = _valeur_alias(ligne, "texte")
     url = _valeur_alias(ligne, "url")
     date_pub = _valeur_alias(ligne, "date_publication")
-    groupe_nom = _valeur_alias(ligne, "groupe_nom") or source
+    groupe_nom = (
+        _nom_groupe_depuis_url(str(url) if url else None)
+        or _valeur_alias(ligne, "groupe_nom")
+        or source
+    )
 
     post_id = _normaliser_id(_valeur_alias(ligne, "id"))
     if not post_id:
