@@ -582,40 +582,77 @@ async def run(args: argparse.Namespace) -> int:
                         oldest_seen = None
 
                 while pages_this_run < args.max_pages:
-                    body = _patch_cursor(template_body, current_cursor)
-                    status_code, response_body = await _fetch_graphql(
-                        page,
-                        graphql_url,
-                        body,
-                    )
-                    if status_code != 200:
-                        raise RuntimeError(
-                            f"GraphQL HTTP {status_code} à la page "
-                            f"{int(state.get('pages_done') or 0) + 1}."
+                    page_number = int(state.get("pages_done") or 0) + 1
+                    posts: list[dict[str, Any]] = []
+                    page_infos: list[dict[str, Any]] = []
+                    info: dict[str, Any] | None = None
+
+                    # Une réponse GraphQL peut être momentanément incomplète
+                    # (page_info absent) après beaucoup de pages. Ne jamais
+                    # avancer le curseur dans ce cas : on rejoue exactement
+                    # la même page. Au dernier essai, on capture un gabarit
+                    # GraphQL frais pour renouveler les paramètres/tokens de
+                    # requête tout en conservant notre curseur persistant.
+                    for tentative_page in range(1, 5):
+                        if tentative_page == 4:
+                            print(
+                                f"Page {page_number} : rafraîchissement du gabarit "
+                                "GraphQL avant dernier essai..."
+                            )
+                            graphql_url, template_body = await _capture_fresh_template(
+                                page,
+                                max_scrolls=4,
+                            )
+
+                        body = _patch_cursor(template_body, current_cursor)
+                        status_code, response_body = await _fetch_graphql(
+                            page,
+                            graphql_url,
+                            body,
                         )
 
-                    posts, page_infos = _aggregate_response(
-                        response_body,
-                        args.group_id,
-                        group_name,
-                    )
-                    if not page_infos:
-                        raise RuntimeError(
-                            "Réponse GraphQL sans page_info : arrêt prudent "
-                            "avant de perdre la position."
-                        )
+                        if status_code != 200:
+                            print(
+                                f"Page {page_number} : HTTP {status_code}, "
+                                f"nouvel essai {tentative_page}/4 sans avancer "
+                                "le curseur."
+                            )
+                        else:
+                            posts, page_infos = _aggregate_response(
+                                response_body,
+                                args.group_id,
+                                group_name,
+                            )
+                            info = next(
+                                (
+                                    item
+                                    for item in reversed(page_infos)
+                                    if item.get("end_cursor")
+                                ),
+                                None,
+                            )
+                            if info is not None:
+                                if tentative_page > 1:
+                                    print(
+                                        f"Page {page_number} récupérée au "
+                                        f"{tentative_page}e essai."
+                                    )
+                                break
 
-                    info = next(
-                        (
-                            item
-                            for item in reversed(page_infos)
-                            if item.get("end_cursor")
-                        ),
-                        None,
-                    )
+                            print(
+                                f"Page {page_number} : réponse sans end_cursor/"
+                                f"page_info exploitable, nouvel essai "
+                                f"{tentative_page}/4 sans avancer le curseur."
+                            )
+
+                        if tentative_page < 4:
+                            await asyncio.sleep(5.0 * tentative_page)
+
                     if info is None:
                         raise RuntimeError(
-                            "page_info présent mais end_cursor absent."
+                            f"Page {page_number} impossible après 4 essais. "
+                            "Arrêt prudent : le curseur sauvegardé n'a pas été "
+                            "avancé, relancer la même commande reprendra cette page."
                         )
 
                     next_cursor = str(info["end_cursor"])
