@@ -667,31 +667,72 @@ async def run(args: argparse.Namespace) -> int:
                     # la même page. Au dernier essai, on capture un gabarit
                     # GraphQL frais pour renouveler les paramètres/tokens de
                     # requête tout en conservant notre curseur persistant.
-                    for tentative_page in range(1, 5):
-                        if tentative_page == 4:
+                    max_tentatives_page = 6
+                    for tentative_page in range(1, max_tentatives_page + 1):
+                        # Après plusieurs échecs réseau, recharge la page du
+                        # groupe puis capture un gabarit GraphQL frais. Le
+                        # current_cursor reste inchangé : aucune progression
+                        # n'est perdue ni sautée.
+                        if tentative_page in {4, 6}:
                             print(
-                                f"Page {page_number} : rafraîchissement du gabarit "
-                                "GraphQL avant dernier essai..."
+                                f"Page {page_number} : récupération de session/"
+                                f"gabarit avant essai {tentative_page}/"
+                                f"{max_tentatives_page}..."
                             )
-                            graphql_url, template_body = await _capture_fresh_template(
-                                page,
-                                args.group_id,
-                                group_name,
-                                max_scrolls=8,
-                            )
+                            try:
+                                await page.goto(
+                                    url_group,
+                                    wait_until="domcontentloaded",
+                                    timeout=60_000,
+                                )
+                                await scraper.detecter_blocage_ou_session_expiree(page)
+                                graphql_url, template_body = await _capture_fresh_template(
+                                    page,
+                                    args.group_id,
+                                    group_name,
+                                    max_scrolls=12,
+                                )
+                            except scraper.SessionExpireeError:
+                                raise
+                            except Exception as exc:
+                                print(
+                                    f"Page {page_number} : impossible de rafraîchir "
+                                    f"la page/gabarit ({type(exc).__name__}: {exc}). "
+                                    "Le curseur reste inchangé."
+                                )
+                                if tentative_page < max_tentatives_page:
+                                    await asyncio.sleep(10.0 * tentative_page)
+                                    continue
 
                         body = _patch_cursor(template_body, current_cursor)
-                        status_code, response_body = await _fetch_graphql(
-                            page,
-                            graphql_url,
-                            body,
-                        )
+
+                        try:
+                            status_code, response_body = await _fetch_graphql(
+                                page,
+                                graphql_url,
+                                body,
+                            )
+                        except Exception as exc:
+                            # Exemple observé : Playwright Page.evaluate:
+                            # TypeError: Failed to fetch. C'est généralement un
+                            # incident réseau/page temporaire. Ne jamais laisser
+                            # cette exception faire avancer ou perdre le curseur.
+                            print(
+                                f"Page {page_number} : erreur réseau GraphQL "
+                                f"({type(exc).__name__}: {exc}) | essai "
+                                f"{tentative_page}/{max_tentatives_page}. "
+                                "Curseur NON avancé."
+                            )
+                            if tentative_page < max_tentatives_page:
+                                await asyncio.sleep(min(30.0, 5.0 * tentative_page))
+                                continue
+                            break
 
                         if status_code != 200:
                             print(
                                 f"Page {page_number} : HTTP {status_code}, "
-                                f"nouvel essai {tentative_page}/4 sans avancer "
-                                "le curseur."
+                                f"nouvel essai {tentative_page}/"
+                                f"{max_tentatives_page} sans avancer le curseur."
                             )
                         else:
                             posts, page_infos = _aggregate_response(
@@ -718,17 +759,19 @@ async def run(args: argparse.Namespace) -> int:
                             print(
                                 f"Page {page_number} : réponse sans end_cursor/"
                                 f"page_info exploitable, nouvel essai "
-                                f"{tentative_page}/4 sans avancer le curseur."
+                                f"{tentative_page}/{max_tentatives_page} "
+                                "sans avancer le curseur."
                             )
 
-                        if tentative_page < 4:
-                            await asyncio.sleep(5.0 * tentative_page)
+                        if tentative_page < max_tentatives_page:
+                            await asyncio.sleep(min(30.0, 5.0 * tentative_page))
 
                     if info is None:
                         raise RuntimeError(
-                            f"Page {page_number} impossible après 4 essais. "
-                            "Arrêt prudent : le curseur sauvegardé n'a pas été "
-                            "avancé, relancer la même commande reprendra cette page."
+                            f"Page {page_number} impossible après "
+                            f"{max_tentatives_page} essais. Arrêt prudent : "
+                            "le curseur sauvegardé n'a pas été avancé, relancer "
+                            "la même commande reprendra cette page."
                         )
 
                     next_cursor = str(info["end_cursor"])
