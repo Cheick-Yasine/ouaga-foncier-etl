@@ -275,7 +275,7 @@ async def structurer_lot(
 
 COLONNES_CSV = [
     "id", "groupe_nom", "url", "date_publication", "date_incertaine",
-    "type_bien", "quartier_zone", "superficie_m2", "prix_fcfa", "statut_document",
+    "type_bien", "type_bien_normalise", "quartier_zone", "superficie_m2", "prix_fcfa", "statut_document",
     "contacts_whatsapp", "mots_cles_pertinents", "resume_court", "texte_nettoye",
 ]
 
@@ -286,6 +286,51 @@ def _serialiser_valeur(valeur: Any) -> str:
     if isinstance(valeur, list):
         return "; ".join(str(v) for v in valeur)
     return str(valeur)
+
+
+_TYPES_RECHERCHE = frozenset({"terrain", "parcelle", "maison"})
+_RE_NON_LOTI = re.compile(r"(?i)\bnon[\s_-]*loti(?:e|s)?\b")
+_RE_LOCATION = re.compile(r"(?i)\b(?:location|louer|loyer|a louer|à louer)\b")
+_RE_VENTE = re.compile(r"(?i)\b(?:vente|vendre|vend|a vendre|à vendre)\b")
+_RE_MAISON = re.compile(r"(?i)\b(?:maison|cour|duplex)\b")
+_RE_VILLA = re.compile(r"(?i)\bvilla\b")
+_RE_HORS_ZONE = re.compile(
+    r"(?i)\b(?:bobo[- ]?dioulasso|koudougou|tenkodogo|sapouy|ouahigouya|kaya)\b"
+)
+
+
+def _type_bien_normalise_pour_recherche(annonce: dict[str, Any]) -> str | None:
+    """Retourne le type exploitable par la plateforme, sinon None.
+
+    La ligne brute reste conservée dans Neon. Une valeur None signifie seulement
+    qu'elle ne doit pas entrer dans la base de recherche préparée.
+    """
+    texte = nettoyer_texte(annonce.get("texte_nettoye"))
+    zone = str(annonce.get("quartier_zone") or "").strip()
+    corpus = f"{zone} {texte}".strip()
+    type_brut = str(annonce.get("type_bien") or "").strip().lower()
+
+    # Quelques sorties LLM "autre" décrivent clairement une maison en vente.
+    if (
+        type_brut == "autre"
+        and _RE_MAISON.search(texte)
+        and _RE_VENTE.search(texte)
+        and not _RE_VILLA.search(texte)
+    ):
+        type_brut = "maison"
+
+    if type_brut not in _TYPES_RECHERCHE:
+        return None
+    if _RE_NON_LOTI.search(texte):
+        return None
+    if annonce.get("prix_fcfa") is None and annonce.get("superficie_m2") is None:
+        return None
+    if _RE_LOCATION.search(texte) and not _RE_VENTE.search(texte):
+        return None
+    if _RE_HORS_ZONE.search(corpus):
+        return None
+
+    return type_brut
 
 
 def exporter_csv(annonces: list[dict[str, Any]], chemin: Path) -> Path:
@@ -327,6 +372,7 @@ CREATE TABLE IF NOT EXISTS annonces (
     date_publication TEXT,
     date_incertaine BOOLEAN,
     type_bien TEXT,
+    type_bien_normalise TEXT,
     quartier_zone TEXT,
     superficie_m2 BIGINT,
     prix_fcfa BIGINT,
@@ -338,6 +384,8 @@ CREATE TABLE IF NOT EXISTS annonces (
     premiere_collecte TIMESTAMPTZ NOT NULL,
     derniere_maj TIMESTAMPTZ NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_annonces_type_bien_normalise
+    ON annonces (type_bien_normalise);
 CREATE TABLE IF NOT EXISTS runs (
     horodatage TIMESTAMPTZ PRIMARY KEY,
     mode TEXT NOT NULL,
@@ -378,20 +426,22 @@ def upsert_annonces(annonces: list[dict[str, Any]], dsn: str | None = None) -> i
     try:
         with conn.cursor() as cur:
             for a in annonces:
+                type_bien_normalise = _type_bien_normalise_pour_recherche(a)
                 cur.execute(
                     """
                     INSERT INTO annonces (
                         id, groupe_nom, url, date_publication, date_incertaine,
-                        type_bien, quartier_zone, superficie_m2, prix_fcfa, statut_document,
+                        type_bien, type_bien_normalise, quartier_zone, superficie_m2, prix_fcfa, statut_document,
                         contacts_whatsapp, mots_cles_pertinents, resume_court, texte_nettoye,
                         premiere_collecte, derniere_maj
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         groupe_nom = EXCLUDED.groupe_nom,
                         url = EXCLUDED.url,
                         date_publication = EXCLUDED.date_publication,
                         date_incertaine = EXCLUDED.date_incertaine,
                         type_bien = EXCLUDED.type_bien,
+                        type_bien_normalise = EXCLUDED.type_bien_normalise,
                         quartier_zone = EXCLUDED.quartier_zone,
                         superficie_m2 = EXCLUDED.superficie_m2,
                         prix_fcfa = EXCLUDED.prix_fcfa,
@@ -404,7 +454,7 @@ def upsert_annonces(annonces: list[dict[str, Any]], dsn: str | None = None) -> i
                     """,
                     (
                         a.get("id"), a.get("groupe_nom"), a.get("url"), a.get("date_publication"),
-                        bool(a.get("date_incertaine")), a.get("type_bien"), a.get("quartier_zone"),
+                        bool(a.get("date_incertaine")), a.get("type_bien"), type_bien_normalise, a.get("quartier_zone"),
                         a.get("superficie_m2"), a.get("prix_fcfa"), a.get("statut_document"),
                         _serialiser_valeur(a.get("contacts_whatsapp")),
                         _serialiser_valeur(a.get("mots_cles_pertinents")),
@@ -432,7 +482,7 @@ def exporter_xlsx_depuis_db(dsn: str | None = None, chemin_xlsx: Path | None = N
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, groupe_nom, url, date_publication, date_incertaine, type_bien, "
-                "quartier_zone, superficie_m2, prix_fcfa, statut_document, contacts_whatsapp, "
+                "type_bien_normalise, quartier_zone, superficie_m2, prix_fcfa, statut_document, contacts_whatsapp, "
                 "mots_cles_pertinents, resume_court, texte_nettoye, premiere_collecte, derniere_maj "
                 "FROM annonces ORDER BY derniere_maj DESC"
             )
