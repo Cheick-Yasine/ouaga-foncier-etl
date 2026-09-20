@@ -566,6 +566,12 @@ async def run(args: argparse.Namespace) -> int:
             "status": "new",
         }
 
+        if args.save_beyond_start:
+            print(
+                "Mode étendu activé : les publications plus anciennes que "
+                f"{args.start_date.isoformat()} seront aussi sauvegardées."
+            )
+
         if args.reset_cursor:
             state = {
                 "cursor": None,
@@ -646,6 +652,7 @@ async def run(args: argparse.Namespace) -> int:
                 old_confirmations = 0
                 pages_this_run = 0
                 target_added_this_run = 0
+                beyond_added_this_run = 0
                 oldest_seen: datetime | None = None
                 if state.get("oldest_seen"):
                     try:
@@ -792,26 +799,39 @@ async def run(args: argparse.Namespace) -> int:
                         )
 
                     target_posts: list[dict[str, Any]] = []
+                    beyond_posts: list[dict[str, Any]] = []
                     for post, dt in dated_known:
-                        if not (start_dt <= dt < end_exclusive):
+                        in_target = start_dt <= dt < end_exclusive
+                        beyond_start = args.save_beyond_start and dt < start_dt
+                        if not (in_target or beyond_start):
                             continue
+
                         post_id = str(post.get("id") or "").strip()
                         if not post_id or post_id in existing_ids:
                             continue
-                        target_posts.append(post)
+
+                        if in_target:
+                            target_posts.append(post)
+                        else:
+                            beyond_posts.append(post)
+
                         existing_ids.add(post_id)
                         raw_by_id[post_id] = post
 
                     # RAW local puis Neon AVANT d'avancer le curseur.
-                    if target_posts:
+                    # Avec --save-beyond-start, les posts plus anciens que
+                    # --start-date sont eux aussi conservés.
+                    posts_to_save = target_posts + beyond_posts
+                    if posts_to_save:
                         _save_local_raw(raw_path, raw_by_id)
                         _persist_raw_posts(
                             conn,
                             run_id,
                             args.group_id,
-                            target_posts,
+                            posts_to_save,
                         )
                         target_added_this_run += len(target_posts)
+                        beyond_added_this_run += len(beyond_posts)
 
                     if dated_known and all(dt < start_dt for _, dt in dated_known):
                         old_confirmations += 1
@@ -843,13 +863,17 @@ async def run(args: argparse.Namespace) -> int:
                     print(
                         f"Page {state['pages_done']} | posts={len(posts)} | "
                         f"cible+nouv={len(target_posts)} | "
+                        f"au-delà+nouv={len(beyond_posts)} | "
                         f"cible total={state['target_posts_saved']} | "
                         f"plus ancien={state['oldest_seen']} | "
                         f"anciens confirmés={old_confirmations}/{OLD_PAGE_CONFIRMATIONS} | "
                         f"has_next={has_next}"
                     )
 
-                    if old_confirmations >= OLD_PAGE_CONFIRMATIONS:
+                    if (
+                        old_confirmations >= OLD_PAGE_CONFIRMATIONS
+                        and not args.save_beyond_start
+                    ):
                         state["status"] = "complete_period_passed"
                         _save_local_state(state_path, state)
                         _save_neon_state(conn, args.group_id, period_key, state)
@@ -881,6 +905,7 @@ async def run(args: argparse.Namespace) -> int:
                 print(f"Pages cumulées            : {state.get('pages_done', 0)}")
                 print(f"RAW cible ajoutés ce run  : {target_added_this_run}")
                 print(f"RAW cible cumulés         : {state.get('target_posts_saved', 0)}")
+                print(f"RAW au-delà ajoutés       : {beyond_added_this_run}")
                 print(f"Plus ancienne date vue    : {state.get('oldest_seen')}")
                 print(f"Statut                    : {state.get('status')}")
                 print(f"Checkpoint local          : {state_path}")
@@ -941,6 +966,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=6.0,
         help="Pause maximale entre deux pages GraphQL.",
+    )
+    parser.add_argument(
+        "--save-beyond-start",
+        action="store_true",
+        help=(
+            "Continue après --start-date et sauvegarde aussi les posts plus "
+            "anciens. Le run s'arrête alors uniquement à --max-pages ou à la "
+            "fin réelle du fil Facebook."
+        ),
     )
     parser.add_argument(
         "--reset-cursor",
