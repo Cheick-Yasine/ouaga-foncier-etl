@@ -540,6 +540,24 @@ async def run(args: argparse.Namespace) -> int:
     group = next((g for g in groups if str(g.id) == str(args.group_id)), None)
     group_name = group.nom if group is not None else f"groupe_{args.group_id}"
 
+    # Isole la session Facebook quand plusieurs comptes tournent en parallèle.
+    # scraper.py lit config.STORAGE_STATE_PATH dynamiquement, donc chaque
+    # --session-name possède ses propres cookies renouvelés + localStorage.
+    if args.session_name:
+        safe_session = "".join(
+            ch if ch.isalnum() or ch in {"-", "_"} else "_"
+            for ch in args.session_name.strip()
+        )
+        if not safe_session:
+            raise ValueError("--session-name ne peut pas être vide.")
+        config.STORAGE_STATE_PATH = (
+            config.STATE_DIR / f"storage_state_{safe_session}.json"
+        )
+        print(
+            f"Session Facebook isolée : {args.session_name} "
+            f"({config.STORAGE_STATE_PATH})"
+        )
+
     dsn = os.environ.get("DATABASE_URL", "").strip()
     conn: psycopg.Connection | None = None
     if dsn:
@@ -593,9 +611,25 @@ async def run(args: argparse.Namespace) -> int:
         )
         raw_by_id = _load_local_raw(raw_path)
 
-        cookies_json = os.environ.get(config.ENV_FB_COOKIES, "").strip()
-        if not cookies_json:
-            raise ValueError(f"{config.ENV_FB_COOKIES} absente.")
+        if args.cookies_file:
+            cookies_path = Path(args.cookies_file).expanduser()
+            if not cookies_path.is_absolute():
+                cookies_path = (ROOT / cookies_path).resolve()
+            try:
+                cookies_json = cookies_path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError(
+                    f"Impossible de lire le fichier cookies : {cookies_path} ({exc})"
+                ) from exc
+            if not cookies_json:
+                raise ValueError(f"Fichier cookies vide : {cookies_path}")
+            print(f"Cookies chargés depuis : {cookies_path.name}")
+        else:
+            cookies_json = os.environ.get(config.ENV_FB_COOKIES, "").strip()
+            if not cookies_json:
+                raise ValueError(
+                    f"{config.ENV_FB_COOKIES} absente et --cookies-file non fourni."
+                )
 
         cookies_secret = scraper.charger_cookies(cookies_json)
         cached = scraper._charger_cookies_caches()
@@ -947,6 +981,20 @@ def parse_args() -> argparse.Namespace:
         description="Backfill historique Facebook par curseur GraphQL persistant."
     )
     parser.add_argument("--group-id", required=True)
+    parser.add_argument(
+        "--session-name",
+        help=(
+            "Nom court du compte/session Facebook (ex: compte1, compte2). "
+            "Crée un storage_state séparé pour permettre des runs parallèles."
+        ),
+    )
+    parser.add_argument(
+        "--cookies-file",
+        help=(
+            "Fichier JSON de cookies Facebook pour ce compte. "
+            "S'il est omis, FB_COOKIES_JSON est utilisé."
+        ),
+    )
     parser.add_argument("--start-date", required=True, type=_parse_iso_date)
     parser.add_argument("--end-date", required=True, type=_parse_iso_date)
     parser.add_argument(
@@ -983,6 +1031,11 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    if args.cookies_file and not args.session_name:
+        parser.error(
+            "--session-name est requis avec --cookies-file afin d'isoler "
+            "le storage_state de chaque compte."
+        )
     if args.end_date < args.start_date:
         parser.error("--end-date doit être >= --start-date.")
     if args.max_pages < 1:
