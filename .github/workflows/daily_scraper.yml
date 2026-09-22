@@ -2,8 +2,9 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    - cron: "0 0 * * *"
-    - cron: "0 12 * * *"
+    # Un seul groupe toutes les 2 h : même volume journalier environ, mais
+    # charge Facebook beaucoup plus étalée qu'un gros run sur tous les groupes.
+    - cron: "17 */2 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -117,10 +118,10 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
             echo "days_back=1" >> "$GITHUB_OUTPUT"
-            echo "round_robin=false" >> "$GITHUB_OUTPUT"
+            echo "round_robin=true" >> "$GITHUB_OUTPUT"
             echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
             echo "group_limit=0" >> "$GITHUB_OUTPUT"
-            echo "batch_size=5" >> "$GITHUB_OUTPUT"
+            echo "batch_size=1" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
             echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
@@ -133,6 +134,13 @@ jobs:
       - name: Exécution du pipeline ETL résilient
         id: pipeline
         env:
+          # Secrets multi-comptes. Ceux qui n'existent pas restent vides.
+          FB_COOKIES_JSON_COMPTE1: ${{ secrets.FB_COOKIES_JSON_COMPTE1 }}
+          FB_COOKIES_JSON_COMPTE2: ${{ secrets.FB_COOKIES_JSON_COMPTE2 }}
+          FB_COOKIES_JSON_COMPTE3: ${{ secrets.FB_COOKIES_JSON_COMPTE3 }}
+          FB_COOKIES_JSON_COMPTE4: ${{ secrets.FB_COOKIES_JSON_COMPTE4 }}
+          FB_COOKIES_JSON_COMPTE5: ${{ secrets.FB_COOKIES_JSON_COMPTE5 }}
+          # Compatibilité : ancien secret utilisé seulement en dernier recours.
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -161,7 +169,7 @@ jobs:
             if [ "${{ steps.params.outputs.round_robin }}" = "true" ]; then
               ARGS+=(--round-robin --groups-per-run "${{ steps.params.outputs.groups_per_run }}")
             fi
-            python scripts/resilient_entrypoint.py "${ARGS[@]}"
+            python scripts/online_multi_account.py "${ARGS[@]}"
           fi
 
       - name: Traitement de secours des RAW déjà récupérés
@@ -170,7 +178,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/process_recovered_raw.py
+        run: python scripts/process_recovered_raw.py --pending-only
 
       - name: Installer pg_dump compatible avec Neon
         if: always()
