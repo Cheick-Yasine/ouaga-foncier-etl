@@ -30,17 +30,28 @@ RETRYABLE_CODES = {2, 3, 4}
 
 
 def _configured_accounts() -> list[tuple[str, str]]:
-    accounts: list[tuple[str, str]] = []
+    dedicated: list[tuple[str, str]] = []
     for account_name, env_name in ACCOUNT_SECRET_NAMES:
         value = os.environ.get(env_name, "").strip()
         if value:
-            accounts.append((account_name, value))
+            dedicated.append((account_name, value))
+
+    # Répartit les runs planifiés entre les comptes au lieu de solliciter
+    # systématiquement compte1. Le secret historique reste uniquement en
+    # dernier recours.
+    if len(dedicated) > 1:
+        try:
+            run_number = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
+        except ValueError:
+            run_number = 1
+        offset = (run_number - 1) % len(dedicated)
+        dedicated = dedicated[offset:] + dedicated[:offset]
 
     legacy_value = os.environ.get(LEGACY_SECRET[1], "").strip()
     if legacy_value:
-        accounts.append((LEGACY_SECRET[0], legacy_value))
+        dedicated.append((LEGACY_SECRET[0], legacy_value))
 
-    return accounts
+    return dedicated
 
 
 def main() -> int:
