@@ -19,10 +19,15 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Charge DATABASE_URL / OPENAI_API_KEY avant l'import de config.py afin que
+# le script puisse être lancé directement en local.
+load_dotenv(ROOT / ".env")
 
 import config
 import processor
@@ -89,13 +94,19 @@ def _charger_et_fusionner(
 
 async def _executer(*, pending_only: bool) -> int:
     posts, conn_checkpoint, ids_neon = _charger_et_fusionner(pending_only=pending_only)
+
+    # La phase LLM peut durer longtemps. Ne pas garder ouverte pendant tout ce
+    # temps la connexion utilisée pour lire les checkpoints, sinon Neon/SSL
+    # peut la fermer avant le marquage final.
+    if conn_checkpoint is not None:
+        conn_checkpoint.close()
+        conn_checkpoint = None
+
     if not posts:
         if pending_only:
             print("Aucun checkpoint Neon non traité à reprendre avant le run.")
         else:
             print("Aucun post brut récupérable après l'échec du scraper.")
-        if conn_checkpoint is not None:
-            conn_checkpoint.close()
         return 0
 
     config.RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,19 +129,57 @@ async def _executer(*, pending_only: bool) -> int:
         )
 
         # Ne marquer que les lignes Neon réellement chargées dans cette reprise.
-        # Si le traitement échoue avant ce point, elles restent pending pour le
-        # prochain run. L'upsert sur annonces rend une reprise répétée sûre.
-        if conn_checkpoint is not None and ids_neon:
-            with conn_checkpoint.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE raw_posts_checkpoint
-                    SET processed = TRUE
-                    WHERE processed = FALSE
-                      AND post_id = ANY(%s)
-                    """,
-                    (list(ids_neon),),
+        # Ouvre une connexion FRAÎCHE après le long traitement LLM pour éviter
+        # l'erreur "SSL connection has been closed unexpectedly".
+        if ids_neon:
+            dsn = os.environ.get("DATABASE_URL", "").strip()
+            if not dsn:
+                raise ValueError(
+                    "DATABASE_URL absente au moment du marquage des checkpoints."
                 )
+
+            last_exc: Exception | None = None
+            for tentative in range(1, 4):
+                conn_mark: psycopg.Connection | None = None
+                try:
+                    conn_mark = psycopg.connect(
+                        dsn,
+                        autocommit=True,
+                        connect_timeout=15,
+                    )
+                    with conn_mark.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE raw_posts_checkpoint
+                            SET processed = TRUE
+                            WHERE processed = FALSE
+                              AND post_id = ANY(%s)
+                            """,
+                            (list(ids_neon),),
+                        )
+                        print(
+                            f"Checkpoints marqués traités : {cur.rowcount}"
+                        )
+                    last_exc = None
+                    break
+                except psycopg.OperationalError as exc:
+                    last_exc = exc
+                    print(
+                        f"Marquage Neon : connexion interrompue, "
+                        f"nouvel essai {tentative}/3..."
+                    )
+                    if tentative < 3:
+                        await asyncio.sleep(3.0 * tentative)
+                finally:
+                    if conn_mark is not None:
+                        try:
+                            conn_mark.close()
+                        except Exception:
+                            pass
+
+            if last_exc is not None:
+                raise last_exc
+
         return 0
     finally:
         if conn_checkpoint is not None:
