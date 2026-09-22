@@ -207,10 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         resultat = asyncio.run(executer(args))
     except scraper.CooldownActifError as exc:
-        # Pas un échec : c'est le mécanisme de sécurité anti-blocage qui fait
-        # exactement ce qu'on lui demande. Code 0 pour ne pas faire échouer le
-        # workflow GitHub Actions tous les jours où le cooldown est actif.
+        # En mode normal, le cooldown reste un succès logique (code 0).
+        # En mode multi-compte, on renvoie 4 pour permettre au lanceur de
+        # basculer automatiquement sur le compte suivant.
         logger.warning("Run annulé par le cooldown anti-blocage : %s", exc)
+        if os.environ.get("FB_MULTI_ACCOUNT_MODE", "").strip() == "1":
+            return 4
         return 0
     except ValueError as exc:
         logger.error("Erreur de configuration : %s", exc)
