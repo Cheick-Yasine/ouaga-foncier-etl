@@ -2,9 +2,8 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # Un seul groupe toutes les 2 h : même volume journalier environ, mais
-    # charge Facebook beaucoup plus étalée qu'un gros run sur tous les groupes.
-    - cron: "17 */2 * * *"
+    # Deux passages par jour, espacés de 12 h.
+    - cron: "17 0,12 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -118,10 +117,10 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "mode=daily" >> "$GITHUB_OUTPUT"
             echo "days_back=1" >> "$GITHUB_OUTPUT"
-            echo "round_robin=true" >> "$GITHUB_OUTPUT"
+            echo "round_robin=false" >> "$GITHUB_OUTPUT"
             echo "groups_per_run=1" >> "$GITHUB_OUTPUT"
             echo "group_limit=0" >> "$GITHUB_OUTPUT"
-            echo "batch_size=1" >> "$GITHUB_OUTPUT"
+            echo "batch_size=5" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
             echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
