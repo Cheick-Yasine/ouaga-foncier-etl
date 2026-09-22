@@ -764,11 +764,7 @@ async def run(args: argparse.Namespace) -> int:
                                 f"{max_tentatives_page}..."
                             )
                             try:
-                                await page.goto(
-                                    url_group,
-                                    wait_until="domcontentloaded",
-                                    timeout=60_000,
-                                )
+                                await _ouvrir_page_groupe(page, url_group)
                                 await scraper.detecter_blocage_ou_session_expiree(page)
                                 graphql_url, template_body = await _capture_fresh_template(
                                     page,
@@ -777,7 +773,50 @@ async def run(args: argparse.Namespace) -> int:
                                     max_scrolls=12,
                                 )
                             except scraper.SessionExpireeError:
-                                raise
+                                # La session peut expirer au milieu d'un très
+                                # long parcours. Le curseur courant n'a pas
+                                # encore été avancé : on peut donc recréer un
+                                # navigateur avec le fichier de cookies frais
+                                # et rejouer exactement la même page.
+                                print(
+                                    f"Page {page_number} : session Facebook expirée "
+                                    "pendant la pagination. Nouvel essai avec les "
+                                    "cookies du fichier, curseur NON avancé."
+                                )
+                                try:
+                                    await page.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    await context.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    await browser.close()
+                                except Exception:
+                                    pass
+
+                                scraper.invalider_storage_state()
+                                browser, context = await scraper.creer_navigateur(
+                                    playwright,
+                                    cookies_secret,
+                                )
+                                page = await context.new_page()
+                                await _ouvrir_page_groupe(page, url_group)
+                                await scraper.detecter_blocage_ou_session_expiree(page)
+                                graphql_url, template_body = await _capture_fresh_template(
+                                    page,
+                                    args.group_id,
+                                    group_name,
+                                    max_scrolls=12,
+                                )
+                                print(
+                                    f"Page {page_number} : session rétablie, "
+                                    "reprise sur le même curseur."
+                                )
+                                if tentative_page < max_tentatives_page:
+                                    await asyncio.sleep(3.0)
+                                    continue
                             except Exception as exc:
                                 print(
                                     f"Page {page_number} : impossible de rafraîchir "
