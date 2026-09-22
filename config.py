@@ -39,9 +39,22 @@ SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
 # dépendre d'un plafond de scrolls arbitraire (voir MAX_PAGES_ABSOLU ci-dessous,
 # qui reste un filet de sécurité, plus le mécanisme d'arrêt principal).
 DERNIER_POST_CONNU_PATH = STATE_DIR / "dernier_post_connu.json"
-COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
-STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
-SANTE_PATH = STATE_DIR / "sante_scraper.json"
+
+# En mode multi-compte (GitHub Actions), chaque compte doit garder son propre
+# storage_state, son propre cooldown et son propre état de santé. Les autres
+# états (seen_ids, dernier post connu, round-robin) restent partagés afin de
+# ne pas recollecter inutilement les mêmes publications.
+_FB_SESSION_NAME = os.environ.get("FB_SESSION_NAME", "").strip()
+if _FB_SESSION_NAME:
+    _FB_SESSION_SAFE = re.sub(r"[^A-Za-z0-9_-]+", "_", _FB_SESSION_NAME)
+    COOLDOWN_PATH = STATE_DIR / f"cooldown_until_{_FB_SESSION_SAFE}.json"
+    STORAGE_STATE_PATH = STATE_DIR / f"storage_state_{_FB_SESSION_SAFE}.json"
+    SANTE_PATH = STATE_DIR / f"sante_scraper_{_FB_SESSION_SAFE}.json"
+else:
+    COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
+    STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
+    SANTE_PATH = STATE_DIR / "sante_scraper.json"
+
 INDEX_PROCHAIN_GROUPE_PATH = STATE_DIR / "prochain_groupe_index.json"
 
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
