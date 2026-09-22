@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode
 
 import psycopg
 from dotenv import load_dotenv
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from psycopg.types.json import Jsonb
 
@@ -527,6 +528,48 @@ async def _fetch_graphql(page: Any, url: str, body: str) -> tuple[int, str]:
     return int(result["status"]), str(result["text"])
 
 
+async def _ouvrir_page_groupe(
+    page: Any,
+    url_group: str,
+    *,
+    tentatives: int = 3,
+) -> None:
+    """Ouvre le groupe avec tolérance aux lenteurs réseau/Facebook.
+
+    Le timeout Playwright par défaut (30 s) est parfois trop court pour Comet.
+    On retente la navigation sans toucher au curseur persistant.
+    """
+    for tentative in range(1, tentatives + 1):
+        try:
+            await page.goto(
+                url_group,
+                wait_until="domcontentloaded",
+                timeout=90_000,
+            )
+            return
+        except PlaywrightTimeoutError as exc:
+            print(
+                f"Ouverture Facebook : timeout tentative "
+                f"{tentative}/{tentatives} (90 s)."
+            )
+            if tentative >= tentatives:
+                raise RuntimeError(
+                    "Facebook n'a pas chargé le groupe après "
+                    f"{tentatives} tentatives. Le curseur Neon n'a pas été "
+                    "modifié ; relancer la même commande plus tard."
+                ) from exc
+
+            try:
+                await page.goto(
+                    "about:blank",
+                    wait_until="commit",
+                    timeout=10_000,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(5.0 * tentative)
+
+
 async def run(args: argparse.Namespace) -> int:
     start_dt = _dt_start(args.start_date)
     end_exclusive = _dt_start(date.fromordinal(args.end_date.toordinal() + 1))
@@ -641,7 +684,7 @@ async def run(args: argparse.Namespace) -> int:
             try:
                 url_group = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{args.group_id}/"
                 print(f"Ouverture : {url_group}")
-                await page.goto(url_group, wait_until="domcontentloaded")
+                await _ouvrir_page_groupe(page, url_group)
                 try:
                     await scraper.detecter_blocage_ou_session_expiree(page)
                 except scraper.SessionExpireeError:
@@ -659,8 +702,8 @@ async def run(args: argparse.Namespace) -> int:
                         cookies_secret,
                     )
                     page = await context.new_page()
-                    print("Cache session expiré : nouvel essai avec FB_COOKIES_JSON.")
-                    await page.goto(url_group, wait_until="domcontentloaded")
+                    print("Cache session expiré : nouvel essai avec les cookies frais.")
+                    await _ouvrir_page_groupe(page, url_group)
                     await scraper.detecter_blocage_ou_session_expiree(page)
 
                 graphql_url, template_body = await _capture_fresh_template(
