@@ -202,18 +202,27 @@ async def run(args: argparse.Namespace) -> int:
     total_valides = 0
     batch_number = 0
 
+    # IMPORTANT : ne pas garder une connexion Neon ouverte pendant les longs
+    # appels OpenAI. Neon peut fermer une connexion restée inactive plusieurs
+    # minutes. On utilise donc des connexions courtes avant/après chaque lot.
     with psycopg.connect(
         config.DATABASE_URL,
         autocommit=True,
         connect_timeout=15,
     ) as conn:
         pending_initial = _count_pending(conn, group_id=args.group_id)
-        print(f"Checkpoints pending au départ : {pending_initial}")
+    print(f"Checkpoints pending au départ : {pending_initial}")
 
-        while True:
-            if args.max_batches and batch_number >= args.max_batches:
-                break
+    while True:
+        if args.max_batches and batch_number >= args.max_batches:
+            break
 
+        # Connexion courte uniquement pour sélectionner le prochain lot.
+        with psycopg.connect(
+            config.DATABASE_URL,
+            autocommit=True,
+            connect_timeout=15,
+        ) as conn:
             # On scanne plus large que batch_size car certaines lignes peuvent
             # être hors fenêtre ou déjà présentes dans annonces.
             scan_limit = max(args.batch_size * 5, args.batch_size + 100)
@@ -233,57 +242,68 @@ async def run(args: argparse.Namespace) -> int:
                     "marqués processed sans appel OpenAI."
                 )
 
-            if not selected:
-                print("Aucun autre RAW correspondant à traiter.")
-                break
+        if not selected:
+            print("Aucun autre RAW correspondant à traiter.")
+            break
 
-            batch_number += 1
-            ids = [post_id for post_id, _ in selected]
-            posts = [payload for _, payload in selected]
+        batch_number += 1
+        ids = [post_id for post_id, _ in selected]
+        posts = [payload for _, payload in selected]
 
-            batch_path = temp_dir / f"pending_batch_{batch_number:04d}.json"
-            batch_path.write_text(
-                json.dumps(posts, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        batch_path = temp_dir / f"pending_batch_{batch_number:04d}.json"
+        batch_path.write_text(
+            json.dumps(posts, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        print(
+            f"\nLOT {batch_number} : {len(posts)} RAW -> "
+            "regex -> OpenAI -> Neon"
+        )
+
+        try:
+            result = await processor.executer_traitement(
+                [batch_path],
+                mode="cursor_recovery",
             )
-
+        except Exception:
             print(
-                f"\nLOT {batch_number} : {len(posts)} RAW -> "
-                "regex -> OpenAI -> Neon"
+                f"LOT {batch_number} interrompu : aucun RAW de ce lot "
+                "n'est marqué processed. Relancer la même commande "
+                "reprendra ces lignes."
             )
+            raise
 
-            try:
-                result = await processor.executer_traitement(
-                    [batch_path],
-                    mode="cursor_recovery",
-                )
-            except Exception:
-                print(
-                    f"LOT {batch_number} interrompu : aucun RAW de ce lot "
-                    "n'est marqué processed. Relancer la même commande "
-                    "reprendra ces lignes."
-                )
-                raise
-
-            # Seulement après succès complet du pipeline du lot.
+        # Connexion FRAÎCHE après le LLM : marque le lot uniquement lorsque
+        # le pipeline regex -> OpenAI -> Neon a réussi complètement.
+        with psycopg.connect(
+            config.DATABASE_URL,
+            autocommit=True,
+            connect_timeout=15,
+        ) as conn:
             _mark_processed(conn, ids)
-
-            total_bruts += result.nb_posts_bruts
-            total_candidats += result.nb_candidats
-            total_valides += result.nb_valides
-
             pending_now = _count_pending(conn, group_id=args.group_id)
-            print(
-                f"LOT {batch_number} OK : {result.nb_posts_bruts} bruts, "
-                f"{result.nb_candidats} candidats, "
-                f"{result.nb_valides} valides | pending groupe={pending_now}"
-            )
 
-            try:
-                batch_path.unlink()
-            except OSError:
-                pass
+        total_bruts += result.nb_posts_bruts
+        total_candidats += result.nb_candidats
+        total_valides += result.nb_valides
 
+        print(
+            f"LOT {batch_number} OK : {result.nb_posts_bruts} bruts, "
+            f"{result.nb_candidats} candidats, "
+            f"{result.nb_valides} valides | pending groupe={pending_now}"
+        )
+
+        try:
+            batch_path.unlink()
+        except OSError:
+            pass
+
+    with psycopg.connect(
+        config.DATABASE_URL,
+        autocommit=True,
+        connect_timeout=15,
+    ) as conn:
         pending_final = _count_pending(conn, group_id=args.group_id)
 
     print("\nTRAITEMENT DES RAW CAPTURÉS - RÉSUMÉ")
