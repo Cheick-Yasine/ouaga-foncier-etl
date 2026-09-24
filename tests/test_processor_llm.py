@@ -191,6 +191,38 @@ class TestStructurerLot:
         # Idem pour statut_document (régression : cet appel manquait, voir processor.py).
         assert valides[0]["statut_document"] == "Titre foncier"
 
+    async def test_corrige_prix_concatene_avec_telephone(self, monkeypatch):
+        candidats = [{
+            "id": "p-phone-price",
+            "texte_nettoye": (
+                "Une cours de 400m² en vente à Gounghin. "
+                "prix: 80m 226 76 13 54 31"
+            ),
+        }]
+
+        async def _fausse_structuration(_client, _texte, _sem, max_retries=3):
+            return {
+                **ANNONCE_VALIDE_BRUTE,
+                "type_bien": "terrain",
+                "superficie_m2": 400,
+                "prix_fcfa": 80_226_761_354,
+            }
+
+        monkeypatch.setattr(
+            processor, "_construire_client", lambda *_a, **_k: AsyncMock()
+        )
+        monkeypatch.setattr(
+            processor, "structurer_annonce", _fausse_structuration
+        )
+
+        valides, non_valides = await processor.structurer_lot(
+            candidats,
+            api_key="cle-test",
+        )
+
+        assert non_valides == []
+        assert valides[0]["prix_fcfa"] == 80_000_000
+
     async def test_llm_juge_invalide_va_dans_non_valides(self, monkeypatch):
         candidats = [{"id": "p1", "texte_nettoye": "annonce suspecte"}]
 
