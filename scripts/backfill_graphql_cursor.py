@@ -33,6 +33,7 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import date, datetime, time as dt_time, timezone
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,43 @@ CREATE TABLE IF NOT EXISTS raw_posts_checkpoint (
     processed BOOLEAN NOT NULL DEFAULT FALSE
 )
 """
+
+NEON_WRITE_RETRIES = 4
+NEON_RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
+
+
+def _connect_neon(dsn: str) -> psycopg.Connection:
+    """Ouvre une connexion Neon neuve et initialise les tables nécessaires."""
+    conn = psycopg.connect(
+        dsn,
+        autocommit=True,
+        connect_timeout=15,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+    conn.execute(CREATE_CURSOR_TABLE_SQL)
+    conn.execute(CREATE_RAW_TABLE_SQL)
+    return conn
+
+
+def _reconnect_neon(
+    conn: psycopg.Connection | None,
+    dsn: str,
+    *,
+    reason: str,
+) -> psycopg.Connection:
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    print(f"Neon : reconnexion ({reason})...")
+    fresh = _connect_neon(dsn)
+    print("Neon : connexion rétablie.")
+    return fresh
+
 
 
 def _parse_iso_date(value: str) -> date:
@@ -298,39 +336,62 @@ def _load_neon_state(
 
 def _save_neon_state(
     conn: psycopg.Connection | None,
+    dsn: str,
     group_id: str,
     period_key: str,
     state: dict[str, Any],
-) -> None:
-    if conn is None:
-        return
-    conn.execute(
-        """
-        INSERT INTO facebook_backfill_cursor (
-            groupe_id, period_key, cursor, pages_done, target_posts_saved,
-            oldest_seen, has_next_page, status, updated_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (groupe_id, period_key) DO UPDATE SET
-            cursor = EXCLUDED.cursor,
-            pages_done = EXCLUDED.pages_done,
-            target_posts_saved = EXCLUDED.target_posts_saved,
-            oldest_seen = EXCLUDED.oldest_seen,
-            has_next_page = EXCLUDED.has_next_page,
-            status = EXCLUDED.status,
-            updated_at = NOW()
-        """,
-        (
-            group_id,
-            period_key,
-            state.get("cursor"),
-            int(state.get("pages_done") or 0),
-            int(state.get("target_posts_saved") or 0),
-            state.get("oldest_seen"),
-            state.get("has_next_page"),
-            state.get("status") or "running",
-        ),
-    )
+) -> psycopg.Connection | None:
+    if conn is None or not dsn:
+        return conn
+
+    for tentative in range(1, NEON_WRITE_RETRIES + 1):
+        try:
+            conn.execute(
+                """
+                INSERT INTO facebook_backfill_cursor (
+                    groupe_id, period_key, cursor, pages_done, target_posts_saved,
+                    oldest_seen, has_next_page, status, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (groupe_id, period_key) DO UPDATE SET
+                    cursor = EXCLUDED.cursor,
+                    pages_done = EXCLUDED.pages_done,
+                    target_posts_saved = EXCLUDED.target_posts_saved,
+                    oldest_seen = EXCLUDED.oldest_seen,
+                    has_next_page = EXCLUDED.has_next_page,
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+                """,
+                (
+                    group_id,
+                    period_key,
+                    state.get("cursor"),
+                    int(state.get("pages_done") or 0),
+                    int(state.get("target_posts_saved") or 0),
+                    state.get("oldest_seen"),
+                    state.get("has_next_page"),
+                    state.get("status") or "running",
+                ),
+            )
+            return conn
+        except psycopg.OperationalError as exc:
+            if tentative >= NEON_WRITE_RETRIES:
+                raise
+            print(
+                f"Neon curseur : connexion interrompue, tentative "
+                f"{tentative}/{NEON_WRITE_RETRIES} ({exc})."
+            )
+            await_delay = NEON_RETRY_DELAYS_SECONDS[
+                min(tentative - 1, len(NEON_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            time.sleep(await_delay)
+            conn = _reconnect_neon(
+                conn,
+                dsn,
+                reason="sauvegarde du curseur",
+            )
+
+    return conn
 
 
 def _load_existing_annonce_ids(conn: psycopg.Connection | None) -> set[str]:
@@ -343,36 +404,57 @@ def _load_existing_annonce_ids(conn: psycopg.Connection | None) -> set[str]:
 
 def _persist_raw_posts(
     conn: psycopg.Connection | None,
+    dsn: str,
     run_id: str,
     group_id: str,
     posts: list[dict[str, Any]],
-) -> int:
-    if conn is None or not posts:
-        return 0
+) -> tuple[psycopg.Connection | None, int]:
+    if conn is None or not dsn or not posts:
+        return conn, 0
     rows = [
         (str(post["id"]), run_id, group_id, Jsonb(post))
         for post in posts
         if post.get("id")
     ]
     if not rows:
-        return 0
+        return conn, 0
 
-    with conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO raw_posts_checkpoint
-                (post_id, run_id, groupe_id, payload, captured_at, processed)
-            VALUES (%s, %s, %s, %s, NOW(), FALSE)
-            ON CONFLICT (post_id) DO UPDATE SET
-                run_id = EXCLUDED.run_id,
-                groupe_id = EXCLUDED.groupe_id,
-                payload = EXCLUDED.payload,
-                captured_at = NOW(),
-                processed = FALSE
-            """,
-            rows,
-        )
-    return len(rows)
+    for tentative in range(1, NEON_WRITE_RETRIES + 1):
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO raw_posts_checkpoint
+                        (post_id, run_id, groupe_id, payload, captured_at, processed)
+                    VALUES (%s, %s, %s, %s, NOW(), FALSE)
+                    ON CONFLICT (post_id) DO UPDATE SET
+                        run_id = EXCLUDED.run_id,
+                        groupe_id = EXCLUDED.groupe_id,
+                        payload = EXCLUDED.payload,
+                        captured_at = NOW(),
+                        processed = FALSE
+                    """,
+                    rows,
+                )
+            return conn, len(rows)
+        except psycopg.OperationalError as exc:
+            if tentative >= NEON_WRITE_RETRIES:
+                raise
+            print(
+                f"Neon RAW : connexion interrompue, tentative "
+                f"{tentative}/{NEON_WRITE_RETRIES} ({exc})."
+            )
+            delay = NEON_RETRY_DELAYS_SECONDS[
+                min(tentative - 1, len(NEON_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            time.sleep(delay)
+            conn = _reconnect_neon(
+                conn,
+                dsn,
+                reason=f"checkpoint RAW page en cours",
+            )
+
+    return conn, 0
 
 
 def _load_local_raw(path: Path) -> dict[str, dict[str, Any]]:
@@ -604,9 +686,7 @@ async def run(args: argparse.Namespace) -> int:
     dsn = os.environ.get("DATABASE_URL", "").strip()
     conn: psycopg.Connection | None = None
     if dsn:
-        conn = psycopg.connect(dsn, autocommit=True, connect_timeout=15)
-        conn.execute(CREATE_CURSOR_TABLE_SQL)
-        conn.execute(CREATE_RAW_TABLE_SQL)
+        conn = _connect_neon(dsn)
         print("Neon : checkpoint RAW + curseur persistant activés.")
     else:
         print("ATTENTION : DATABASE_URL absent, persistance locale uniquement.")
@@ -940,8 +1020,9 @@ async def run(args: argparse.Namespace) -> int:
                     posts_to_save = target_posts + beyond_posts
                     if posts_to_save:
                         _save_local_raw(raw_path, raw_by_id)
-                        _persist_raw_posts(
+                        conn, _ = _persist_raw_posts(
                             conn,
+                            dsn,
                             run_id,
                             args.group_id,
                             posts_to_save,
@@ -969,8 +1050,9 @@ async def run(args: argparse.Namespace) -> int:
                     state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
                     _save_local_state(state_path, state)
-                    _save_neon_state(
+                    conn = _save_neon_state(
                         conn,
+                        dsn,
                         args.group_id,
                         period_key,
                         state,
