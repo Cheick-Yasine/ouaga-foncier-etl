@@ -138,6 +138,61 @@ class AnnonceStructuree(BaseModel):
         return v
 
 
+
+# Garde-fou déterministe contre une erreur observée en production :
+# "prix: 80m" suivi d'un numéro "226 76 13 54 31" ne doit jamais devenir
+# 80 226 ... FCFA. Le LLM reste la source principale, mais ce contrôle corrige
+# uniquement les cas où le texte contient un prix en millions EXPLICITE et un
+# numéro de téléphone, alors que le montant structuré est plusieurs fois supérieur.
+_RE_PRIX_MILLIONS_EXPLICITE = re.compile(
+    r"(?i)\bprix\s*:?\s*(\d{1,4}(?:[.,]\d+)?)\s*(?:m|million|millions)\b"
+)
+_RE_TELEPHONE_BF = re.compile(
+    r"(?<!\d)(?:\+?226[\s.\-]*)?(?:\d{2}[\s.\-]*){4}(?!\d)"
+)
+
+
+def _corriger_prix_concatene_telephone(
+    texte: str,
+    structure: dict[str, Any],
+) -> dict[str, Any]:
+    """Corrige un prix manifestement concaténé avec un numéro de téléphone.
+
+    Correction volontairement étroite :
+    - présence d'un prix explicite du type prix: 80m / 80 millions ;
+    - présence d'un numéro BF dans le même texte ;
+    - prix structuré >= 1 milliard et > 5x le prix explicite.
+
+    Les autres valeurs atypiques ne sont jamais modifiées automatiquement.
+    """
+    prix_structure = structure.get("prix_fcfa")
+    if not isinstance(prix_structure, int) or prix_structure < 1_000_000_000:
+        return structure
+
+    prix_match = _RE_PRIX_MILLIONS_EXPLICITE.search(texte or "")
+    if prix_match is None or _RE_TELEPHONE_BF.search(texte or "") is None:
+        return structure
+
+    try:
+        millions = float(prix_match.group(1).replace(",", "."))
+    except ValueError:
+        return structure
+
+    prix_explicite = int(round(millions * 1_000_000))
+    if prix_explicite <= 0 or prix_structure <= prix_explicite * 5:
+        return structure
+
+    corrigee = dict(structure)
+    corrigee["prix_fcfa"] = prix_explicite
+    logger.warning(
+        "Prix LLM corrigé : %s -> %s FCFA ; probable concaténation avec "
+        "un numéro de téléphone dans le texte.",
+        prix_structure,
+        prix_explicite,
+    )
+    return corrigee
+
+
 def _construire_client(api_key: str | None = None) -> AsyncOpenAI:
     # .strip() : même piège que DATABASE_URL (voir config.py) - un secret CI
     # collé avec un retour à la ligne final casserait l'en-tête HTTP
@@ -252,6 +307,10 @@ async def structurer_lot(
         elif not structure["est_une_annonce_valide"]:
             non_valides.append({**post, "motif_rejet": "llm_juge_invalide", **structure})
         else:
+            structure = _corriger_prix_concatene_telephone(
+                post.get("texte_nettoye") or "",
+                structure,
+            )
             structure["quartier_zone"] = config.normaliser_quartier(structure.get("quartier_zone"))
             # BUG RÉEL trouvé le 2026-08-03 en analysant les 224 premières
             # annonces réelles : `normaliser_statut_document` existait dans
