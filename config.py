@@ -575,7 +575,7 @@ COOLDOWN_MULTIPLICATEUR_MAX = 8  # plafonne le cooldown exponentiel (24h * 8 = 8
 # la taille d'un post Facebook), rôle équivalent à claude-3-5-haiku utilisé
 # avant. Prix vérifiés via recherche web le 2026-08-01, à revérifier
 # périodiquement (les tarifs LLM changent souvent).
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-6-luna"
 OPENAI_TEMPERATURE = 0.0
 OPENAI_MAX_TOKENS = 1024
 LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate limits)
