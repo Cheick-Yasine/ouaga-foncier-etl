@@ -7,7 +7,7 @@ Scraping de groupes Facebook ciblés → filtrage local → structuration par LL
 - **Langage** : Python 3.12.
 - **Scraping** : Playwright (Chromium, async), session authentifiée via cookies (`FB_COOKIES_JSON`), cible `web.facebook.com` (interface "Comet").
 - **Filtrage** : regex locales, gratuites, aucun appel API (`config.py`).
-- **Structuration** : API OpenAI (`gpt-4o-mini`), Structured Outputs (schéma JSON strict) pour extraire les champs (type de bien, quartier, superficie, prix, statut du document, contacts).
+- **Structuration** : API Gemini (`gemini-2.5-flash-lite`), Structured Outputs (schéma JSON strict) pour extraire les champs (type de bien, quartier, superficie, prix, statut du document, contacts).
 - **Stockage** : PostgreSQL (hébergé sur Neon), upsert par `id` de post — jamais de doublon. Export Excel régénéré à chaque run.
 - **Orchestration** : GitHub Actions, cron quotidien + déclenchement manuel.
 
@@ -17,7 +17,7 @@ Le pipeline s'exécute en 4 étapes, orchestrées par `main.py` :
 
 1. **Scraping** (`scraper.py`) — pour chaque groupe actif de `groups.csv` : ouverture de `web.facebook.com/groups/<id>`, extraction des posts "mis en avant" (JSON embarqué dans la page), puis scroll simulé avec interception des réponses réseau GraphQL pour récupérer le fil normal du groupe. S'arrête par groupe quand la fenêtre de dates (`--days-back`) est dépassée ou après plusieurs scrolls sans nouveau post.
 2. **Filtrage** (`processor.py`, étape A) — chaque post brut passe par des regex (mots-clés fonciers, exclusion des recherches pures et du spam) pour ne garder que les candidats plausibles, sans coût API.
-3. **Structuration LLM** (`processor.py`, étape B) — chaque candidat est envoyé à l'API OpenAI, qui renvoie une structure validée (Pydantic) ou rejette le post s'il ne s'agit pas d'une vraie annonce. Les champs `quartier_zone` et `statut_document` sont ensuite normalisés (casse) contre une liste connue.
+3. **Structuration LLM** (`processor.py`, étape B) — chaque candidat est envoyé à l'API Gemini, qui renvoie une structure validée (Pydantic) ou rejette le post s'il ne s'agit pas d'une vraie annonce. Les champs `quartier_zone` et `statut_document` sont ensuite normalisés (casse) contre une liste connue.
 4. **Persistance** (`processor.py`) — upsert des annonces valides dans PostgreSQL, mise à jour de l'export Excel, détection de dérive de volume (alerte si un run quotidien produit anormalement peu de résultats vs l'historique).
 
 Deux modes d'exécution (`--mode`) :
@@ -50,14 +50,14 @@ Ajouter `--clear-actions-cache` si le run précédent a tourné en CI (sinon le 
 ouaga-foncier-etl/
 ├── config.py       # mots-clés/regex, quartiers, statuts de document, groupes, délais anti-blocage
 ├── scraper.py       # Playwright : navigation, scroll, capture GraphQL, détection de blocage/session expirée
-├── processor.py      # filtrage regex, appel API OpenAI, schéma + upsert PostgreSQL, export Excel
+├── processor.py      # filtrage regex, appel API Gemini, schéma + upsert PostgreSQL, export Excel
 ├── main.py         # orchestrateur CLI (--mode, --days-back, --group-limit, --batch-size, --skip-llm)
 ├── groups.csv       # liste des groupes Facebook ciblés (id, nom, url, actif, confidentialité)
 ├── requirements.txt
-├── .env.example      # FB_COOKIES_JSON, OPENAI_API_KEY, DATABASE_URL
+├── .env.example      # FB_COOKIES_JSON, GEMINI_API_KEY, DATABASE_URL
 ├── .github/workflows/daily_scraper.yml  # job tests (bloquant) -> job scraping
 ├── scripts/maj_cookies.py  # recharge FB_COOKIES_JSON depuis un export Cookie-Editor (voir section ci-dessus)
-└── tests/          # une suite par module, API OpenAI et navigateur entièrement mockés
+└── tests/          # une suite par module, API Gemini et navigateur entièrement mockés
 ```
 
 ## Installation
@@ -66,7 +66,7 @@ ouaga-foncier-etl/
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 playwright install --with-deps chromium
-cp .env.example .env  # renseigner FB_COOKIES_JSON, OPENAI_API_KEY, DATABASE_URL
+cp .env.example .env  # renseigner FB_COOKIES_JSON, GEMINI_API_KEY, DATABASE_URL
 ```
 
 ## Utilisation
