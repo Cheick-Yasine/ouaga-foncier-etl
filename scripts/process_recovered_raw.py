@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Charge DATABASE_URL / OPENAI_API_KEY avant l'import de config.py afin que
+# Charge DATABASE_URL / GEMINI_API_KEY avant l'import de config.py afin que
 # le script puisse être lancé directement en local.
 load_dotenv(ROOT / ".env")
 
