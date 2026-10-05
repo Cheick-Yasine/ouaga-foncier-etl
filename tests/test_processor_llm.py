@@ -240,11 +240,11 @@ class TestStructurerLot:
 
 class TestConstruireClient:
     def test_leve_erreur_si_cle_absente(self, monkeypatch):
-        monkeypatch.delenv(config.ENV_OPENAI_KEY, raising=False)
+        monkeypatch.delenv(config.ENV_GEMINI_KEY, raising=False)
         with pytest.raises(ValueError):
             processor._construire_client(api_key=None)
 
     def test_utilise_la_cle_fournie_en_priorite(self, monkeypatch):
-        monkeypatch.setenv(config.ENV_OPENAI_KEY, "cle-env")
+        monkeypatch.setenv(config.ENV_GEMINI_KEY, "cle-env")
         client = processor._construire_client(api_key="cle-explicite")
         assert client.api_key == "cle-explicite"
