@@ -102,7 +102,7 @@ jobs:
         id: pipeline
         env:
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         shell: bash
         run: |
@@ -122,7 +122,7 @@ jobs:
         if: always() && steps.pipeline.outcome == 'failure'
         continue-on-error: true
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/process_recovered_raw.py
 
