@@ -68,7 +68,7 @@ MASTER_XLSX_PATH = PROCESSED_DIR / "annonces.xlsx"
 # --------------------------------------------------------------------------- #
 
 ENV_FB_COOKIES = "FB_COOKIES_JSON"
-ENV_OPENAI_KEY = "OPENAI_API_KEY"
+ENV_GEMINI_KEY = "GEMINI_API_KEY"
 ENV_DATABASE_URL = "DATABASE_URL"
 
 # Base de données maître PostgreSQL (source de vérité, upsert par id de post).
@@ -575,7 +575,7 @@ COOLDOWN_MULTIPLICATEUR_MAX = 8  # plafonne le cooldown exponentiel (24h * 8 = 8
 # la taille d'un post Facebook), rôle équivalent à claude-3-5-haiku utilisé
 # avant. Prix vérifiés via recherche web le 2026-08-01, à revérifier
 # périodiquement (les tarifs LLM changent souvent).
-OPENAI_MODEL = "gpt-6-luna"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 OPENAI_TEMPERATURE = 0.0
 OPENAI_MAX_TOKENS = 1024
 LLM_MAX_CONCURRENCE = 5  # requêtes simultanées max (throttling coût + rate limits)
