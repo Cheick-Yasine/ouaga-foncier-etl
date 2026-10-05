@@ -99,7 +99,7 @@ def filtrer_candidats(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
 
 
 # --------------------------------------------------------------------------- #
-# Étape B : structuration via API OpenAI (async, Structured Outputs, schéma forcé)
+# Étape B : structuration via API Gemini (async, Structured Outputs, schéma forcé)
 # --------------------------------------------------------------------------- #
 
 
@@ -197,10 +197,10 @@ def _construire_client(api_key: str | None = None) -> AsyncOpenAI:
     # .strip() : même piège que DATABASE_URL (voir config.py) - un secret CI
     # collé avec un retour à la ligne final casserait l'en-tête HTTP
     # Authorization envoyé par le client OpenAI.
-    cle = (api_key or os.environ.get(config.ENV_OPENAI_KEY, "")).strip()
+    cle = (api_key or os.environ.get(config.ENV_GEMINI_KEY, "")).strip()
     if not cle:
-        raise ValueError(f"Variable d'environnement {config.ENV_OPENAI_KEY} absente.")
-    return AsyncOpenAI(api_key=cle)
+        raise ValueError(f"Variable d'environnement {config.ENV_GEMINI_KEY} absente.")
+    return AsyncOpenAI(api_key=cle, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
 
 
 async def structurer_annonce(
@@ -209,14 +209,14 @@ async def structurer_annonce(
     semaphore: asyncio.Semaphore,
     max_retries: int = config.LLM_MAX_RETRIES,
 ) -> dict[str, Any] | None:
-    """Appelle l'API OpenAI pour structurer un post, avec retry/backoff exponentiel.
+    """Appelle l'API Gemini pour structurer un post, avec retry/backoff exponentiel.
 
     Retourne None (plutôt que de lever) en cas d'échec définitif, pour que le
     traitement du lot entier ne soit pas interrompu par un seul post en erreur -
     l'appelant compte les échecs et les journalise (cf. `structurer_lot`).
 
     INCERTITUDE ASSUMÉE : cet appel (Structured Outputs, `response_format`
-    json_schema strict) n'a pas pu être testé contre l'API OpenAI réelle -
+    json_schema strict) n'a pas pu être testé contre l'API Gemini réelle -
     aucun accès réseau sortant vers api.openai.com depuis mon environnement
     (confirmé par un échec de connexion direct). La forme de l'appel est
     basée sur le contrat documenté du SDK `openai` (introspection du
@@ -228,7 +228,7 @@ async def structurer_annonce(
         for tentative in range(1, max_retries + 1):
             try:
                 reponse = await client.chat.completions.create(
-                    model=config.OPENAI_MODEL,
+                    model=config.GEMINI_MODEL,
                     max_tokens=config.OPENAI_MAX_TOKENS,
                     temperature=config.OPENAI_TEMPERATURE,
                     response_format={
@@ -258,14 +258,14 @@ async def structurer_annonce(
             except RateLimitError:
                 attente = config.LLM_BACKOFF_BASE_S * (2 ** (tentative - 1)) + random.uniform(0, 1)
                 logger.warning(
-                    "Rate limit API OpenAI (tentative %d/%d) - attente %.1fs",
+                    "Rate limit API Gemini (tentative %d/%d) - attente %.1fs",
                     tentative, max_retries, attente,
                 )
                 await asyncio.sleep(attente)
             except (APIConnectionError, APIStatusError) as exc:
                 attente = config.LLM_BACKOFF_BASE_S * (2 ** (tentative - 1))
                 logger.warning(
-                    "Erreur API OpenAI (%s, tentative %d/%d) - attente %.1fs",
+                    "Erreur API Gemini (%s, tentative %d/%d) - attente %.1fs",
                     exc, tentative, max_retries, attente,
                 )
                 await asyncio.sleep(attente)
@@ -702,7 +702,7 @@ async def executer_traitement(
     comme trace d'audit ponctuelle - la base maître reste la référence.
 
     Raises:
-        ValueError: OPENAI_API_KEY absente ou DATABASE_URL absente.
+        ValueError: GEMINI_API_KEY absente ou DATABASE_URL absente.
     """
     if not config.DATABASE_URL:
         # Échec rapide et explicite AVANT tout appel LLM payant : inutile de
