@@ -44,9 +44,9 @@ async def process_batches(posts: list[dict[str, Any]], batch_size: int) -> dict[
     totals = {"raw_selectionnes": len(posts), "candidats": 0, "valides": 0, "integres": 0, "rejetes_ou_echecs": 0, "checkpoints_marques": 0, "lots": 0}
     for offset in range(0, len(posts), batch_size):
         batch = posts[offset:offset + batch_size]; totals["lots"] += 1
-        chemin = config.RAW_DIR / f"recovery_missing_batch_{totals["lots"]:04d}.json"
+        chemin = config.RAW_DIR / f"recovery_missing_batch_{totals['lots']:04d}.json"
         chemin.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"=== Lot {totals["lots"]} : {offset+1}-{offset+len(batch)} / {len(posts)} ===")
+        print(f"=== Lot {totals['lots']} : {offset+1}-{offset+len(batch)} / {len(posts)} ===")
         resultat = await processor.executer_traitement([chemin], mode="recovery_missing")
         totals["candidats"] += resultat.nb_candidats; totals["valides"] += resultat.nb_valides
         totals["integres"] += resultat.nb_valides
