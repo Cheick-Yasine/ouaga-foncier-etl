@@ -1,0 +1,55 @@
+name: Rattrapage des annonces de vente manquantes
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Début UTC"
+        required: true
+        default: "2026-10-02T18:23:13Z"
+      end:
+        description: "Fin UTC"
+        required: true
+        default: "2026-10-07T12:00:00Z"
+      batch_size:
+        description: "Taille des lots OpenAI"
+        required: true
+        default: "100"
+
+concurrency:
+  group: ouaga-foncier-rattrapage-ventes
+  cancel-in-progress: false
+
+jobs:
+  recovery-sales:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.7"
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+      - name: Intégrer les ventes manquantes
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python scripts/reprocess_missing_sales.py \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --batch-size "${{ inputs.batch_size }}"
+      - name: Vérifier le résultat
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os, psycopg
+          dsn = os.environ["DATABASE_URL"]
+          with psycopg.connect(dsn) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("SELECT COUNT(*) FROM public.annonces")
+                  print("annonces_total=", cur.fetchone()[0])
+          PY
