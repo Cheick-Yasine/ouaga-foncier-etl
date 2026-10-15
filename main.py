@@ -99,6 +99,8 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API OpenAI. "
         "Utile pour tester/débugger le scraper sans consommer de crédits API.",
     )
+    parseur.add_argument("--collect-only", action="store_true", help="Collecte uniquement ; traitement séparé par le superviseur.")
+    parseur.add_argument("--process-file", type=Path, help="Retraite un fichier brut sans accès à Facebook.")
     args = parseur.parse_args(argv)
 
     if args.days_back is None:
@@ -177,6 +179,9 @@ async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitem
         args.skip_llm,
     )
 
+    if args.process_file:
+        return await processor.executer_traitement([args.process_file], mode=args.mode)
+
     fichiers_bruts = await scraper.executer_scraping(
         mode=args.mode,
         days_back=args.days_back,
@@ -185,6 +190,9 @@ async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitem
         round_robin=args.round_robin,
         compte=args.compte,
     )
+
+    if args.collect_only:
+        return config.RAW_DIR
 
     if not fichiers_bruts:
         logger.warning(
@@ -222,11 +230,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         resultat = asyncio.run(executer(args))
     except scraper.CooldownActifError as exc:
-        # Pas un échec : c'est le mécanisme de sécurité anti-blocage qui fait
-        # exactement ce qu'on lui demande. Code 0 pour ne pas faire échouer le
-        # workflow GitHub Actions tous les jours où le cooldown est actif.
+        # Une pause protectrice doit rester visible comme absence de collecte.
         logger.warning("Run annulé par le cooldown anti-blocage : %s", exc)
-        return 0
+        return 4
     except ValueError as exc:
         logger.error("Erreur de configuration : %s", exc)
         return 1

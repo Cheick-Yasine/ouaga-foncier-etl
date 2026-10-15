@@ -1,10 +1,11 @@
 """Scraping Facebook (Playwright async) - mode quotidien et rattrapage (backfill).
 
 
-CHOIX D'ARCHITECTURE : entrée mobile, extraction JSON Comet compatible
+CHOIX D'ARCHITECTURE : entrée mobile ou ordinateur, extraction JSON Comet
 -----------------------------------------------------------------------
-Les URLs sont normalisées vers m.facebook.com et chaque compte conserve un
-profil Android stable. Si Facebook redirige vers www/web, cette redirection est
+Les URLs suivent OUAGA_BROWSER_MODE : m.facebook.com avec profil Android en
+mode mobile, www.facebook.com avec Chromium natif en mode desktop.
+Si Facebook redirige vers www/web, cette redirection est
 journalisée et le même parseur Comet reste utilisable. Une page sans JSON
 initial et sans réponse GraphQL reconnue provoque une erreur explicite au lieu
 d'être considérée silencieusement comme un groupe vide. Comet embarque les
@@ -43,10 +44,13 @@ sans préavis) - à surveiller sur les prochains runs quotidiens.
 
 from __future__ import annotations
 
+from progress_public import emit as emit_progress
+
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import urllib.parse
@@ -61,6 +65,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
+    Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -88,6 +93,13 @@ class InterfaceFacebookInattendueError(Exception):
 
 class StructureFacebookInattendueError(Exception):
     """Levée si la page ne présente aucun signal exploitable connu."""
+
+
+class RechercheIncompleteError(StructureFacebookInattendueError):
+    """Résultats conservés, mais aucune preuve de couverture complète."""
+    def __init__(self, message, posts):
+        super().__init__(message)
+        self.posts = posts
 
 
 class CooldownActifError(Exception):
@@ -304,6 +316,8 @@ def _charger_cookies_caches(compte: str | None = None) -> list[dict[str, Any]] |
     # traiter comme "expiré", contrairement à une date passée classique).
     maintenant = datetime.now(timezone.utc).timestamp()
     for c in cookies:
+        if c.get("name") not in {"c_user", "xs"}:
+            continue
         expiration = c.get("expires")
         if expiration is not None and expiration != -1 and expiration < maintenant:
             logger.info(
@@ -319,7 +333,8 @@ def _charger_cookies_caches(compte: str | None = None) -> list[dict[str, Any]] |
         "potentiellement déjà renouvelée par Facebook depuis FB_COOKIES_JSON).",
         len(cookies),
     )
-    return cookies
+    return [c for c in cookies if c.get("expires", -1) in (None, -1)
+            or c.get("expires", -1) >= maintenant]
 
 
 async def sauvegarder_storage_state(
@@ -336,7 +351,8 @@ async def sauvegarder_storage_state(
     try:
         chemin = config.storage_state_path(compte)
         chemin.parent.mkdir(parents=True, exist_ok=True)
-        await contexte.storage_state(path=str(chemin))
+        from durable import atomic_json
+        atomic_json(chemin, await contexte.storage_state(), private=True)
     except Exception:
         logger.exception("Échec de sauvegarde du storage_state (non bloquant).")
 
@@ -367,6 +383,8 @@ async def creer_navigateur(
     cookies: list[dict[str, Any]],
     compte: str | None = None,
     proxy: dict[str, str] | None = None,
+    *,
+    headless: bool | None = None,
 ) -> tuple[Browser, BrowserContext]:
     """Lance Chromium headless et prépare une session aussi cohérente que possible
     d'un run à l'autre (cookies + localStorage réutilisé si disponible).
@@ -385,24 +403,30 @@ async def creer_navigateur(
     précis, sans non plus le supprimer entièrement (le proxy lui-même a sa
     propre réputation, pas forcément parfaite).
     """
-    user_agent, viewport = config.choisir_fingerprint_mobile(compte)
+    mode = config.mode_navigateur()
+    moteur = config.moteur_navigateur()
+    if headless is None:
+        headless = os.environ.get('OUAGA_BROWSER_VISIBLE') != '1'
+    if mode == "desktop":
+        options_interface = dict(viewport={"width": 1440, "height": 900}, is_mobile=False, has_touch=False)
+        if moteur == 'firefox':
+            options_interface.pop('is_mobile')  # aucune émulation mobile dans Firefox
+        logger.info("Navigateur ordinateur : moteur=%s | viewport=1440x900 | agent utilisateur natif | tactile désactivé", moteur)
+    else:
+        user_agent, viewport = config.choisir_fingerprint_mobile(compte)
+        options_interface = dict(viewport=viewport, user_agent=user_agent, is_mobile=True, has_touch=True)
+        logger.info(
+            "Fingerprint mobile : viewport=%sx%s | UA=%s...",
+            viewport["width"], viewport["height"], user_agent[:60],
+        )
     region = config.parametres_regionaux(compte)
-    logger.info(
-        "Fingerprint mobile : viewport=%sx%s | UA=%s...",
-        viewport["width"],
-        viewport["height"],
-        user_agent[:60],
-    )
-    navigateur = await playwright.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled"],
-        proxy=proxy,
+    navigateur = await getattr(playwright, moteur).launch(
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"] if mode == "mobile" else [],
+        proxy=None,
     )
     contexte = await navigateur.new_context(
-        viewport=viewport,
-        user_agent=user_agent,
-        is_mobile=True,
-        has_touch=True,
+        **options_interface,
         locale=region.locale,
         timezone_id=region.fuseau_horaire,
         storage_state={"cookies": [], "origins": _charger_origins_sauvegardees(compte)},
@@ -410,9 +434,10 @@ async def creer_navigateur(
     # Masque le flag standard qui trahit un navigateur piloté par automation.
     # Patch minimal et documenté publiquement (pas une suite de contournement) -
     # voir README.md pour ce qui n'est délibérément PAS fait au-delà de ça.
-    await contexte.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
+    if mode == "mobile":
+        await contexte.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
     await contexte.add_cookies(cookies)
     contexte.set_default_navigation_timeout(config.NAVIGATION_TIMEOUT_MS)
     return navigateur, contexte
@@ -534,6 +559,17 @@ async def _scroll_humain(page: Page, delai_multiplicateur: float = 1.0) -> None:
 
 
 async def detecter_blocage_ou_session_expiree(page: Page) -> None:
+    from search_runtime import lire_apres_navigation
+    try:
+        await lire_apres_navigation(page, lambda: _detecter_blocage_une_fois(page))
+    except PlaywrightError as exc:
+        from search_runtime import navigation_interrompue
+        if navigation_interrompue(exc):
+            raise StructureFacebookInattendueError('Navigation instable pendant la vérification de session.') from exc
+        raise
+
+
+async def _detecter_blocage_une_fois(page: Page) -> None:
     """Vérifie l'URL et le contenu visible pour détecter un mur anti-bot ou une
     session expirée. Lève une exception dédiée dans les deux cas, pour que
     l'appelant puisse arrêter proprement plutôt que de scraper une page d'erreur.
@@ -542,10 +578,7 @@ async def detecter_blocage_ou_session_expiree(page: Page) -> None:
     if any(fragment in url for fragment in SELECTEURS["checkpoint_url_fragments"]):
         raise BlocageDetecteError(f"URL de checkpoint/connexion détectée : {page.url}")
 
-    try:
-        contenu = (await page.content()).lower()
-    except Exception:  # page déjà fermée, navigation en cours, etc.
-        return
+    contenu = (await page.content()).lower()
 
     if any(mot in contenu for mot in MOTS_CHECKPOINT_TEXTE):
         raise BlocageDetecteError("Texte de vérification anti-bot détecté sur la page.")
@@ -1199,8 +1232,8 @@ def sauvegarder_seen_ids(
 
     chemin = config.seen_ids_path(compte)
     chemin.parent.mkdir(parents=True, exist_ok=True)
-    with chemin.open("w", encoding="utf-8") as f:
-        json.dump(purge, f, ensure_ascii=False, indent=2)
+    from durable import atomic_json
+    atomic_json(chemin, purge)
 
 
 def charger_dernier_post_connu(compte: str | None = None) -> dict[str, str]:
@@ -1421,10 +1454,15 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
     Objectif explicite du cahier des charges : ne pas perdre les données déjà
     scrapées en cas de coupure sur un groupe suivant.
     """
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     chemin = config.RAW_DIR / f"{timestamp}_{groupe_id}.json"
-    with chemin.open("w", encoding="utf-8") as f:
-        json.dump(posts, f, ensure_ascii=False, indent=2)
+    from durable import atomic_json
+    atomic_json(chemin, posts)
+    import os
+    if os.environ.get("OUAGA_ARCHIVE_NEON") == "1":
+        from archive_neon import archive_raw
+        archive_raw(chemin)
+        emit_progress("archived", groupe_id, archived=len(posts))
     logger.info("Groupe %s : %d posts sauvegardés -> %s", groupe_id, len(posts), chemin)
     return chemin
 
@@ -1567,6 +1605,8 @@ async def scraper_groupe(
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
     post_repere: str | None = None,
+    rattrapage: bool = False,
+    recherche: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne (les nouveaux posts non vus, le nouveau
@@ -1615,6 +1655,9 @@ async def scraper_groupe(
     chronologique fiable, donc inutilisables comme signal de fraîcheur ; une
     fois vus ils entrent dans `seen_ids` et ne sont plus jamais réévalués).
 
+    En rattrapage, aucun plafond total de scrolls. Le seuil sans nouveauté,
+    les lots hors fenêtre et les contrôles de session restent actifs.
+
     Args:
         delai_multiplicateur: facteur appliqué aux délais entre étapes de
             scroll (voir `calculer_ajustements` - >1.0 quand le throttle
@@ -1630,6 +1673,8 @@ async def scraper_groupe(
     page = await context.new_page()
     nouveaux_posts: list[dict[str, Any]] = []
     posts_captures: list[dict[str, Any]] = []
+    ids_captures: set[str] = set()
+    statuts_graphql: dict[int, int] = {}
     taches_en_cours: set[asyncio.Task] = set()
     nb_posts_trouves_via_scroll = 0  # exclut les posts "mis en avant" du HTML initial
     # Défini tôt (avant le try) pour être toujours retournable, y compris si
@@ -1651,12 +1696,12 @@ async def scraper_groupe(
         `posts_captures`. Best-effort : toute erreur est avalée pour ne
         jamais interrompre le scraping sur une réponse mal formée.
         """
+        statuts_graphql[reponse.status] = statuts_graphql.get(reponse.status, 0) + 1
         try:
             corps = await reponse.text()
         except Exception:
             return
-        # Ancien préfixe anti-JSON-hijacking parfois toujours présent.
-        corps = corps.removeprefix("for (;;);")
+        from search_runtime import graphql_payloads
         if len(echantillons_graphql_bruts) < config.NB_ECHANTILLONS_DEBUG_GRAPHQL:
             echantillons_graphql_bruts.append(
                 {"url": reponse.url, "corps_tronque": corps[:5000]}
@@ -1664,17 +1709,11 @@ async def scraper_groupe(
         # Une réponse GraphQL Facebook peut contenir plusieurs objets JSON
         # concaténés ligne par ligne ("multipart") - on tente le corps entier
         # puis chaque ligne individuellement.
-        for candidat in (corps, *corps.splitlines()):
-            candidat = candidat.strip()
-            if not candidat:
-                continue
-            try:
-                payload = json.loads(candidat)
-            except json.JSONDecodeError:
-                continue
-            posts_captures.extend(
-                extraire_stories_depuis_json(payload, groupe.id, groupe.nom)
-            )
+        for payload in graphql_payloads(corps):
+            for post in extraire_stories_depuis_json(payload, groupe.id, groupe.nom):
+                if post['id'] not in ids_captures:
+                    ids_captures.add(post['id'])
+                    posts_captures.append(post)
 
     def _sur_reponse(reponse: Any) -> None:
         # Callback SYNCHRONE (API d'événements Playwright) : on ne fait que
@@ -1687,7 +1726,15 @@ async def scraper_groupe(
             taches_en_cours.add(tache)
             tache.add_done_callback(taches_en_cours.discard)
 
-    page.on("response", _sur_reponse)
+    ecoute_reponses_active = False
+    def commencer_capture_recherche():
+        nonlocal ecoute_reponses_active
+        if not ecoute_reponses_active:
+            page.on('response', _sur_reponse)
+            ecoute_reponses_active = True
+    if not recherche:
+        page.on("response", _sur_reponse)
+        ecoute_reponses_active = True
     # Navigue vers `groupe.url` tel que renseigné dans groups.csv, plutôt que
     # de reconstruire systématiquement une URL `/groups/<id>/` à partir de
     # `groupe.id` (comportement d'origine, valable uniquement pour un vrai
@@ -1702,27 +1749,45 @@ async def scraper_groupe(
 
     try:
         logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
-        await page.goto(url_groupe, wait_until="domcontentloaded")
-        interface = _verifier_domaine_facebook(page.url)
-        if interface != "mobile":
-            logger.warning(
-                "Facebook a redirigé %s vers l'interface %s (%s).",
-                groupe.nom,
-                interface,
-                page.url,
+        emit_progress("open", groupe.id)
+        if recherche:
+            from group_search import configure_search
+            logger.info('Groupe %s | recherche="%s" | préparation du tri récent', groupe.nom, recherche)
+            # Navigation directe vers la recherche ; aucun fil général n’est ouvert.
+            try:
+                await configure_search(page, groupe, recherche, on_results_ready=commencer_capture_recherche)
+            except (ValueError, PlaywrightTimeoutError) as exc:
+                diagnostic = config.LOG_DIR / f"recherche_{groupe.id}_{recherche}.html"
+                diagnostic.write_text(await page.content(), encoding="utf-8")
+                logger.error('Recherche non configurée. Diagnostic local : %s', diagnostic)
+                raise StructureFacebookInattendueError(str(exc)) from exc
+            # La capture commence après validation du groupe et AVANT le filtre.
+            await asyncio.sleep(config.PAGE_DELAY_MIN_S)
+            if taches_en_cours:
+                await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
+            logger.info('Groupe %s | recherche="%s" | filtre Publications récentes confirmé', groupe.nom, recherche)
+        else:
+            await page.goto(url_groupe, wait_until="domcontentloaded")
+            interface = _verifier_domaine_facebook(page.url)
+            if interface != "mobile":
+                logger.warning(
+                    "Facebook a redirigé %s vers l'interface %s (%s).",
+                    groupe.nom,
+                    interface,
+                    page.url,
+                )
+            await detecter_blocage_ou_session_expiree(page)
+            await _selectionner_activite_recente(page, groupe)
+            await asyncio.sleep(
+                random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
+                * delai_multiplicateur
             )
-        await detecter_blocage_ou_session_expiree(page)
-        await _selectionner_activite_recente(page, groupe)
-        await asyncio.sleep(
-            random.uniform(config.TEMPS_LECTURE_MIN_S, config.TEMPS_LECTURE_MAX_S)
-            * delai_multiplicateur
-        )
 
-        await _actualiser_fil_avant_scroll(page, groupe)
-        await asyncio.sleep(
-            random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
-            * delai_multiplicateur
-        )
+            await _actualiser_fil_avant_scroll(page, groupe)
+            await asyncio.sleep(
+                random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
+                * delai_multiplicateur
+            )
 
         # Posts "mis en avant" (filtrés via seen_ids - pas de ré-export).
         #
@@ -1745,18 +1810,25 @@ async def scraper_groupe(
         #      `seen_ids` et ne sera plus jamais réévalué (impact réel
         #      observé : une seule fois par groupe, pas une pollution
         #      quotidienne récurrente du jeu de données).
-        html_initial = await page.content()
+        from search_runtime import lire_apres_navigation
+        html_initial = await lire_apres_navigation(page, page.content)
         posts_initiaux = _extraire_stories_depuis_scripts_json(
             html_initial, groupe.id, groupe.nom
         )
         if not posts_initiaux:
             await _sauvegarder_html_debug(page, groupe.id)
+        if recherche:
+            from group_search import matching_post
+            posts_visibles = await _extraire_posts_weblite_dom(page, groupe)
+            posts_initiaux = list({p["id"]: p for p in posts_initiaux + posts_captures + posts_visibles
+                                   if matching_post(p, recherche, groupe.id)}.values())
         posts_inedits_initiaux = [
             p for p in posts_initiaux if p["id"] not in seen_ids
         ]
         for p in posts_inedits_initiaux:
             seen_ids[p["id"]] = p["scrape_le"]
         nouveaux_posts.extend(posts_inedits_initiaux)
+        prochaine_capture = len(posts_captures)
         # Note : les posts "mis en avant" ne sont volontairement PAS utilisés
         # comme candidat pour `nouveau_repere` (pas de garantie chronologique,
         # voir le commentaire détaillé plus haut sur ce même sujet) ni comme
@@ -1770,12 +1842,23 @@ async def scraper_groupe(
         etapes_sans_nouveau = 0
         etapes_hors_fenetre = 0
         etapes_scroll = 0
+        # Les réponses arrivant entre deux tours doivent également être traitées.
+        mouvement = None
+        reprise_effectuee = False
+        diagnostic_ecrit = False
 
-        while etapes_scroll < config.MAX_PAGES_ABSOLU:
-            debut_capture = len(posts_captures)
-            # Scroll page-niveau (window), plus fiable en headless que
-            # page.mouse.wheel dont l'effet dépend de la position du curseur.
-            await _scroll_humain(page, delai_multiplicateur)
+        while rattrapage or etapes_scroll < config.MAX_PAGES_ABSOLU:
+            await detecter_blocage_ou_session_expiree(page)
+            if recherche and config.mode_navigateur() == 'desktop':
+                from search_runtime import defiler_resultats
+                reprendre = etapes_sans_nouveau >= 3 and not reprise_effectuee
+                mouvement = await defiler_resultats(page, reprendre=reprendre)
+                reprise_effectuee |= reprendre
+                logger.info('Défilement %s | position=%s -> %s | hauteur=%s | bas=%s | reprise=%s',
+                            mouvement['apres']['cible'], mouvement['avant']['position'], mouvement['apres']['position'],
+                            mouvement['apres']['hauteur'], mouvement['apres']['bas'], reprendre)
+            else:
+                await _scroll_humain(page, delai_multiplicateur)
             await asyncio.sleep(
                 random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
                 * delai_multiplicateur
@@ -1787,7 +1870,10 @@ async def scraper_groupe(
 
             posts_dom = await _extraire_posts_weblite_dom(page, groupe)
             posts_dom_observes.update(post["id"] for post in posts_dom)
-            nouveaux_bruts = posts_captures[debut_capture:] + posts_dom
+            nouveaux_bruts = posts_captures[prochaine_capture:] + posts_dom
+            prochaine_capture = len(posts_captures)
+            if recherche:
+                nouveaux_bruts = [p for p in nouveaux_bruts if matching_post(p, recherche, groupe.id)]
 
             # Le repère doit provenir d'un véritable id/permalien Facebook,
             # jamais du hash auteur+texte qui confond deux republications.
@@ -1849,11 +1935,31 @@ async def scraper_groupe(
                 etapes_sans_nouveau += 1
 
             logger.info(
-                "Groupe %s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
-                "| weblite_dom=%d | posts capturés cumulés=%d",
-                groupe.nom, etapes_scroll, compteur_reponses_vues,
+                "Groupe %s | recherche=%s | étape scroll %d | réponses réseau vues=%d matchées_graphql=%d "
+                "| weblite_dom=%d | posts capturés cumulés=%d | retenus=%d | sans nouveauté=%d/20",
+                groupe.nom, recherche or "fil", etapes_scroll, compteur_reponses_vues,
                 compteur_reponses_matchees, len(posts_dom_observes), len(posts_captures),
+                len(nouveaux_posts), etapes_sans_nouveau,
             )
+
+            emit_progress("scroll", groupe.id, scroll=etapes_scroll,
+                          network=compteur_reponses_vues, graphql=compteur_reponses_matchees,
+                          dom=len(posts_dom_observes), captured=len(posts_captures),
+                          selected=len(nouveaux_posts))
+
+            if recherche:
+                from search_runtime import statistiques_dates, diagnostic_stagnation
+                stats = statistiques_dates(nouveaux_posts, date_limite)
+                logger.info('Recherche=%s | dates : dans les %s jours=%s | hors fenêtre=%s | incertaines=%s | plus récent=%s | HTTP GraphQL=%s',
+                            recherche, max_days_back, stats['dans_fenetre'], stats['hors_fenetre'],
+                            stats['dates_incertaines'], stats['date_max'], statuts_graphql)
+                if etapes_sans_nouveau >= 3 and not diagnostic_ecrit:
+                    dossier = config.LOG_DIR / f'stagnation_{groupe.id}_{recherche}'
+                    await diagnostic_stagnation(page, dossier, dict(groupe=groupe.id, recherche=recherche,
+                        mouvement=mouvement, captures_uniques=len(posts_captures), retenus=len(nouveaux_posts),
+                        statuts_graphql=statuts_graphql, **stats))
+                    diagnostic_ecrit = True
+                    logger.warning('Chargement sans nouveauté : diagnostic %s ; fin des résultats non prouvée.', dossier)
 
             # Critère d'arrêt PRINCIPAL : le post-repère du run précédent a été
             # retrouvé -> on a la certitude d'avoir tout rattrapé sur ce groupe.
@@ -1894,11 +2000,14 @@ async def scraper_groupe(
                     groupe.nom,
                     etapes_sans_nouveau,
                 )
+                if recherche:
+                    raise RechercheIncompleteError(
+                        f'Recherche {recherche} : chargement sans nouveauté, couverture non confirmée.', nouveaux_posts)
                 break
 
             etapes_scroll += 1
 
-        if etapes_scroll >= config.MAX_PAGES_ABSOLU and not repere_trouve:
+        if not rattrapage and etapes_scroll >= config.MAX_PAGES_ABSOLU and not repere_trouve:
             logger.warning(
                 "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint SANS avoir "
                 "retrouvé le post-repère du run précédent (id=%s) - soit ce post "
@@ -1925,14 +2034,56 @@ async def scraper_groupe(
 
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
+        if recherche:
+            raise StructureFacebookInattendueError("Recherche interrompue par un timeout : couverture non confirmée.") from exc
     finally:
-        page.remove_listener("response", _sur_reponse)
+        if ecoute_reponses_active:
+            page.remove_listener("response", _sur_reponse)
         if taches_en_cours:
             await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
         await page.close()
 
     return nouveaux_posts, nouveau_repere
 
+
+
+async def scraper_recherches_groupe(context, groupe, max_days_back, seen_ids,
+                                    delai_multiplicateur=1.0, post_repere=None,
+                                    rattrapage=False, fichiers_sauvegardes=None):
+    """Deux recherches indépendantes ; sauvegarde terrain avant de passer à parcelle."""
+    from group_search import TERMS, in_window
+    resultats = {}
+    incompletes = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days_back)
+    base_seen = dict(seen_ids)
+    for term in TERMS:
+        # Les doublons de terrain ne doivent pas arrêter trop tôt la recherche parcelle.
+        query_seen = dict(base_seen)
+        try:
+            posts, _ = await scraper_groupe(
+                context, groupe, max_days_back, query_seen,
+                delai_multiplicateur=delai_multiplicateur, post_repere=None,
+                rattrapage=rattrapage, recherche=term,
+            )
+        except RechercheIncompleteError as exc:
+            posts = exc.posts
+            incompletes.append(term)
+            logger.warning('%s Les résultats partiels seront sauvegardés.', exc)
+        nouveaux = [p for p in posts if p['id'] not in resultats and in_window(p, cutoff)]
+        # Dédoublonner aussi une éventuelle répétition interne au résultat.
+        nouveaux = list({p['id']: p for p in nouveaux}.values())
+        if nouveaux:
+            path = sauvegarder_posts_groupe(nouveaux, groupe.id)
+            if fichiers_sauvegardes is not None:
+                fichiers_sauvegardes.append(path)
+        resultats.update((p['id'], p) for p in nouveaux)
+        seen_ids.update({p['id']: query_seen[p['id']] for p in nouveaux if p['id'] in query_seen})
+        logger.info('Groupe %s | recherche="%s" terminée | %d publications sauvegardées | cumul unique=%d | dates incertaines=%d',
+                    groupe.nom, term, len(nouveaux), len(resultats),
+                    sum(bool(p.get('date_incertaine') or not p.get('date_publication')) for p in nouveaux))
+    if incompletes:
+        raise RechercheIncompleteError('Recherches incomplètes : ' + ', '.join(incompletes), list(resultats.values()))
+    return list(resultats.values()), None
 
 # --------------------------------------------------------------------------- #
 # Orchestration : batches de groupes + pauses inter-batch
@@ -2007,9 +2158,10 @@ async def executer_scraping(
 
     nom_secret = config.nom_secret_cookies(compte)
     cookies_json = os.environ.get(nom_secret)
-    if not cookies_json:
+    cookies_persistants = _charger_cookies_caches(compte)
+    if not cookies_json and not cookies_persistants:
         raise ValueError(f"Variable d'environnement {nom_secret} absente.")
-    cookies_secret = charger_cookies(cookies_json)
+    cookies_secret = cookies_persistants or charger_cookies(cookies_json)
 
     if round_robin:
         tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
@@ -2022,18 +2174,23 @@ async def executer_scraping(
             for i in range(nb_a_traiter)
         ]
         nouvel_index = (index_depart + nb_a_traiter) % total
-        config.sauvegarder_index_prochain_groupe(nouvel_index, compte)
         logger.info(
             "Round-robin : %d/%d groupe(s) traité(s) ce run (index %d -> %d) : %s",
             nb_a_traiter, total, index_depart, nouvel_index,
             ", ".join(g.nom for g in groupes),
         )
     else:
-        groupes = config.charger_groupes(limite=group_limit, compte=compte)
+        tous_les_groupes_actifs = config.charger_groupes(limite=None, compte=compte)
+        total = len(tous_les_groupes_actifs)
+        index_depart = config.charger_index_prochain_groupe(compte) % total
+        groupes = tous_les_groupes_actifs[index_depart:] + tous_les_groupes_actifs[:index_depart]
+        if group_limit:
+            groupes = groupes[:group_limit]
 
     etat_sante = charger_sante(compte)
     ajustements = calculer_ajustements(etat_sante)
-    if ajustements.ratio_groupes < 1.0:
+    collecte_reduite = ajustements.ratio_groupes < 1.0
+    if collecte_reduite:
         nb_avant = len(groupes)
         groupes = groupes[: max(1, round(nb_avant * ajustements.ratio_groupes))]
         logger.warning(
@@ -2054,7 +2211,7 @@ async def executer_scraping(
         groups_batch_size,
     )
 
-    proxy = config.proxy_playwright(compte)
+    proxy = None  # connexion directe demandée pour tous les comptes
     if proxy is not None:
         logger.info(
             "Proxy configuré pour ce run (%s) : sortie via %s.",
@@ -2104,6 +2261,9 @@ async def executer_scraping(
                     echec_groupe = False
                     posts: list[dict[str, Any]] = []
                     nouveau_repere: str | None = None
+                    seen_avant_groupe = dict(seen_ids)
+                    # Le backfill relit la période, même si les anciens bruts ont disparu.
+                    seen_pour_groupe = {} if mode == "backfill" else seen_ids
                     try:
                         cookies_caches = _charger_cookies_caches(compte)
                         cookies = (
@@ -2117,13 +2277,15 @@ async def executer_scraping(
                         if proxy is not None:
                             await verifier_proxy_et_region(contexte, compte)
                         await echauffement(contexte)
-                        posts, nouveau_repere = await scraper_groupe(
+                        posts, nouveau_repere = await scraper_recherches_groupe(
                             contexte,
                             groupe,
                             days_back,
-                            seen_ids,
+                            seen_pour_groupe,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
-                            post_repere=reperes_dernier_post.get(groupe.id),
+                            post_repere=None if mode == "backfill" else reperes_dernier_post.get(groupe.id),
+                            rattrapage=mode == "backfill",
+                            fichiers_sauvegardes=fichiers_sauvegardes,
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
@@ -2187,6 +2349,8 @@ async def executer_scraping(
                             groupe.nom,
                         )
                         anomalies += 1
+                        seen_ids.clear()
+                        seen_ids.update(seen_avant_groupe)
                         echec_groupe = True
                     finally:
                         if contexte is not None:
@@ -2213,14 +2377,26 @@ async def executer_scraping(
                     if not echec_groupe:
                         if nouveau_repere:
                             reperes_dernier_post[groupe.id] = nouveau_repere
-                        if posts:
-                            fichiers_sauvegardes.append(
-                                sauvegarder_posts_groupe(posts, groupe.id)
-                            )
+                        seen_ids.update(seen_pour_groupe)
                         sauvegarder_seen_ids(seen_ids, compte=compte)
                         sauvegarder_dernier_post_connu(
                             reperes_dernier_post, compte
                         )
+
+                    # Avancer seulement après traitement effectif, y compris erreur locale.
+                    # Le prochain run ne repart pas toujours des premiers groupes.
+                    config.sauvegarder_index_prochain_groupe(
+                        (index_depart + index_global + 1) % total, compte
+                    )
+                    from durable import atomic_json
+                    suivi = config.sante_path(compte).parent / "groupes.json"
+                    historique_groupes = json.loads(suivi.read_text()) if suivi.exists() else {}
+                    historique_groupes[groupe.id] = {
+                        "fin": datetime.now(timezone.utc).isoformat(),
+                        "statut": "erreur" if echec_groupe else "termine",
+                        "nouveaux_posts": len(posts),
+                    }
+                    atomic_json(suivi, historique_groupes)
 
                     if index_global < len(groupes) - 1:
                         if i < len(lot) - 1:
@@ -2256,6 +2432,8 @@ async def executer_scraping(
                     nouvel_etat_sante.get("niveau_confiance", 1.0),
                 )
 
+    if anomalies or budget_depasse or collecte_reduite:
+        raise RuntimeError("Collecte partielle : fichiers sauvegardés conservés, groupes restants à reprendre.")
     return fichiers_sauvegardes
 
 

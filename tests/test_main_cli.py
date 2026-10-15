@@ -96,7 +96,7 @@ class TestMainEndToEnd:
         code = main.main(["--mode", "daily"])
         assert code == 3
 
-    def test_cooldown_actif_retourne_0_sans_planter(self, monkeypatch, repertoires_isoles):
+    def test_cooldown_actif_retourne_4(self, monkeypatch, repertoires_isoles):
         # Un cooldown actif n'est pas un échec : le workflow CI ne doit pas
         # passer au rouge tous les jours où le mécanisme de sécurité agit.
         monkeypatch.setattr(
@@ -104,7 +104,7 @@ class TestMainEndToEnd:
             AsyncMock(side_effect=scraper.CooldownActifError("cooldown jusqu'à demain")),
         )
         code = main.main(["--mode", "daily"])
-        assert code == 0
+        assert code == 4
 
     def test_pipeline_complet_appelle_processor(self, monkeypatch, repertoires_isoles, tmp_path):
         faux_fichier = tmp_path / "posts.json"

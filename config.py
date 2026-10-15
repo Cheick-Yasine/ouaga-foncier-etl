@@ -23,7 +23,7 @@ _logger = logging.getLogger("ouaga_foncier_etl.config")
 # --------------------------------------------------------------------------- #
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("OUAGA_DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
 RAW_DIR = DATA_DIR / "raw"  # posts bruts scrapés, sauvegarde incrémentale
 PROCESSED_DIR = DATA_DIR / "processed"  # sorties CSV/JSON structurées
 STATE_DIR = DATA_DIR / "state"  # ids déjà vus (déduplication inter-runs)
@@ -33,6 +33,24 @@ for _dir in (RAW_DIR, PROCESSED_DIR, STATE_DIR, LOG_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 GROUPS_CSV_PATH = BASE_DIR / "groups.csv"
+
+
+def mode_navigateur() -> str:
+    """Même interface pour le diagnostic et les sous-processus de collecte."""
+    mode = os.environ.get("OUAGA_BROWSER_MODE", "mobile").strip().lower()
+    if mode not in {"mobile", "desktop"}:
+        raise ValueError("OUAGA_BROWSER_MODE doit être mobile ou desktop.")
+    return mode
+
+
+def moteur_navigateur() -> str:
+    moteur = os.environ.get('OUAGA_BROWSER_ENGINE', 'chromium').strip().lower()
+    if moteur not in {'chromium', 'firefox'}:
+        raise ValueError('OUAGA_BROWSER_ENGINE doit être chromium ou firefox.')
+    if moteur == 'firefox' and mode_navigateur() != 'desktop':
+        raise ValueError('Firefox nécessite --browser desktop.')
+    return moteur
+
 SEEN_IDS_PATH = STATE_DIR / "seen_post_ids.json"
 # {groupe_id: post_id} du post le plus récent connu pour chaque groupe, au
 # moment où le run précédent a terminé son scroll. Sert de repère d'arrêt :
@@ -136,71 +154,12 @@ def proxy_playwright(
     *,
     obligatoire: bool | None = None,
 ) -> dict[str, str] | None:
-    """Lit et parse l'URL de proxy pour ce compte (voir `nom_secret_proxy`),
-    au format attendu par Playwright (`BrowserType.launch(proxy=...)`) :
-    `{"server": "schéma://hôte:port", "username"?: str, "password"?: str}`.
+    """Compatibilité : collecte directe, anciens secrets proxy ignorés.
 
-    POURQUOI UN PROXY (voir README.md, section "Stratégie anti-blocage") : le
-    facteur qui pèse le plus sur le risque de blocage Facebook n'est pas le
-    comportement du scraper (délais, user-agent, etc.) mais la réputation de
-    l'IP/ASN d'où partent les requêtes. Une IP de datacenter GitHub Actions,
-    jamais associée au compte auparavant, peut faire invalider la session
-    immédiatement côté serveur Facebook (SessionExpireeError, signature
-    USER_ID/actorID à 0 - voir `detecter_blocage_ou_session_expiree` dans
-    scraper.py) même avec des cookies fraîchement régénérés. Un proxy
-    résidentiel/mobile donne une IP à réputation plus proche d'un usage
-    humain réel. Ce n'est PAS une garantie (même réserve assumée que pour les
-    autres mesures anti-blocage - voir `creer_navigateur`), seulement une
-    réduction de risque supplémentaire.
-
-    Format attendu de la variable d'environnement (ex. PROXY_URL_1) :
-        http://utilisateur:motdepasse@hote:port
-        http://hote:port                          (proxy sans authentification)
-        socks5://utilisateur:motdepasse@hote:port  (Playwright supporte aussi SOCKS5)
-
-    En mode multi-comptes, le proxy est obligatoire par défaut afin qu'un
-    secret absent ou mal formé ne fasse jamais basculer silencieusement le job
-    sur l'IP du runner GitHub. Le mode mono-compte historique reste optionnel.
+    Aucun proxy applicatif n'est utilisé, même si PROXY_URL reste dans .env.
+    La connexion sortante est celle de la machine qui exécute le navigateur.
     """
-    if obligatoire is None:
-        obligatoire = compte is not None
-
-    nom_variable = nom_secret_proxy(compte)
-    valeur = os.environ.get(nom_variable, "").strip()
-    if not valeur:
-        if obligatoire:
-            raise ValueError(
-                f"{nom_variable} est absent ou vide : exécution refusée pour "
-                "éviter une sortie réseau accidentelle sans proxy."
-            )
-        return None
-
-    try:
-        analyse = urllib.parse.urlsplit(valeur)
-        port = analyse.port
-    except ValueError as exc:
-        raise ValueError(f"{nom_variable} contient un port invalide.") from exc
-
-    schemas_acceptes = {"http", "https", "socks5"}
-    if analyse.scheme.lower() not in schemas_acceptes or not analyse.hostname:
-        message = (
-            f"{nom_variable} est invalide : format attendu "
-            "http(s)://[utilisateur:motdepasse@]hôte:port ou socks5://..."
-        )
-        if obligatoire:
-            raise ValueError(message)
-        _logger.warning("%s Proxy ignoré.", message)
-        return None
-
-    suffixe_port = f":{port}" if port else ""
-    proxy: dict[str, str] = {
-        "server": f"{analyse.scheme.lower()}://{analyse.hostname}{suffixe_port}"
-    }
-    if analyse.username:
-        proxy["username"] = urllib.parse.unquote(analyse.username)
-    if analyse.password:
-        proxy["password"] = urllib.parse.unquote(analyse.password)
-    return proxy
+    return None
 
 
 @dataclass(frozen=True)
@@ -376,19 +335,18 @@ def charger_groupes(
                     f"Compte '{valeur_compte}' invalide pour le groupe '{ligne['id'].strip()}' "
                     f"dans {chemin} (valeurs valides : {sorted(COMPTES_VALIDES)})."
                 )
-            # Normalise l'URL vers m.facebook.com (mode mobile) si elle pointe
-            # encore vers www/web - cohérent avec le fingerprint mobile.
+            # Aligner l'adresse du groupe sur l'interface du navigateur.
             url_brute = ligne["url"].strip()
-            url_mobile = re.sub(
-                r"https?://(www\.|web\.)?facebook\.com",
-                "https://m.facebook.com",
+            url_normalisee = re.sub(
+                r"https?://(?:(?:www|web|m)\.)?facebook\.com(?=/|$)",
+                "https://www.facebook.com" if mode_navigateur() == "desktop" else "https://m.facebook.com",
                 url_brute,
             )
             groupes.append(
                 Groupe(
                     id=ligne["id"].strip(),
                     nom=ligne["nom"].strip(),
-                    url=url_mobile,
+                    url=url_normalisee,
                     actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
                     compte=valeur_compte,
                 )
@@ -722,7 +680,7 @@ PAUSE_ENTRE_GROUPES_MAX_S = 900.0  # 15 minutes
 PAUSE_ENTRE_BATCHES_MIN_S = 1200.0  # 20 minutes
 PAUSE_ENTRE_BATCHES_MAX_S = 1800.0  # 30 minutes
 
-MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
+MAX_PAGES_SANS_NOUVEAU_POST = 20  # même seuil pour pages/scrolls sans nouveauté
 # Un seul post ancien peut être un contenu original inclus dans une
 # republication récente. Il faut donc plusieurs lots consécutifs dont TOUTES
 # les dates d'apparition dans le groupe sont anciennes avant d'arrêter.
